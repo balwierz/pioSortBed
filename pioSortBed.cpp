@@ -174,7 +174,7 @@ int main(int argc, char *argv[])
 				char weight[chrNameBufSize];
 				int numArgsRead = sscanf(buff, lineFormat, chr, &beg, &end, weight, str);
 				
-				if(numArgsRead == 5)
+				if(numArgsRead >= 3)
 				{
 					// we have read to the end of line
 					if(beg < 0)
