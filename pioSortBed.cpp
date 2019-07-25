@@ -1,6 +1,9 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
+//#include <string.h>
+#include <string>
+#include <vector>
+#include <algorithm>
 #include <iostream>
 #include <time.h>
 #include <boost/program_options.hpp>
@@ -251,20 +254,23 @@ int main(int argc, char *argv[])
 		/***********************************
 		 *  the actual sorting starts here *
 		 * *********************************/
-		cerr << "We have " << readCount-1 << " regions. Sorting..." << endl;
 		chrInfo.erase("");
 		// list all the chromosome NAMES here:
 		int nChrom = chrInfo.size();
-		string* chroms = new string[nChrom];
+		std::vector<std::string> chroms;
 		int chrI = 0;
 		for(string2chrInfoT::iterator it=chrInfo.begin(); it!=chrInfo.end(); it++)
 		{
-			chroms[chrI++] = it->first;
+			cerr << it->first << ": " << it->second.len << endl;
+			//chroms[chrI++] = it->first;
+			chroms.push_back(it->first);
 			if(maxChrLen < it->second.len)
 			{
 				maxChrLen = it->second.len;
 			}
 		}
+		cerr << "We have " << readCount-1 << " regions.\n"
+			<< nChrom << " chromosomes\nSorting..." << endl;
 		//cout << "Longest chr is " << maxChrLen << endl;
 		if(maxChrLen > chrLenLimit)
 		{
@@ -273,24 +279,24 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 		time(&start);
-		qsort(chroms, nChrom, sizeof(string), cmpString);
+		std::sort(chroms.begin(), chroms.end());
 		int* chromTable = (int*)  calloc(maxChrLen+1, sizeof(int)); // chromosome length
 		int* numReadsBeg = (int*) calloc(maxChrLen+1, sizeof(int)); // number of reads starting at the position (for preallocation)
 		readsGlobal = reads;  // for sorting (comparison)
 		
-		for(chrI = 0; chrI<nChrom; chrI++)
+		for(std::vector<std::string>::iterator it=chroms.begin(); it!=chroms.end(); it++) //chrI = 0; chrI<nChrom; chrI++
 		{
 			// TODO here is some time for a heuristic whether to use counting sort of qsort
 			// based on the lenght of the chromosome and the number of reads; for the dense
 			// reads we prefer counting sort.
 			
 			// Counting sort:
-			cerr << "Sorting " << chroms[chrI] << endl;
+			cerr << "Sorting " << *it << endl;
 			/** PART 1 of sorting
 			 * building an array of lists
 			 **/
-			int thisChrLen = chrInfo[chroms[chrI]].len;
-			int currRead = chrInfo[chroms[chrI]].lastRead;
+			int thisChrLen = chrInfo[*it].len;
+			int currRead = chrInfo[*it].lastRead;
 			int maxNumReads = 0;	// the maximum number of reads at any position
 			while(currRead)
 			{
@@ -331,7 +337,7 @@ int main(int argc, char *argv[])
 						//}
 						// print it out:
 						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[chrI].c_str(), pos, pos+1, sumList(reads, readBuff, foo));
+							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
 						else
 							for(int j = 0; j < foo; ++j)
 								printf("%s", reads[readBuff[j]].line);
@@ -346,7 +352,7 @@ int main(int argc, char *argv[])
 				for(int pos=0; pos<=thisChrLen; pos++)
 					if(chromTable[pos])
 						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[chrI].c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
+							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
 						else
 							while(chromTable[pos])
 							{
@@ -441,11 +447,6 @@ float sumList2(seqread* reads, int* chromTable, int pos)
 		chromTable[pos] = reads[chromTable[pos]].next;
 	}
 	return sum;
-}
-
-int cmpString(const void* a, const void* b)
-{
-	return( ((const string*)a)->compare(*(const string*)b) );
 }
 
 int cmpSeqreadPtrEnd(const void* a, const void* b)
