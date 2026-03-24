@@ -1,27 +1,70 @@
-Fastest implementation of BED file sorting [genomics]
+# pioSortBed
 
-It replaces the UNIX sort -k1,1 -k2,2n file.bed (in LC_ALL=C)
-and the bedtools sort commands.
+**Ultra-fast BED file sorter for genomics**
 
-Input files: BED3, BED6+n etc
+Sorts BED files by chromosome and start coordinate, equivalent to:
+```
+LC_ALL=C sort -k1,1 -k2,2n file.bed
+```
+but significantly faster on large datasets. Supports BED3, BED6, and extended BED formats.
 
-It uses (what I believe is called) bucket sorting. So effectively does not do any coordinate comparisons,
-just the indexing. In this way it is not anymore O(n*log(n)) problem, but O(n+m) problem, where n is the numer of reads
-and m it the maximum length of a chromosome/contig. So for large datasets it runs in linear time of the number of reads.
-But it sucks on really small files
+## Algorithm
 
+pioSortBed uses bucket sort (counting sort), which avoids coordinate comparisons entirely — reads are placed directly into position-indexed buckets. This reduces the complexity from **O(n log n)** to **O(n + m)**, where *n* is the number of regions and *m* is the maximum chromosome length. For large datasets, sorting runs in linear time.
 
-pioSortBed needs to *store all data in the memory*. Roughly twice as much memory needed than
-the size of the BED file. It is possible to add some swapping in the future.
+> Note: bucket sort has overhead proportional to chromosome length, so it is slower than `sort` on very small files.
 
-There are some compilation-time limits on the lenghts of lines [1024], chromosome name lengths [256]
-and chromosome length limits [1Gbp]. You can change these and recompile.
+## Installation
 
-It can do some trivial operations like collapsing regions if they are multiple lines regions with the same coordinates.
-It does not aim at replacing bedops, bedtools, GenomicRanges etc
+**Dependencies:** GCC, Boost (`boost_program_options`)
 
-It is probably compatible with Unicode characters in read names :-) Uses Boost for hast tables and command line opions.
+```bash
+make
+```
 
+For non-standard Boost locations:
+```bash
+g++ -I/path/to/boost/include -L/path/to/boost/lib \
+    pioSortBed.cpp -o pioSortBed -O3 -lboost_program_options -static
+```
 
-Piotr Balwierz
-Imperial College London
+## Usage
+
+```
+pioSortBed [options] <input.bed>
+pioSortBed [options] -   # read from standard input
+```
+
+| Option | Description |
+|--------|-------------|
+| `-s s` / `--sort s` | Sort by start coordinate (default) |
+| `-s b` / `--sort b` | Sort by start and end coordinate |
+| `-s 5` / `--sort 5` | Sort by 5' end (respects strand: col 6) |
+| `-r` / `--ral` | Input is in RAL format instead of BED |
+| `--collapse` | Collapse overlapping regions, summing weights |
+| `-h` / `--help` | Show help message |
+
+**Examples:**
+```bash
+pioSortBed input.bed > sorted.bed
+cat input.bed | pioSortBed - > sorted.bed
+pioSortBed --sort b input.bed > sorted.bed
+```
+
+## Memory Requirements
+
+All data is loaded into memory. Expect approximately **2× the input file size** in RAM usage.
+
+## Compile-time Limits
+
+These constants can be changed and the program recompiled if needed:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `lineBufSize` | 1024 bytes | Maximum BED line length |
+| `chrNameBufSize` | 256 bytes | Maximum chromosome name length |
+| `chrLenLimit` | 1 Gbp | Maximum chromosome/contig length |
+
+## Author
+
+Piotr Balwierz — Imperial College London
