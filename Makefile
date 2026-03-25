@@ -1,5 +1,5 @@
 CC=g++
-CFLAGS=-I.
+CFLAGS=-I. -O3 -std=c++11
 # static can be removed from the options, but it is safer to keep it and do not recompile often.
 LDFLAGS=-lboost_program_options -static
 DEPS = 

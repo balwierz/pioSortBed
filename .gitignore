@@ -1,2 +1,5 @@
 .vs
 CppProperties.json
+*.o
+pioSortBed
+Out/
