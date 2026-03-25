@@ -165,17 +165,19 @@ static inline int copyField(const char** pp, char* dst, int dstMax)
 	return n;
 }
 
-// BED line parser.
-static int parseBedLine(const char* buf,
-                        char* chr, int chrMax,
-                        int* beg, int* end,
-                        char* weightBuf, int weightMax,
-                        char* strandChar)
+// Minimal BED parser: only chr (as pointer+length into buf), beg, end.
+// Also returns tailPtr: pointer to everything after end field (fields 4+).
+static inline int parseBedLine3(const char* buf,
+                                const char** chrPtr, int* chrLen,
+                                int* beg, int* end,
+                                const char** tailPtr)
 {
 	const char* p = buf;
-
-	int n = copyField(&p, chr, chrMax);
-	if (n == 0) return 0;
+	*chrPtr = p;
+	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
+	*chrLen = (int)(p - *chrPtr);
+	if (*chrLen == 0) return 0;
+	if (*p == '\t' || *p == ' ') p++; else return 0;
 
 	int v = parseUInt(&p);
 	if (v < 0) return 1;
@@ -185,6 +187,35 @@ static int parseBedLine(const char* buf,
 	v = parseUInt(&p);
 	if (v < 0) return 2;
 	*end = v;
+	*tailPtr = p;
+	return 3;
+}
+
+// Full BED parser: chr (as pointer+length), beg, end, weight, strand.
+// Also returns tailPtr (same as parseBedLine3).
+static inline int parseBedLineFull(const char* buf,
+                                   const char** chrPtr, int* chrLen,
+                                   int* beg, int* end,
+                                   char* weightBuf, int weightMax,
+                                   char* strandChar,
+                                   const char** tailPtr)
+{
+	const char* p = buf;
+	*chrPtr = p;
+	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
+	*chrLen = (int)(p - *chrPtr);
+	if (*chrLen == 0) return 0;
+	if (*p == '\t' || *p == ' ') p++; else return 0;
+
+	int v = parseUInt(&p);
+	if (v < 0) return 1;
+	*beg = v;
+	if (*p == '\t' || *p == ' ') p++;
+
+	v = parseUInt(&p);
+	if (v < 0) return 2;
+	*end = v;
+	*tailPtr = p;  // capture tail before parsing deeper fields
 
 	if (*p != '\t' && *p != ' ') return 3;
 	p++;
@@ -195,7 +226,7 @@ static int parseBedLine(const char* buf,
 	p++;
 
 	// field 4: weight
-	n = copyField(&p, weightBuf, weightMax);
+	int n = copyField(&p, weightBuf, weightMax);
 	if (n == 0) return 3;
 
 	// field 5: strand
@@ -243,6 +274,193 @@ static int parseRalLine(const char* buf,
 
 float sumList(seqread* reads, int* readBuff, int foo);
 float sumList2(seqread*, int*, int);
+
+// Fast integer-to-buffer writer. Returns number of chars written.
+static inline int writeUInt(char* buf, int val)
+{
+	if(val == 0) { buf[0] = '0'; return 1; }
+	char tmp[11];
+	int n = 0;
+	while(val > 0) { tmp[n++] = '0' + (val % 10); val /= 10; }
+	for(int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+	return n;
+}
+
+// Reconstruct and write a BED line: chr\tbeg\tend[tail]\n
+// tail includes the leading \t if fields 4+ exist, or is "" for BED3.
+static inline void writeBedLine(const char* chr, int beg, int end,
+                                const char* tail, FILE* out)
+{
+	char buf[32];
+	fputs_unlocked(chr, out);
+	fputc_unlocked('\t', out);
+	int n = writeUInt(buf, beg);
+	buf[n++] = '\t';
+	n += writeUInt(buf + n, end);
+	fwrite_unlocked(buf, 1, n, out);
+	if(tail[0]) fputs_unlocked(tail, out);
+	fputc_unlocked('\n', out);
+}
+
+// Parsing loop, templated on UseMmap to eliminate per-line branch.
+// Uses parseBedLine3 (3 fields only) for the common BED case,
+// parseBedLineFull when weight/strand are needed, parseRalLine for RAL.	// For BED, stores only the "tail" (fields 4+) in reads[].line, saving ~50% memory.
+	// For RAL, stores the full line (RAL output format differs from BED).// Same-chr check uses length-first comparison to avoid string construction.
+template<bool UseMmap>
+static void parseLines(
+    char* mmapBase, size_t mmapSize,
+    FILE* fh,
+    seqread*& reads, int& readCount, int& currMaxReads,
+    string2chrInfoT& chrInfo, string2chrInfoT::iterator& thisChrIt,
+    Arena* arena,
+    bool fRal, int fCollapse, char sortMode)
+{
+	char* mmapCur = mmapBase;
+	char* mmapLim = mmapBase + mmapSize;
+	char stdinBuf[lineBufSize];
+	const bool needExtra = fRal || fCollapse || (sortMode == '5');
+
+	while(1)
+	{
+		char* linePtr;
+
+		if(UseMmap)
+		{
+			if(mmapCur >= mmapLim) break;
+			linePtr = mmapCur;
+			char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
+			if(nl)
+			{
+				if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+				*nl = '\0';
+				mmapCur = nl + 1;
+			}
+			else
+			{
+				mmapCur = mmapLim;
+			}
+		}
+		else
+		{
+			if(!fgets_unlocked(stdinBuf, lineBufSize, fh)) break;
+			linePtr = stdinBuf;
+			// Strip trailing \r\n now so parsers and tailPtr see clean data
+			size_t len = strlen(linePtr);
+			if (len >= 2 && linePtr[len-2] == '\r' && linePtr[len-1] == '\n')
+				{ linePtr[len-2] = '\0'; }
+			else if (len >= 1 && linePtr[len-1] == '\n')
+				{ linePtr[len-1] = '\0'; }
+		}
+
+		if(readCount == currMaxReads)
+		{
+			currMaxReads = (int) (currMaxReads * 2);
+			reads = (seqread*) realloc(reads, currMaxReads * sizeof(seqread));
+		}
+
+		int beg = 0;
+		int end = 0;
+		char strandChar = '+';
+		char weight[chrNameBufSize];
+		weight[0] = '0'; weight[1] = '\0';
+		char chrBuf[chrNameBufSize]; // only used by RAL parser
+		const char* chrPtr;
+		int chrLen;
+		const char* tailPtr = "";
+		int numArgsRead;
+
+		if(fRal)
+		{
+			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+			                           &beg, &end, weight, chrNameBufSize,
+			                           &strandChar);
+			chrPtr = chrBuf;
+			chrLen = (int)strlen(chrBuf);
+		}
+		else if(needExtra)
+		{
+			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
+			                              &beg, &end, weight, chrNameBufSize,
+			                              &strandChar, &tailPtr);
+		}
+		else
+		{
+			numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
+		}
+
+		if(numArgsRead >= 3)
+		{
+			if(beg < 0)
+			{
+				cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
+				exit(1);
+			}
+			if(fRal)
+			{
+				// RAL: store full line (output format differs from BED)
+				if(UseMmap)
+					reads[readCount].line = linePtr;
+				else
+					reads[readCount].line = arena->alloc(linePtr, strlen(linePtr) + 1);
+			}
+			else if(!fCollapse)
+			{
+				// BED: store only tail (fields after chr/beg/end)
+				if(UseMmap)
+				{
+					reads[readCount].line = (char*)tailPtr;
+				}
+				else
+				{
+					size_t tlen = strlen(tailPtr);
+					reads[readCount].line = arena->alloc(tailPtr, tlen + 1);
+				}
+			}
+			else
+			{
+				size_t wlen = strlen(weight);
+				reads[readCount].line = arena->alloc(weight, wlen + 1);
+			}
+			reads[readCount].beg = beg;
+			reads[readCount].end = end;
+			reads[readCount].str = strandChar;
+			int chosenPosition = (sortMode == '5') ? (strandChar == '-' ? end : beg) : beg;
+
+			// Fast same-chr check: compare length first, then bytes.
+			// Avoids constructing a std::string for the common case (same chr).
+			if((int)thisChrIt->first.size() != chrLen ||
+			   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
+			{	// different chromosome
+				pair<string2chrInfoT::iterator,bool> ins =
+					chrInfo.insert(make_pair(string(chrPtr, chrLen), chrInfoT()));
+				thisChrIt = ins.first;
+				if(!ins.second)
+				{
+					if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
+					reads[readCount].next = thisChrIt->second.lastRead;
+				}
+				else
+				{
+					reads[readCount].next = 0;
+					thisChrIt->second.len = chosenPosition;
+				}
+			}
+			else
+			{	// same chromosome as previous line
+				if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
+				reads[readCount].next = thisChrIt->second.lastRead;
+			}
+			thisChrIt->second.lastRead = readCount;
+		}
+		else
+		{
+			cerr << "Error in parsing line: " << linePtr << endl
+				<< "Perhaps this line is malformed?" << endl;
+			exit(1);
+		}
+		readCount ++;
+	}
+}
 
 int main(int argc, char *argv[])
 {
@@ -376,145 +594,17 @@ int main(int argc, char *argv[])
 			chrInfo.insert(make_pair(string(""), chrInfoT()));
 		string2chrInfoT::iterator thisChrIt = insResult.first;
 
-		// Parsing loop
-		char* mmapCur = mmapBase;
-		char* mmapLim = mmapBase + mmapSize;
-		char stdinBuf[lineBufSize];
-
-		while(1)
-		{
-			char* linePtr;
-
-			if(useMmap)
-			{
-				if(mmapCur >= mmapLim) break;
-				linePtr = mmapCur;
-				// memchr uses SIMD on modern glibc — much faster than fgets char-by-char copy
-				char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
-				if(nl)
-				{
-					if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
-					*nl = '\0';
-					mmapCur = nl + 1;
-				}
-				else
-				{
-					// Last line without trailing newline.
-					// The extra byte mapped past EOF is guaranteed to be zero (NUL sentinel).
-					mmapCur = mmapLim;
-				}
-			}
-			else
-			{
-				if(!fgets_unlocked(stdinBuf, lineBufSize, fh)) break;
-				linePtr = stdinBuf;
-			}
-
-			if(readCount == currMaxReads)
-			{
-				currMaxReads = (int) (currMaxReads * 2);
-				reads = (seqread*) realloc(reads, currMaxReads * sizeof(seqread));
-			}
-
-			int beg = 0;
-			int end = 0;
-			char chr[chrNameBufSize];
-			char strandChar = '+';
-			char weight[chrNameBufSize];
-			weight[0] = '0'; weight[1] = '\0'; // default weight
-
-			int numArgsRead;
-			if (fRal)
-				numArgsRead = parseRalLine(linePtr, chr, chrNameBufSize,
-				                           &beg, &end,
-				                           weight, chrNameBufSize,
-				                           &strandChar);
-			else
-				numArgsRead = parseBedLine(linePtr, chr, chrNameBufSize,
-				                           &beg, &end,
-				                           weight, chrNameBufSize,
-				                           &strandChar);
-
-			if(numArgsRead >= 3)
-			{
-				if(beg < 0)
-				{
-					cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
-					exit(1);
-				}
-				if(!fCollapse)
-				{
-					if(useMmap)
-					{
-						// Line is already NUL-terminated in the mmap buffer (no copy needed)
-						reads[readCount].line = linePtr;
-					}
-					else
-					{
-						// Strip trailing \r\n or \n before storing
-						size_t len = strlen(linePtr);
-						if (len >= 2 && linePtr[len-2] == '\r' && linePtr[len-1] == '\n')
-						{
-							linePtr[len-2] = '\0';
-							len -= 2;
-						}
-						else if (len >= 1 && linePtr[len-1] == '\n')
-						{
-							linePtr[len-1] = '\0';
-							len--;
-						}
-						reads[readCount].line = arena->alloc(linePtr, len + 1);
-					}
-				}
-				else
-				{
-					// In collapse mode store just the weight string.
-					size_t wlen = strlen(weight);
-					reads[readCount].line = arena->alloc(weight, wlen + 1);
-				}
-				reads[readCount].beg = beg;
-				reads[readCount].end = end;
-				reads[readCount].str = strandChar;
-				// depending on parameters choose the right position:
-				int chosenPosition = (sortMode == '5') ? (strandChar == '-' ? end : beg) : beg;
-
-				// no lookup if we deal with the same chromosome as in the previous line:
-				if(thisChrIt->first.compare(chr))
-				{	// it is a different chromosome :-(
-					pair<string2chrInfoT::iterator,bool> ins =
-						chrInfo.insert(make_pair(string(chr), chrInfoT()));
-					thisChrIt = ins.first;
-					if(!ins.second)
-					{
-						// We already have seen reads from this chromosome:
-						if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
-						// push head to the list:
-						reads[readCount].next = thisChrIt->second.lastRead;
-					}
-					else
-					{
-						// This chromosome is a new one
-						// create the end element in the list:
-						reads[readCount].next = 0;
-						thisChrIt->second.len = chosenPosition;
-					}
-				}
-				else
-				{	// the same chromosome as in the previous line
-					if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
-					// push head to the list:
-					reads[readCount].next = thisChrIt->second.lastRead;
-				}
-				thisChrIt->second.lastRead = readCount;
-			}
-			else
-			{
-				cerr << "Error in parsing line: " << linePtr << endl
-					<< "Perhaps this line is malformed?" << endl;
-				return(1);
-			}
-			readCount ++;
-		} // while over the lines in the file
+		// Parsing loop (templated on mmap vs stdin to eliminate per-line branch)
+		if(useMmap)
+			parseLines<true>(mmapBase, mmapSize, fh,
+			                 reads, readCount, currMaxReads,
+			                 chrInfo, thisChrIt, arena,
+			                 fRal, fCollapse, sortMode);
+		else
+			parseLines<false>(mmapBase, mmapSize, fh,
+			                  reads, readCount, currMaxReads,
+			                  chrInfo, thisChrIt, arena,
+			                  fRal, fCollapse, sortMode);
 		if(fh) fclose(fh);
 		time(&tend);
 		double difftime_reading = difftime(tend, tstart);
@@ -706,10 +796,23 @@ int main(int argc, char *argv[])
 			}
 			else
 			{
-				for(int i = 0; i < totalReads; i++)
+				if(fRal)
 				{
-					fputs_unlocked(reads[order[i]].line, stdout);
-					fputc_unlocked('\n', stdout);
+					for(int i = 0; i < totalReads; i++)
+					{
+						fputs_unlocked(reads[order[i]].line, stdout);
+						fputc_unlocked('\n', stdout);
+					}
+				}
+				else
+				{
+					for(int i = 0; i < totalReads; i++)
+					{
+						int ri = order[i];
+						writeBedLine(chroms[reads[ri].chrIdx].c_str(),
+						             reads[ri].beg, reads[ri].end,
+						             reads[ri].line, stdout);
+					}
 				}
 			}
 			free(order);
@@ -779,12 +882,17 @@ int main(int argc, char *argv[])
 							// print it out:
 							if(fCollapse)
 								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
-							else
+							else if(fRal)
 								for(int j = 0; j < foo; ++j)
 								{
 									fputs_unlocked(reads[readBuff[j]].line, stdout);
 									fputc_unlocked('\n', stdout);
 								}
+							else
+								for(int j = 0; j < foo; ++j)
+									writeBedLine(it->c_str(), reads[readBuff[j]].beg,
+									             reads[readBuff[j]].end,
+									             reads[readBuff[j]].line, stdout);
 							numReadsBeg[pos] = 0;
 						}
 					}
@@ -798,13 +906,20 @@ int main(int argc, char *argv[])
 						{
 							if(fCollapse)
 								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
-							else
+							else if(fRal)
 								while(chromTable[pos])
 								{
 									fputs_unlocked(reads[chromTable[pos]].line, stdout);
 									fputc_unlocked('\n', stdout);
 									chromTable[pos] = reads[chromTable[pos]].next;
-									// no deallocation here for speed
+								}
+							else
+								while(chromTable[pos])
+								{
+									int ri = chromTable[pos];
+									writeBedLine(it->c_str(), reads[ri].beg, reads[ri].end,
+									             reads[ri].line, stdout);
+									chromTable[pos] = reads[ri].next;
 								}
 						}
 				}

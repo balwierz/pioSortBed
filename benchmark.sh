@@ -10,6 +10,15 @@ PIO="$SCRIPT_DIR/pioSortBed"
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/pioSortBed-bench.XXXXXX")
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Parse options
+VERIFY=0
+for arg in "$@"; do
+    case "$arg" in
+        --verify)    VERIFY=1 ;;
+        --no-verify) VERIFY=0 ;;
+    esac
+done
+
 SIZES=(10000 100000 1000000 5000000 10000000 50000000 100000000)
 CHROMS=("chr1" "chr2" "chr3" "chr4" "chr5" "chr10" "chr11" "chr20" "chrX" "chrY")
 
@@ -186,8 +195,10 @@ for n in "${SIZES[@]}"; do
     generate_bed "$n" "$BENCH_FILE"
 
     # --- Reference: LC_ALL=C sort -k1,1 -k2,2n (gold standard) ---
-    LC_ALL=C sort -k1,1 -k2,2n --buffer-size="$SORT_BUF" "$BENCH_FILE" > "$TMPDIR/ref_out.txt"
-    awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_keys.txt"
+    if (( VERIFY )); then
+        LC_ALL=C sort -k1,1 -k2,2n --buffer-size="$SORT_BUF" "$BENCH_FILE" > "$TMPDIR/ref_out.txt"
+        awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_keys.txt"
+    fi
 
     # --- pioSortBed single-threaded ---
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE"
@@ -230,21 +241,24 @@ for n in "${SIZES[@]}"; do
     fi
 
     # --- Verify correctness vs LC_ALL=C sort reference ---
-    match="OK"
-    for tool in pio1 pio8 bt bo; do
-        outfile="$TMPDIR/${tool}_out.txt"
-        [[ -f "$outfile" ]] || continue
-        awk -F'\t' '{print $1"\t"$2}' "$outfile" > "$TMPDIR/${tool}_keys.txt"
-        if ! diff -q "$TMPDIR/ref_keys.txt" "$TMPDIR/${tool}_keys.txt" > /dev/null 2>&1; then
-            match="${match}/${tool} ORDER"
-            continue
-        fi
-        LC_ALL=C sort "$outfile" > "$TMPDIR/${tool}_fullsort.txt"
-        LC_ALL=C sort "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_fullsort.txt"
-        if ! diff -q "$TMPDIR/ref_fullsort.txt" "$TMPDIR/${tool}_fullsort.txt" > /dev/null 2>&1; then
-            match="${match}/${tool} LINES"
-        fi
-    done
+    match="-"
+    if (( VERIFY )); then
+        match="OK"
+        for tool in pio1 pio8 bt bo; do
+            outfile="$TMPDIR/${tool}_out.txt"
+            [[ -f "$outfile" ]] || continue
+            awk -F'\t' '{print $1"\t"$2}' "$outfile" > "$TMPDIR/${tool}_keys.txt"
+            if ! diff -q "$TMPDIR/ref_keys.txt" "$TMPDIR/${tool}_keys.txt" > /dev/null 2>&1; then
+                match="${match}/${tool} ORDER"
+                continue
+            fi
+            LC_ALL=C sort "$outfile" > "$TMPDIR/${tool}_fullsort.txt"
+            LC_ALL=C sort "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_fullsort.txt"
+            if ! diff -q "$TMPDIR/ref_fullsort.txt" "$TMPDIR/${tool}_fullsort.txt" > /dev/null 2>&1; then
+                match="${match}/${tool} LINES"
+            fi
+        done
+    fi
 
     # --- Print row ---
     printf "$SEP" "$(fmt_reads $n)"
