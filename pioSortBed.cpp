@@ -405,13 +405,14 @@ static void parseLines(
 			}
 			else if(!fCollapse)
 			{
-				// BED: store only tail (fields after chr/beg/end)
 				if(UseMmap)
 				{
-					reads[readCount].line = (char*)tailPtr;
+					// mmap: point to full line (zero-copy, fast output)
+					reads[readCount].line = linePtr;
 				}
 				else
 				{
+					// stdin: store only tail to save arena memory
 					size_t tlen = strlen(tailPtr);
 					reads[readCount].line = arena->alloc(tailPtr, tlen + 1);
 				}
@@ -479,6 +480,7 @@ int main(int argc, char *argv[])
 		"  Chromosome length limit: " + to_string(chrLenLimit/1000000) + "Mbp\n"
 		"  Chromosome/contig number limit: unlimited\n"
 		"  Read number limit: unlimited (but will be kept in the memory)\n"};
+	app.set_version_flag("-V,--version", "1.2.1");
 
 	string inputFile;
 	char sortMode = 's';
@@ -796,8 +798,9 @@ int main(int argc, char *argv[])
 			}
 			else
 			{
-				if(fRal)
+				if(fRal || useMmap)
 				{
+					// Full line pointer (RAL or mmap): fast single fputs
 					for(int i = 0; i < totalReads; i++)
 					{
 						fputs_unlocked(reads[order[i]].line, stdout);
@@ -806,6 +809,7 @@ int main(int argc, char *argv[])
 				}
 				else
 				{
+					// stdin BED: reconstruct from tail
 					for(int i = 0; i < totalReads; i++)
 					{
 						int ri = order[i];
@@ -882,7 +886,7 @@ int main(int argc, char *argv[])
 							// print it out:
 							if(fCollapse)
 								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
-							else if(fRal)
+							else if(fRal || useMmap)
 								for(int j = 0; j < foo; ++j)
 								{
 									fputs_unlocked(reads[readBuff[j]].line, stdout);
@@ -906,7 +910,7 @@ int main(int argc, char *argv[])
 						{
 							if(fCollapse)
 								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
-							else if(fRal)
+							else if(fRal || useMmap)
 								while(chromTable[pos])
 								{
 									fputs_unlocked(reads[chromTable[pos]].line, stdout);
