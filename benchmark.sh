@@ -401,6 +401,7 @@ if command -v gnuplot &>/dev/null; then
     cat > "$GNUPLOT_SCRIPT" <<'GPEOF'
 set datafile separator ','
 set logscale x 10
+set xrange [1e6:]
 set logscale y 10
 set format x '%.0s%c'
 set xtics nomirror

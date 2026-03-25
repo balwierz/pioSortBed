@@ -103,7 +103,6 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 100k  | 20 ms    | **10 ms**| 20 ms         | 70 ms     | 60 ms     | 80 ms      | 50 ms     |
 | 1M    | 260 ms   | **190 ms**| 210 ms       | 850 ms    | **260 ms**| 820 ms     | 580 ms    |
 | 5M    | 1.82 s   | 1.16 s   | **1.01 s**    | 4.96 s    | 1.51 s    | 4.30 s     | 3.27 s    |
 | 50M   | 17.82 s  | 17.94 s  | **10.41 s**   | 64.8 s    | 19.01 s   | 51.74 s    | 33.12 s   |
@@ -122,13 +121,11 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 10k   | 3.3 MB   | 3.4 MB   | 3.4 MB        | 6.0 MB    | 3.4 MB    | 8.9 MB     | **1.8 MB**|
-| 100k  | **10.1 MB**| 10.2 MB| 9.5 MB        | 11.4 MB   | 12.0 MB   | 47.5 MB    | 8.5 MB    |
-| 1M    | 71.1 MB  | 73.4 MB  | **64.8 MB**   | 88.4 MB   | 164.6 MB  | 409.6 MB   | 54.8 MB   |
-| 5M    | 337.9 MB | 355.8 MB | **318.1 MB**  | 432.6 MB  | 814.1 MB  | 2.0 GB     | 268.3 MB  |
-| 10M   | 674.4 MB | 711.0 MB | **633.9 MB**  | 863.6 MB  | 1.6 GB    | 3.9 GB     | 535.3 MB  |
-| 50M   | 4.1 GB   | 4.1 GB   | **3.1 GB**    | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
-| 100M  | 7.2 GB   | 7.2 GB   | **6.2 GB**    | 8.5 GB    | 14.8 GB   | 24.5 GB    | 5.2 GB    |
+| 1M    | 71.1 MB  | 73.4 MB  | 64.8 MB       | 88.4 MB   | 164.6 MB  | 409.6 MB   | **54.8 MB**|
+| 5M    | 337.9 MB | 355.8 MB | 318.1 MB      | 432.6 MB  | 814.1 MB  | 2.0 GB     | **268.3 MB**|
+| 10M   | 674.4 MB | 711.0 MB | 633.9 MB      | 863.6 MB  | 1.6 GB    | 3.9 GB     | **535.3 MB**|
+| 50M   | 4.1 GB   | 4.1 GB   | 3.1 GB        | 4.2 GB    | 8.0 GB    | 19.4 GB    | **2.6 GB**|
+| 100M  | 7.2 GB   | 7.2 GB   | 6.2 GB        | 8.5 GB    | 14.8 GB   | 24.5 GB    | **5.2 GB**|
 
 **Key observations:**
 - **pioSortBed low-mem mode** reduces peak RAM on large files (50M: **3.1 GB vs 4.1 GB**; 100M: **6.2 GB vs 7.2 GB**)
