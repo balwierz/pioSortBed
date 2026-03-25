@@ -62,11 +62,9 @@ All data is loaded into memory. Expect approximately **2× the input file size**
 
 Sorting random BED6 files (10 chromosomes, coordinates 0–249 Mbp). Wall time and peak RSS measured with GNU time. All tools verified to produce identical sort order.
 
-![Benchmark plot](benchmark_plot.png)
-
-Solid lines = wall time (left axis), dashed lines = peak memory (right axis). Log–log scale.
-
 ### Wall time
+
+![Wall time](benchmark_time.png)
 
 | Reads | pio 1t | pio 8t | sort 1t | sort 8t | bedtools | bedops |
 |------:|-------:|-------:|--------:|--------:|---------:|-------:|
@@ -78,6 +76,8 @@ Solid lines = wall time (left axis), dashed lines = peak memory (right axis). Lo
 | 50M   | **29.45 s** | 29.71 s | 2min25s | 1min33s | 1min48s | 1min02s |
 
 ### Peak memory (RSS)
+
+![Peak memory](benchmark_memory.png)
 
 | Reads | pio 1t | pio 8t | sort 1t | sort 8t | bedtools | bedops |
 |------:|-------:|-------:|--------:|--------:|---------:|-------:|

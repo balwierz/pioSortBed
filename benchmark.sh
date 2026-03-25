@@ -365,36 +365,21 @@ echo ""
 # Generate plot with gnuplot
 # ---------------------------------------------------------------------------
 
-PLOT_FILE="$SCRIPT_DIR/benchmark_plot.png"
+PLOT_TIME="$SCRIPT_DIR/benchmark_time.png"
+PLOT_MEM="$SCRIPT_DIR/benchmark_memory.png"
 
 if command -v gnuplot &>/dev/null; then
-    echo "Generating plot: $PLOT_FILE"
+    echo "Generating plots: $PLOT_TIME, $PLOT_MEM"
     GNUPLOT_SCRIPT="$TMPDIR/plot.gp"
     cat > "$GNUPLOT_SCRIPT" <<'GPEOF'
-set terminal pngcairo size 900,500 enhanced font 'Arial,11'
-set output 'PLOT_PLACEHOLDER'
-
 set datafile separator ','
-
-set title "pioSortBed Benchmark" font ',14'
-set xlabel 'Number of reads'
-set ylabel 'Wall time (seconds)' textcolor rgb '#333333'
-set y2label 'Peak RSS (MB)' textcolor rgb '#999999'
-
 set logscale x 10
 set logscale y 10
-set logscale y2 10
 set format x '%.0s%c'
-set format y '%.2g'
-set format y2 '%.0f'
-
 set xtics nomirror
-set ytics nomirror textcolor rgb '#333333'
-set y2tics nomirror textcolor rgb '#999999'
-
+set ytics nomirror
 set key top left font ',10' spacing 1.2
 set grid xtics ytics lt 0 lw 0.5 lc rgb '#dddddd'
-set border 11
 
 set style line 1 lc rgb '#e41a1c' lw 2.2 pt 7  ps 1.0
 set style line 2 lc rgb '#377eb8' lw 2.2 pt 7  ps 1.0
@@ -403,19 +388,38 @@ set style line 4 lc rgb '#ff7f00' lw 2.2 pt 7  ps 1.0
 set style line 5 lc rgb '#984ea3' lw 2.2 pt 7  ps 1.0
 set style line 6 lc rgb '#a65628' lw 2.2 pt 7  ps 1.0
 
+# --- Wall time plot ---
+set terminal pngcairo size 900,400 enhanced font 'Arial,11'
+set output 'PLOT_TIME_PH'
+set title "Wall time" font ',14'
+set xlabel 'Number of reads'
+set ylabel 'Wall time (seconds)'
+set format y '%.2g'
+
 plot 'CSV_PLACEHOLDER' \
-    skip 1 using 1:($2/1000.0) axes x1y1 with linespoints ls 1 title 'pio 1t', \
- '' skip 1 using 1:($4/1000.0) axes x1y1 with linespoints ls 2 title 'pio 8t', \
- '' skip 1 using 1:($6/1000.0) axes x1y1 with linespoints ls 3 title 'sort 1t', \
- '' skip 1 using 1:($8/1000.0) axes x1y1 with linespoints ls 4 title 'sort 8t', \
- '' skip 1 using 1:($10/1000.0) axes x1y1 with linespoints ls 5 title 'bedtools', \
- '' skip 1 using 1:($12/1000.0) axes x1y1 with linespoints ls 1 dt 2 lw 1.4 title 'bedops', \
- '' skip 1 using 1:($5/1024.0)  axes x1y2 with linespoints ls 2 dt 4 lw 1.4 pt 5 ps 0.8 title 'pio 8t mem', \
- '' skip 1 using 1:($9/1024.0)  axes x1y2 with linespoints ls 4 dt 4 lw 1.4 pt 5 ps 0.8 title 'sort 8t mem', \
- '' skip 1 using 1:($11/1024.0) axes x1y2 with linespoints ls 5 dt 4 lw 1.4 pt 5 ps 0.8 title 'bedtools mem'
+    skip 1 using 1:($2/1000.0) with linespoints ls 1 title 'pioSortBed 1t', \
+ '' skip 1 using 1:($4/1000.0) with linespoints ls 2 title 'pioSortBed 8t', \
+ '' skip 1 using 1:($6/1000.0) with linespoints ls 3 title 'GNU sort 1t', \
+ '' skip 1 using 1:($8/1000.0) with linespoints ls 4 title 'GNU sort 8t', \
+ '' skip 1 using 1:($10/1000.0) with linespoints ls 5 title 'bedtools sort', \
+ '' skip 1 using 1:($12/1000.0) with linespoints ls 6 title 'bedops sort-bed'
+
+# --- Memory plot ---
+set output 'PLOT_MEM_PH'
+set title "Peak memory (RSS)" font ',14'
+set ylabel 'Peak RSS (MB)'
+set format y '%.0f'
+
+plot 'CSV_PLACEHOLDER' \
+    skip 1 using 1:($3/1024.0) with linespoints ls 1 title 'pioSortBed 1t', \
+ '' skip 1 using 1:($5/1024.0) with linespoints ls 2 title 'pioSortBed 8t', \
+ '' skip 1 using 1:($7/1024.0) with linespoints ls 3 title 'GNU sort 1t', \
+ '' skip 1 using 1:($9/1024.0) with linespoints ls 4 title 'GNU sort 8t', \
+ '' skip 1 using 1:($11/1024.0) with linespoints ls 5 title 'bedtools sort', \
+ '' skip 1 using 1:($13/1024.0) with linespoints ls 6 title 'bedops sort-bed'
 GPEOF
-    sed -i "s|PLOT_PLACEHOLDER|$PLOT_FILE|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$GNUPLOT_SCRIPT"
-    gnuplot "$GNUPLOT_SCRIPT" && echo "Plot saved to $PLOT_FILE" || echo "gnuplot failed"
+    sed -i "s|PLOT_TIME_PH|$PLOT_TIME|g; s|PLOT_MEM_PH|$PLOT_MEM|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$GNUPLOT_SCRIPT"
+    gnuplot "$GNUPLOT_SCRIPT" && echo "Plots saved" || echo "gnuplot failed"
 else
     echo "gnuplot not found — skipping plot generation"
 fi

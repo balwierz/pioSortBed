@@ -5,3 +5,4 @@ pioSortBed
 Out/
 benchmark_results.csv
 pioSortBed-linux-x86_64
+benchmark_plot.png
