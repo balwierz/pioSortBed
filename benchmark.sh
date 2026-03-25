@@ -417,7 +417,7 @@ set style line 6 lc rgb '#a65628' lw 2.2 pt 7  ps 1.0
 set style line 7 lc rgb '#f781bf' lw 2.2 pt 7  ps 1.0
 
 # --- Wall time plot ---
-set terminal pngcairo size 900,400 enhanced font 'Arial,11'
+set terminal pngcairo size 900,600 enhanced font 'Arial,11'
 set output 'PLOT_TIME_PH'
 set title "Wall time" font ',14'
 set xlabel 'Number of reads'

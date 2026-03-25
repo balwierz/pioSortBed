@@ -103,7 +103,6 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 10k   | —        | —        | —             | **10 ms** | —         | **10 ms**  | —         |
 | 100k  | 20 ms    | **10 ms**| 20 ms         | 70 ms     | 60 ms     | 80 ms      | 50 ms     |
 | 1M    | 260 ms   | **190 ms**| 210 ms       | 850 ms    | **260 ms**| 820 ms     | 580 ms    |
 | 5M    | 1.82 s   | 1.16 s   | **1.01 s**    | 4.96 s    | 1.51 s    | 4.30 s     | 3.27 s    |
