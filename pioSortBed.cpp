@@ -718,7 +718,7 @@ int main(int argc, char *argv[])
 	char* outBuf = (char*) malloc(1 << 20);
 	setvbuf(stdout, outBuf, _IOFBF, 1 << 20);
 
-	CLI::App app{"Ultra fast bed file sorter\nPiotr Balwierz, 2012\n\n"
+	CLI::App app{"Ultra fast bed file sorter\nPiotr Balwierz, 2012-2026\n\n"
 		"Results are equivalent to \"LC_ALL=C sort -k1,1 -k2,2n file.bed\"\n"
 		"or \"sort -k1,1 -k2,2n -k3,3n file.bed\" if --sort=b enabled.\n"
 		"Uses one thread by default and sorts at ~disk IO throughput limits.\n\n"
