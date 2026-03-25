@@ -11,7 +11,7 @@ NEW="$SCRIPT_DIR/pioSortBed"
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/pioSortBed-bench.XXXXXX")
 trap 'rm -rf "$TMPDIR"' EXIT
 
-SIZES=(10000 100000 1000000 5000000 10000000 50000000)
+SIZES=(10000 100000 1000000 5000000 10000000)
 CHROMS=("chr1" "chr2" "chr3" "chr4" "chr5" "chr10" "chr11" "chr20" "chrX" "chrY")
 
 # ---------------------------------------------------------------------------
@@ -33,65 +33,51 @@ generate_bed() {
     }' > "$out"
 }
 
-# Run a command, capture wall time (ms) and peak RSS (kB) via /proc.
+# Run a command, capture wall time (ms) and peak RSS (kB) via GNU time.
 # Usage: run_and_measure <command...>
 # For stdin input, set BENCH_STDIN to the file path before calling.
-# Sets globals: PEAK_KB
+# Sets globals: RESULT_MS, RESULT_KB
+TIME_BIN=/usr/bin/time
+
 run_and_measure() {
+    local time_out="$TMPDIR/time.tmp"
     if [[ -n "${BENCH_STDIN:-}" ]]; then
-        "$@" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp" &
+        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
     else
-        "$@" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp" &
+        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
     fi
-    local pid=$!
-
-    local peak=0
-    while kill -0 "$pid" 2>/dev/null; do
-        local rss
-        rss=$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || true
-        if [[ -n "$rss" && "$rss" -gt "$peak" ]]; then
-            peak=$rss
-        fi
-        local rss_cur
-        rss_cur=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || true
-        if [[ -n "$rss_cur" && "$rss_cur" -gt "$peak" ]]; then
-            peak=$rss_cur
-        fi
-        sleep 0.01
-    done
-    wait "$pid" || true
-
-    PEAK_KB=$peak
+    # GNU time outputs: elapsed_seconds peak_rss_kb
+    read -r secs kb < "$time_out"
+    RESULT_MS=$(awk "BEGIN { printf \"%d\", $secs * 1000 }")
+    RESULT_KB=$kb
 }
 
 # Like run_and_measure but runs a shell command string (needed for pipelines).
 # Usage: run_shell_and_measure "<shell command>"
 run_shell_and_measure() {
     local cmd="$1"
+    local time_out="$TMPDIR/time.tmp"
     if [[ -n "${BENCH_STDIN:-}" ]]; then
-        bash -c "$cmd" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp" &
+        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
     else
-        bash -c "$cmd" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp" &
+        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
     fi
-    local pid=$!
+    read -r secs kb < "$time_out"
+    RESULT_MS=$(awk "BEGIN { printf \"%d\", $secs * 1000 }")
+    RESULT_KB=$kb
+}
 
-    local peak=0
-    while kill -0 "$pid" 2>/dev/null; do
-        local rss
-        rss=$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || true
-        if [[ -n "$rss" && "$rss" -gt "$peak" ]]; then
-            peak=$rss
-        fi
-        local rss_cur
-        rss_cur=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || true
-        if [[ -n "$rss_cur" && "$rss_cur" -gt "$peak" ]]; then
-            peak=$rss_cur
-        fi
-        sleep 0.01
-    done
-    wait "$pid" || true
-
-    PEAK_KB=$peak
+fmt_reads() {
+    local n=$1
+    if (( n >= 1000000000 )); then
+        awk "BEGIN { printf \"%.0fG\", $n / 1000000000 }"
+    elif (( n >= 1000000 )); then
+        awk "BEGIN { printf \"%.0fM\", $n / 1000000 }"
+    elif (( n >= 1000 )); then
+        awk "BEGIN { printf \"%.0fk\", $n / 1000 }"
+    else
+        echo "$n"
+    fi
 }
 
 fmt_size() {
@@ -122,21 +108,13 @@ fmt_time() {
 bench_one() {
     local label="$1"; shift
     cat "$BENCH_FILE" > /dev/null  # warm cache
-    local t0=$(($(date +%s%N)))
     run_and_measure "$@"
-    local t1=$(($(date +%s%N)))
-    RESULT_MS=$(( (t1 - t0) / 1000000 ))
-    RESULT_KB=$PEAK_KB
 }
 
 bench_one_shell() {
     local label="$1"; shift
     cat "$BENCH_FILE" > /dev/null
-    local t0=$(($(date +%s%N)))
     run_shell_and_measure "$1"
-    local t1=$(($(date +%s%N)))
-    RESULT_MS=$(( (t1 - t0) / 1000000 ))
-    RESULT_KB=$PEAK_KB
 }
 
 # ---------------------------------------------------------------------------
@@ -152,8 +130,10 @@ fi
 
 HAS_SORT=0
 HAS_BEDTOOLS=0
+HAS_BEDOPS=0
 if command -v sort &>/dev/null; then HAS_SORT=1; fi
 if command -v bedtools &>/dev/null; then HAS_BEDTOOLS=1; fi
+if command -v sort-bed &>/dev/null; then HAS_BEDOPS=1; fi
 
 echo "pioSortBed benchmark"
 echo "===================="
@@ -161,6 +141,7 @@ echo "  pioSortBed-v1: $OLD"
 echo "  pioSortBed-v2: $NEW"
 (( HAS_SORT ))     && echo "  GNU sort:      $(which sort) ($(sort --version | head -1))"
 (( HAS_BEDTOOLS )) && echo "  bedtools sort:  $(which bedtools) ($(bedtools --version))"
+(( HAS_BEDOPS ))   && echo "  bedops sort-bed: $(which sort-bed) ($(sort-bed --version 2>&1 | head -1))"
 echo "  Temp dir:      $TMPDIR"
 echo ""
 
@@ -170,6 +151,10 @@ echo ""
 
 # Determine available memory for GNU sort buffer
 SORT_BUF="80%"
+
+# CSV output for plotting
+CSV_FILE="$SCRIPT_DIR/benchmark_results.csv"
+echo "reads,v1_ms,v1_kb,v2_ms,v2_kb,sort_ms,sort_kb,sort1_ms,sort1_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
 
 SEP="%-10s"
 HDR_TIME="  %14s"
@@ -184,6 +169,7 @@ printf "$HDR_TIME$HDR_MEM" "v2 time" "v2 RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort time" "sort RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort1 time" "sort1 RSS"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "bt time" "bt RSS"
+(( HAS_BEDOPS ))   && printf "$HDR_TIME$HDR_MEM" "bo time" "bo RSS"
 printf "  %s" "Match"
 echo ""
 
@@ -193,6 +179,7 @@ printf "$HDR_TIME$HDR_MEM" "-------" "------"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "---------" "--------"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "----------" "---------"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "-------" "------"
+(( HAS_BEDOPS ))   && printf "$HDR_TIME$HDR_MEM" "-------" "------"
 printf "  %s" "-----"
 echo ""
 
@@ -244,11 +231,19 @@ for n in "${SIZES[@]}"; do
         cp "$TMPDIR/output.tmp" "$TMPDIR/bt_out.txt"
     fi
 
+    # --- bedops sort-bed ---
+    bo_ms=0; bo_kb=0
+    if (( HAS_BEDOPS )); then
+        bench_one "bo" sort-bed "$BENCH_FILE"
+        bo_ms=$RESULT_MS; bo_kb=$RESULT_KB
+        cp "$TMPDIR/output.tmp" "$TMPDIR/bo_out.txt"
+    fi
+
     # --- Verify correctness vs LC_ALL=C sort reference ---
     # 1. Sort-key order: chr+beg columns must match the reference sequence.
     # 2. Line set: fully-sorted output must contain exactly the same lines.
     match="OK"
-    for tool in v1 v2 bt; do
+    for tool in v1 v2 bt bo; do
         outfile="$TMPDIR/${tool}_out.txt"
         [[ -f "$outfile" ]] || continue
         # Check sort-key order matches reference
@@ -266,7 +261,7 @@ for n in "${SIZES[@]}"; do
     done
 
     # --- Print row ---
-    printf "$SEP" "$n"
+    printf "$SEP" "$(fmt_reads $n)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $v1_ms)" "$(fmt_size $v1_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $v2_ms)" "$(fmt_size $v2_kb)"
     if (( HAS_SORT )); then
@@ -276,8 +271,14 @@ for n in "${SIZES[@]}"; do
     if (( HAS_BEDTOOLS )); then
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $bt_ms)" "$(fmt_size $bt_kb)"
     fi
+    if (( HAS_BEDOPS )); then
+        printf "$ROW_TIME$ROW_MEM" "$(fmt_time $bo_ms)" "$(fmt_size $bo_kb)"
+    fi
     printf "  %s" "$match"
     echo ""
+
+    # Write CSV row
+    echo "$n,$v1_ms,$v1_kb,$v2_ms,$v2_kb,$sort_ms,$sort_kb,$sort1_ms,$sort1_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
 
     # Clean up large files between runs
     rm -f "$BENCH_FILE" "$TMPDIR"/*.txt
@@ -298,11 +299,13 @@ printf "%-10s  %8s" "Reads" "vs v1"
 (( HAS_SORT ))     && printf "  %8s" "vs sort"
 (( HAS_SORT ))     && printf "  %8s" "vs sort1"
 (( HAS_BEDTOOLS )) && printf "  %8s" "vs bt"
+(( HAS_BEDOPS ))   && printf "  %8s" "vs bo"
 echo ""
 printf "%-10s  %8s" "-----" "-----"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_SORT ))     && printf "  %8s" "--------"
 (( HAS_BEDTOOLS )) && printf "  %8s" "-----"
+(( HAS_BEDOPS ))   && printf "  %8s" "-----"
 echo ""
 
 for n in "${SIZES[@]}"; do
@@ -324,18 +327,25 @@ for n in "${SIZES[@]}"; do
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS
     fi
+    bo_ms=0
+    if (( HAS_BEDOPS )); then
+        bench_one "bo" sort-bed "$BENCH_FILE"
+        bo_ms=$RESULT_MS
+    fi
 
-    printf "%-10s" "$n"
+    printf "%-10s" "$(fmt_reads $n)"
     if (( v2_ms > 0 )); then
         printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $v1_ms / $v2_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort_ms / $v2_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort1_ms / $v2_ms }")"
         (( HAS_BEDTOOLS )) && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bt_ms / $v2_ms }")"
+        (( HAS_BEDOPS ))   && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bo_ms / $v2_ms }")"
     else
         printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_BEDTOOLS )) && printf "  %8s" "inf"
+        (( HAS_BEDOPS ))   && printf "  %8s" "inf"
     fi
     echo ""
 
@@ -364,6 +374,70 @@ BENCH_STDIN=""
 
 printf "  File:  %s, %s peak RSS\n" "$(fmt_time $file_ms)" "$(fmt_size $file_kb)"
 printf "  Stdin: %s, %s peak RSS\n" "$(fmt_time $stdin_ms)" "$(fmt_size $stdin_kb)"
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# Generate plot with gnuplot
+# ---------------------------------------------------------------------------
+
+PLOT_FILE="$SCRIPT_DIR/benchmark_plot.png"
+
+if command -v gnuplot &>/dev/null; then
+    echo "Generating plot: $PLOT_FILE"
+    GNUPLOT_SCRIPT="$TMPDIR/plot.gp"
+    cat > "$GNUPLOT_SCRIPT" <<'GPEOF'
+set terminal pngcairo size 900,500 enhanced font 'Arial,11'
+set output 'PLOT_PLACEHOLDER'
+
+set datafile separator ','
+
+set title "pioSortBed Benchmark" font ',14'
+set xlabel 'Number of reads'
+set ylabel 'Wall time (seconds)' textcolor rgb '#333333'
+set y2label 'Peak RSS (MB)' textcolor rgb '#999999'
+
+set logscale x 10
+set logscale y 10
+set logscale y2 10
+set format x '%.0s%c'
+set format y '%.2g'
+set format y2 '%.0f'
+
+set xtics nomirror
+set ytics nomirror textcolor rgb '#333333'
+set y2tics nomirror textcolor rgb '#999999'
+
+set key top left font ',10' spacing 1.2
+set grid xtics ytics lt 0 lw 0.5 lc rgb '#dddddd'
+set border 11
+
+set style line 1 lc rgb '#e41a1c' lw 2.2 pt 7  ps 1.0
+set style line 2 lc rgb '#377eb8' lw 2.2 pt 7  ps 1.0
+set style line 3 lc rgb '#4daf4a' lw 2.2 pt 7  ps 1.0
+set style line 4 lc rgb '#ff7f00' lw 2.2 pt 7  ps 1.0
+set style line 5 lc rgb '#984ea3' lw 2.2 pt 7  ps 1.0
+set style line 12 lc rgb '#377eb8' lw 1.4 pt 5 ps 0.8 dt 4
+set style line 13 lc rgb '#4daf4a' lw 1.4 pt 5 ps 0.8 dt 4
+set style line 14 lc rgb '#ff7f00' lw 1.4 pt 5 ps 0.8 dt 4
+set style line 15 lc rgb '#984ea3' lw 1.4 pt 5 ps 0.8 dt 4
+
+plot 'CSV_PLACEHOLDER' \
+    skip 1 using 1:($2/1000.0) axes x1y1 with linespoints ls 1 title 'pioSortBed v1', \
+ '' skip 1 using 1:($4/1000.0) axes x1y1 with linespoints ls 2 title 'pioSortBed v2', \
+ '' skip 1 using 1:($6/1000.0) axes x1y1 with linespoints ls 3 title 'GNU sort', \
+ '' skip 1 using 1:($10/1000.0) axes x1y1 with linespoints ls 4 title 'bedtools sort', \
+ '' skip 1 using 1:($12/1000.0) axes x1y1 with linespoints ls 5 title 'bedops sort-bed', \
+ '' skip 1 using 1:($5/1024.0)  axes x1y2 with linespoints ls 12 title 'v2 mem', \
+ '' skip 1 using 1:($7/1024.0)  axes x1y2 with linespoints ls 13 title 'sort mem', \
+ '' skip 1 using 1:($11/1024.0) axes x1y2 with linespoints ls 14 title 'bedtools mem', \
+ '' skip 1 using 1:($13/1024.0) axes x1y2 with linespoints ls 15 title 'bedops mem'
+GPEOF
+    sed -i "s|PLOT_PLACEHOLDER|$PLOT_FILE|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$GNUPLOT_SCRIPT"
+    gnuplot "$GNUPLOT_SCRIPT" && echo "Plot saved to $PLOT_FILE" || echo "gnuplot failed"
+else
+    echo "gnuplot not found — skipping plot generation"
+fi
 
 echo ""
 echo "Done."

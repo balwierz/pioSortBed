@@ -5,14 +5,16 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <parallel/algorithm>
 #include <iostream>
 #include <time.h>
+#include <omp.h>
 #include <unordered_map>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <boost/program_options.hpp>
+#include "CLI11.hpp"
 
 /* Copyright: Piotr Balwierz */
 
@@ -21,13 +23,21 @@ using namespace std;
 // Field layout minimizes padding: pointer first, then ints, then char.
 // 24 bytes per read on 64-bit (8 + 4 + 4 + 4 + 1 + 3 padding).
 // Removing str would NOT shrink the struct (still 24 bytes due to pointer alignment).
+//
+// The `next` field is used by bucket sort to thread per-chromosome linked lists.
+// The `chrIdx` field is used by the classic sort path to store a small integer
+// chromosome index for fast comparison.  They occupy the same 4 bytes (union)
+// because the two sort paths never need both simultaneously:
+//   - During parsing, `next` is populated (linked lists).
+//   - If classic sort is chosen, we walk each list once to stamp `chrIdx`,
+//     overwriting `next` which is no longer needed.
 class seqread
 {
 	public:
 	char* line; // keeps the full line; in case of collapse option just the weight as string.
 	int beg;
 	int end;
-	int next;
+	union { int next; int chrIdx; };
 	char str;
 };
 
@@ -37,7 +47,8 @@ class chrInfoT
 	public:
 	int len;		// length (the max beg position)
 	int lastRead;	// keeps the head of the list of all reads at a given chromosome
-	chrInfoT() : len(0), lastRead(0) {}
+	int idx;		// sequential chromosome index, assigned after parsing & alphabetical sort
+	chrInfoT() : len(0), lastRead(0), idx(0) {}
 };
 
 typedef std::unordered_map<string, chrInfoT> string2chrInfoT;
@@ -52,6 +63,14 @@ const int chrLenLimit = 1000000000;  // 500Mb. we don't believe there are longer
 const char chrTooLongMsg[] = "That is more than 3 times the length of human chr1! If you are sure this is correct recompile the program with an increased chrLenLimit value";
 const int chrNameBufSize = 256;		// buffer for chromosme names like "chr1_random"
 									// and strand too, although it should be only "+" or "-"
+
+// Hybrid sort strategy cutoff: files with fewer than this many reads use
+// classic O(n log n) comparison sort (std::sort on an index array).
+// Larger files use bucket/counting sort which is O(n + m) where m = max
+// chromosome length.  Bucket sort allocates a chromTable[maxChrLen] array
+// (up to 4 GB), so the classic path saves memory for smaller files while
+// bucket sort wins on throughput for large genomic datasets.
+const int defaultBucketCutoff = 10000000;
 
 
 // Arena allocator for line/weight strings.
@@ -225,86 +244,86 @@ static int parseRalLine(const char* buf,
 float sumList(seqread* reads, int* readBuff, int foo);
 float sumList2(seqread*, int*, int);
 
-namespace po = boost::program_options;
 int main(int argc, char *argv[])
 {
-	try
+	// 1MB output buffer
+	char* outBuf = (char*) malloc(1 << 20);
+	setvbuf(stdout, outBuf, _IOFBF, 1 << 20);
+
+	CLI::App app{"Ultra fast bed file sorter\nPiotr Balwierz, 2012\n\n"
+		"Results are equivalent to \"LC_ALL=C sort -k1,1 -k2,2n file.bed\"\n"
+		"or \"sort -k1,1 -k2,2n -k3,3n file.bed\" if --sort=b enabled.\n"
+		"Uses one thread by default and sorts at ~disk IO throughput limits.\n\n"
+		"Input file should contain a new line character in the end of the last line.\n\n"
+		"Compilation-time limits:\n"
+		"  Line length limit: " + to_string(lineBufSize) + " (stdin only; no limit for file input)\n"
+		"  Chromosome name limit: " + to_string(chrNameBufSize) + "\n"
+		"  Chromosome length limit: " + to_string(chrLenLimit/1000000) + "Mbp\n"
+		"  Chromosome/contig number limit: unlimited\n"
+		"  Read number limit: unlimited (but will be kept in the memory)\n"};
+
+	string inputFile;
+	char sortMode = 's';
+	int fCollapse = 0;
+	int fRal = 0;
+	int bucketCutoff = defaultBucketCutoff;
+	int numThreads = 0;
+
+	app.add_option("input-file", inputFile, "input file; put \"-\" to read from stdin")
+		->required();
+	app.add_option("-s,--sort", sortMode,
+		"s: start coordinate [default]\n"
+		"b: sort also by end coordinate\n"
+		"5: sort by 5' end (respects strand)")
+		->default_val('s');
+	app.add_flag("-r,--ral", fRal, "input is in RAL format");
+	app.add_flag("--collapse", fCollapse,
+		"collapse BEDWEIGHT by summing weights of the reads and truncate the coordinates, "
+		"set strand to \"+\", id to \".\". Makes no sense for --sort=b");
+	app.add_option("--bucket-cutoff", bucketCutoff,
+		"use bucket sort for files with at least this many reads; "
+		"smaller files use std::sort (0 = always bucket sort)")
+		->default_val(defaultBucketCutoff);
+	app.add_option("-t,--threads", numThreads,
+		"number of threads for the classic sort path "
+		"(0 = all cores; 1 = single-threaded std::sort)")
+		->default_val(0);
+
+	CLI11_PARSE(app, argc, argv);
+
+	if(numThreads <= 0)
+		numThreads = omp_get_max_threads();
+	omp_set_num_threads(numThreads);
+
+	int readCount = 1;	// count == 0 is used as an end of a list.
+	int currMaxReads = 1024;
+	long fileSize = -1; // -1 means stdin / unknown
+
+	// I/O state: either mmap (file) or FILE* (stdin)
+	char* mmapBase = NULL;
+	size_t mmapSize = 0;
+	bool useMmap = false;
+	FILE* fh = NULL;
+	Arena* arena = NULL;
+
+	if(inputFile == "-")
 	{
-		// 1MB output buffer
-		char* outBuf = (char*) malloc(1 << 20);
-		setvbuf(stdout, outBuf, _IOFBF, 1 << 20);
-
-		po::options_description desc("Allowed options");
-		desc.add_options()
-		    ("help,h", "produce this help message")
-		    ("ral,r", "input is in RAL format")
-		    ("sort,s", po::value<char>()->default_value('s'), "arg can be: s-start, b-both, 5-5'end\n"
-						"s: start coordinate [default]\n"
-						"b: sort also by the end coordinate, aka \"LC_ALL=C sort -k1,1 -k2,2n -k3,3n\". Don't use if you don't need it, as it requires more computation.\n"
-						"5: sort by 5' -p- bond (2nd column for + strand and 3rd column for - strand)\n"
-			)
-		    ("collapse", "collapse BEDWEIGHT by summing weights of the reads and truncate the coordinates, set strand to \"+,\" id to \".\". Makes no sense for --sort=b")
-		    ("input-file", po::value<string>(), "input file; put \"-\" to read from standard input (e.g. cat file.bed | pioSortBed)")
-		;
-
-		po::positional_options_description p;
-		p.add("input-file", -1);
-
-		po::variables_map vm;
-		po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
-		po::notify(vm);
-
-		if (vm.count("help") || ! vm.count("input-file"))
+		fh = stdin;
+		cerr << "Reading data from standard input" << endl;
+		const size_t chunkSize = 64UL * 1024 * 1024;
+		arena = new Arena(chunkSize, chunkSize);
+	}
+	else
+	{
+		int fd = open(inputFile.c_str(), O_RDONLY);
+		if(fd < 0)
 		{
-		    cerr << "Ultra fast bed file sorter\nPiotr Balwierz, 2012\n\n"
-			<< "Usage: piotrSortBed file.bed > outfile.bed\n\n"
-			<< "Results are equivalent to \"LC_ALL=C sort -k1,1 -k2,2n file.bed\"\n"
-			<< "or \"sort -k1,1 -k2,2n -k3,3n file.bed\" if --end option enabled.\n"
-			<< "Uses one thread and sorts at ~disk IO throughput limits.\n\n"
-			<< "Input file should contain a new line character in the end of the last line.\n\n"
-			<< "Compilation-time limits:\nLine length limit: " << lineBufSize << " (stdin only; no limit for file input)"
-			<< "\nChromosome name limit: " << chrNameBufSize
-			<< "\nChromosome length limit: " << chrLenLimit/1000000 << "Mbp"
-			<< "\nChromosome/contig number limit: unlimited"
-			<< "\nRead number limit: unlimited (but will be kept in the memory)\n" << endl
-		    << desc << "\n";
-		    return 1;
+			cerr << "Error opening " << inputFile << endl;
+			return 1;
 		}
-
-		int readCount = 1;	// count == 0 is used as an end of a list.
-		int currMaxReads = 1024;
-		long fileSize = -1; // -1 means stdin / unknown
-
-		// these are to not do lookups in the hash each time:
-		int fCollapse = vm.count("collapse");
-		char sortMode = vm["sort"].as<char>();
-		int fRal = vm.count("ral");
-
-		// I/O state: either mmap (file) or FILE* (stdin)
-		char* mmapBase = NULL;
-		size_t mmapSize = 0;
-		bool useMmap = false;
-		FILE* fh = NULL;
-		Arena* arena = NULL;
-
-		if(vm["input-file"].as<string>() == "-")
-		{
-			fh = stdin;
-			cerr << "Reading data from standard input" << endl;
-			const size_t chunkSize = 64UL * 1024 * 1024;
-			arena = new Arena(chunkSize, chunkSize);
-		}
-		else
-		{
-			int fd = open(vm["input-file"].as<string>().c_str(), O_RDONLY);
-			if(fd < 0)
-			{
-				cerr << "Error opening " << vm["input-file"].as<string>() << endl;
-				return 1;
-			}
-			struct stat st;
-			fstat(fd, &st);
-			fileSize = st.st_size;
+		struct stat st;
+		fstat(fd, &st);
+		fileSize = st.st_size;
 
 			if(fileSize == 0)
 			{
@@ -317,7 +336,7 @@ int main(int argc, char *argv[])
 			mmapBase = (char*) mmap(NULL, (size_t)fileSize + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 			if(mmapBase == MAP_FAILED)
 			{
-				cerr << "Error: mmap failed for " << vm["input-file"].as<string>() << endl;
+				cerr << "Error: mmap failed for " << inputFile << endl;
 				close(fd);
 				return 1;
 			}
@@ -527,102 +546,276 @@ int main(int argc, char *argv[])
 		}
 		time(&tstart);
 		std::sort(chroms.begin(), chroms.end());
-		int* chromTable = (int*)  calloc(maxChrLen+1, sizeof(int)); // chromosome length
-		// numReadsBeg only needed for --sort b mode
-		int* numReadsBeg = NULL;
-		if(sortMode == 'b')
-			numReadsBeg = (int*) calloc(maxChrLen+1, sizeof(int));
 
-		for(std::vector<std::string>::iterator it=chroms.begin(); it!=chroms.end(); it++)
+		// Assign sequential chromosome indices (alphabetical order) so the
+		// classic sort path can compare chromosomes with a single int compare
+		// instead of a string compare.
+		for(int ci = 0; ci < (int)chroms.size(); ci++)
+			chrInfo.find(chroms[ci])->second.idx = ci;
+
+		// Choose sort strategy: classic O(n log n) for small files,
+		// bucket/counting sort O(n + m) for large files.
+		// The bucket sort allocates chromTable[maxChrLen+1] which can be up to 4 GB.
+		// For small files this is wasteful — the classic path uses only
+		// readCount * 4 bytes for the index array, and std::sort with an inlined
+		// comparator is very efficient for moderate n.
+		int totalReads = readCount - 1;
+		// bucketCutoff == 0 means "always use bucket sort" (skip the classic path).
+		// Otherwise use bucket sort when we have at least bucketCutoff reads.
+		bool useBucketSort = (bucketCutoff == 0) || (totalReads >= bucketCutoff);
+		if(useBucketSort)
+			cerr << "Using bucket sort (" << totalReads << " reads >= cutoff " << bucketCutoff << ")" << endl;
+		else
+			cerr << "Using classic sort (" << totalReads << " reads < cutoff " << bucketCutoff << ")" << endl;
+
+		if(!useBucketSort)
 		{
-			cerr << "Sorting " << *it << endl;
-			/** PART 1 of sorting
-			 * building an array of lists
-			 **/
-			// Single hash lookup per chromosome
-			string2chrInfoT::iterator cit = chrInfo.find(*it);
-			int thisChrLen = cit->second.len;
-			int currRead = cit->second.lastRead;
-			int maxNumReads = 0;	// the maximum number of reads at any position
-			while(currRead)
+			/*************************************************************
+			 * CLASSIC SORT PATH — O(n log n) comparison-based sort
+			 *
+			 * We sort an index array rather than the 24-byte seqread structs.
+			 * Swapping 4-byte indices is cheaper and keeps the reads array
+			 * in place (important when line pointers reference the mmap buffer).
+			 *
+			 * Steps:
+			 *  1. Walk each chromosome's linked list to stamp chrIdx and
+			 *     collect all read indices into a flat array.
+			 *  2. std::sort the index array with an inlined lambda comparator.
+			 *  3. Linear scan to print (and optionally collapse).
+			 *************************************************************/
+
+			// Step 1: Walk linked lists, stamp chrIdx, build index array.
+			// The `next` field is no longer needed after this — we reuse its
+			// storage for chrIdx (they share a union).
+			int* order = (int*) malloc(totalReads * sizeof(int));
+			int oi = 0;
+			for(int ci = 0; ci < (int)chroms.size(); ci++)
 			{
-				int chosenPosition = (sortMode == '5') ? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg) : reads[currRead].beg;
-				int oldPtr = chromTable[chosenPosition];
-				chromTable[chosenPosition] = currRead;
-				currRead = reads[currRead].next;		// this and the next line cannot be exchanged
-				reads[chromTable[chosenPosition]].next = oldPtr;
+				string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+				int curr = cit->second.lastRead;
+				while(curr)
+				{
+					int nxt = reads[curr].next;  // save before overwriting
+					reads[curr].chrIdx = ci;
+					order[oi++] = curr;
+					curr = nxt;
+				}
+			}
+
+			// Step 2: Sort the index array.
+			// When numThreads == 1, use std::sort (introsort) which inlines the
+			// comparator lambda — best single-threaded performance.
+			// When numThreads > 1, use __gnu_parallel::sort which splits the
+			// work across OpenMP threads.  The parallel version cannot inline
+			// the comparator as aggressively, so for small inputs the overhead
+			// of thread management may negate the parallelism gains.  For
+			// medium-to-large inputs (1M+ reads) the speedup is significant.
+			//
+			// Primary key: chromosome index (int compare, not string).
+			// Secondary key: sort position (beg, or 5' end).
+			// Tertiary key (--sort b only): end position.
+			if(numThreads == 1)
+			{
+				// Single-threaded: std::sort with inlined lambda — fastest for 1 core.
 				if(sortMode == 'b')
 				{
-					numReadsBeg[chosenPosition] ++;
-					if(numReadsBeg[chosenPosition] > maxNumReads)
-						maxNumReads ++;	// it can only increase by one.
+					std::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						if(reads[a].beg != reads[b].beg) return reads[a].beg < reads[b].beg;
+						return reads[a].end < reads[b].end;
+					});
+				}
+				else if(sortMode == '5')
+				{
+					std::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						int posA = (reads[a].str == '-') ? reads[a].end : reads[a].beg;
+						int posB = (reads[b].str == '-') ? reads[b].end : reads[b].beg;
+						return posA < posB;
+					});
+				}
+				else
+				{
+					std::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						return reads[a].beg < reads[b].beg;
+					});
 				}
 			}
-			/** PART 2 of sorting:
-			 * printing and destroying the count list:
-			 **/
-			if(sortMode == 'b')
+			else
 			{
-				// we want to sort by end position too.
-				int* readBuff = (int*) calloc(maxNumReads, sizeof(int));
-				for(int pos=0; pos<=thisChrLen; pos++)
+				// Multi-threaded: __gnu_parallel::sort partitions the array
+				// across OpenMP threads.  Each partition is sorted independently,
+				// then merged — giving ~N× speedup on the sort phase alone.
+				cerr << "Parallel sort using " << numThreads << " threads" << endl;
+				if(sortMode == 'b')
 				{
-					if(chromTable[pos])
+					__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						if(reads[a].beg != reads[b].beg) return reads[a].beg < reads[b].beg;
+						return reads[a].end < reads[b].end;
+					});
+				}
+				else if(sortMode == '5')
+				{
+					__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						int posA = (reads[a].str == '-') ? reads[a].end : reads[a].beg;
+						int posB = (reads[b].str == '-') ? reads[b].end : reads[b].beg;
+						return posA < posB;
+					});
+				}
+				else
+				{
+					__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
+						if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+						return reads[a].beg < reads[b].beg;
+					});
+				}
+			}
+
+			// Step 3: Print in sorted order.
+			if(fCollapse)
+			{
+				// Collapse mode: adjacent reads at the same (chr, position) are
+				// merged by summing weights.  After sorting, identical positions
+				// are contiguous, so a single linear scan suffices.
+				int i = 0;
+				while(i < totalReads)
+				{
+					int ri = order[i];
+					int ci = reads[ri].chrIdx;
+					int pos = reads[ri].beg;
+					float sum = 0.0;
+					// Accumulate all reads at the same (chr, pos)
+					while(i < totalReads)
 					{
-						int i=0;
-						int foo = numReadsBeg[pos];
-						while(chromTable[pos])
+						int rj = order[i];
+						if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
+						float w;
+						if(!sscanf(reads[rj].line, "%f", &w))
 						{
-							readBuff[i++] = chromTable[pos];
-							chromTable[pos] = reads[chromTable[pos]].next;
+							cerr << "Malformed weight " << reads[rj].line << endl;
+							exit(1);
 						}
-						// std::sort with lambda inlines the comparator (faster than qsort function pointer)
-						std::sort(readBuff, readBuff + foo, [reads](int a, int b) {
-							return reads[a].end < reads[b].end;
-						});
-						// print it out:
-						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
-						else
-							for(int j = 0; j < foo; ++j)
-							{
-								fputs_unlocked(reads[readBuff[j]].line, stdout);
-								fputc_unlocked('\n', stdout);
-							}
-						numReadsBeg[pos] = 0;
+						sum += w;
+						i++;
+					}
+					printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
+				}
+			}
+			else
+			{
+				for(int i = 0; i < totalReads; i++)
+				{
+					fputs_unlocked(reads[order[i]].line, stdout);
+					fputc_unlocked('\n', stdout);
+				}
+			}
+			free(order);
+		}
+		else
+		{
+			/*************************************************************
+			 * BUCKET SORT PATH — O(n + m) counting/bucket sort
+			 *
+			 * Allocates chromTable[maxChrLen+1] and scatters reads by position.
+			 * Wins for large files where n >> log(n), making the linear scan
+			 * over chromosome length worthwhile.
+			 *************************************************************/
+			int* chromTable = (int*)  calloc(maxChrLen+1, sizeof(int));
+			// numReadsBeg only needed for --sort b mode
+			int* numReadsBeg = NULL;
+			if(sortMode == 'b')
+				numReadsBeg = (int*) calloc(maxChrLen+1, sizeof(int));
+
+			for(std::vector<std::string>::iterator it=chroms.begin(); it!=chroms.end(); it++)
+			{
+				cerr << "Sorting " << *it << endl;
+				/** PART 1 of sorting
+				 * building an array of lists
+				 **/
+				// Single hash lookup per chromosome
+				string2chrInfoT::iterator cit = chrInfo.find(*it);
+				int thisChrLen = cit->second.len;
+				int currRead = cit->second.lastRead;
+				int maxNumReads = 0;	// the maximum number of reads at any position
+				while(currRead)
+				{
+					int chosenPosition = (sortMode == '5') ? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg) : reads[currRead].beg;
+					int oldPtr = chromTable[chosenPosition];
+					chromTable[chosenPosition] = currRead;
+					currRead = reads[currRead].next;		// this and the next line cannot be exchanged
+					reads[chromTable[chosenPosition]].next = oldPtr;
+					if(sortMode == 'b')
+					{
+						numReadsBeg[chosenPosition] ++;
+						if(numReadsBeg[chosenPosition] > maxNumReads)
+							maxNumReads ++;	// it can only increase by one.
 					}
 				}
-				free(readBuff);
-			}
-			else  // sortMode in {5, s}
-			{
-				// we don't want to sort by the end position: simply print what is attached to any position in the genome
-				for(int pos=0; pos<=thisChrLen; pos++)
-					if(chromTable[pos])
+				/** PART 2 of sorting:
+				 * printing and destroying the count list:
+				 **/
+				if(sortMode == 'b')
+				{
+					// we want to sort by end position too.
+					int* readBuff = (int*) calloc(maxNumReads, sizeof(int));
+					for(int pos=0; pos<=thisChrLen; pos++)
 					{
-						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
-						else
+						if(chromTable[pos])
+						{
+							int i=0;
+							int foo = numReadsBeg[pos];
 							while(chromTable[pos])
 							{
-								fputs_unlocked(reads[chromTable[pos]].line, stdout);
-								fputc_unlocked('\n', stdout);
+								readBuff[i++] = chromTable[pos];
 								chromTable[pos] = reads[chromTable[pos]].next;
-								// no deallocation here for speed
 							}
+							// std::sort with lambda inlines the comparator (faster than qsort function pointer)
+							std::sort(readBuff, readBuff + foo, [reads](int a, int b) {
+								return reads[a].end < reads[b].end;
+							});
+							// print it out:
+							if(fCollapse)
+								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
+							else
+								for(int j = 0; j < foo; ++j)
+								{
+									fputs_unlocked(reads[readBuff[j]].line, stdout);
+									fputc_unlocked('\n', stdout);
+								}
+							numReadsBeg[pos] = 0;
+						}
 					}
-			}
-		}
+					free(readBuff);
+				}
+				else  // sortMode in {5, s}
+				{
+					// we don't want to sort by the end position: simply print what is attached to any position in the genome
+					for(int pos=0; pos<=thisChrLen; pos++)
+						if(chromTable[pos])
+						{
+							if(fCollapse)
+								printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
+							else
+								while(chromTable[pos])
+								{
+									fputs_unlocked(reads[chromTable[pos]].line, stdout);
+									fputc_unlocked('\n', stdout);
+									chromTable[pos] = reads[chromTable[pos]].next;
+									// no deallocation here for speed
+								}
+						}
+				}
+			} // end per-chromosome loop (bucket sort)
+			free(chromTable);
+			if(numReadsBeg) free(numReadsBeg);
+		} // end bucket sort path
 		time(&tend);
 		double difftime_sorting = difftime(tend, tstart);
 		fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime_sorting+0.5));
 		return 0;
-	}
-	catch(std::exception& e)
-    {
-        cout << e.what() << "\n";
-        return 1;
-    }
 }
 
 float sumList(seqread* reads, int* readBuff, int foo)

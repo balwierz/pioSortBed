@@ -1,7 +1,7 @@
 CC=g++
-CFLAGS=-I. -O3 -std=c++11
+CFLAGS=-I. -O3 -std=c++11 -fopenmp
 # static can be removed from the options, but it is safer to keep it and do not recompile often.
-LDFLAGS=-lboost_program_options -static
+LDFLAGS=-lgomp -static
 DEPS = 
 
 %.o: %.cpp $(DEPS)
