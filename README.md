@@ -84,19 +84,31 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 
 Wall time and peak RSS (resident set size) measured with GNU time. Times in seconds or milliseconds; memory in MB or GB.
 
+
 ### Wall Time
 
 ![Wall time comparison](benchmark_time.png)
 
-| Reads | pio 1t | pio 8t | pio low-mem | sort 1t | sort 8t | bedtools | bedops |
-|------:|-------:|-------:|------------:|--------:|--------:|---------:|-------:|
-| 10k   | — | — | — | 10 ms | — | 10 ms | — |
-| 100k  | 20 ms | 10 ms | 20 ms | 70 ms | 60 ms | 80 ms | 50 ms |
-| 1M    | 260 ms | 190 ms | 210 ms | 850 ms | 260 ms | 820 ms | 580 ms |
-| 5M    | 1.82 s | 1.16 s | 1.01 s | 4.96 s | 1.51 s | 4.30 s | 3.27 s |
-| 10M   | 3.81 s | 2.36 s | 2.01 s | 10.63 s | 3.09 s | 8.67 s | 6.37 s |
-| 50M   | 17.82 s | 17.94 s | **10.41 s** | 64.8 s | 19.01 s | 51.74 s | 33.12 s |
-| 100M  | 33.52 s | 34.03 s | **23.52 s** | 141.1 s | 46.43 s | 161.7 s | 65.8 s |
+#### Legend (point style & color):
+
+| Tool                | Color      | Point Style | Description |
+|---------------------|------------|-------------|-------------|
+| **pioSortBed 1t**   | <span style="color:#e41a1c">red</span>      | ●           | Single-thread (default) |
+| **pioSortBed 8t**   | <span style="color:#377eb8">blue</span>     | ■           | 8 threads |
+| **pioSortBed low-mem** | <span style="color:#f781bf">pink</span>  | ◆           | Low-memory SSD mode |
+| **GNU sort 1t**     | <span style="color:#4daf4a">green</span>    | ▲           | Single-thread |
+| **GNU sort 8t**     | <span style="color:#ff7f00">orange</span>   | ▼           | 8 threads |
+| **bedtools**        | <span style="color:#984ea3">purple</span>   | ✚           | bedtools sort |
+| **bedops**          | <span style="color:#a65628">brown</span>    | ✦           | bedops sort-bed |
+
+| Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
+|------:|----------|----------|---------------|-----------|-----------|------------|-----------|
+| 10k   | —        | —        | —             | **10 ms** | —         | **10 ms**  | —         |
+| 100k  | 20 ms    | **10 ms**| 20 ms         | 70 ms     | 60 ms     | 80 ms      | 50 ms     |
+| 1M    | 260 ms   | **190 ms**| 210 ms       | 850 ms    | **260 ms**| 820 ms     | 580 ms    |
+| 5M    | 1.82 s   | 1.16 s   | **1.01 s**    | 4.96 s    | 1.51 s    | 4.30 s     | 3.27 s    |
+| 50M   | 17.82 s  | 17.94 s  | **10.41 s**   | 64.8 s    | 19.01 s   | 51.74 s    | 33.12 s   |
+| 100M  | 33.52 s  | 34.03 s  | **23.52 s**   | 141.1 s   | 46.43 s   | 161.7 s    | 65.8 s    |
 
 **Key observations:**
 - **pioSortBed 1t** dominates at moderate sizes (100k–10M reads)
@@ -109,15 +121,15 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ![Peak memory usage](benchmark_memory.png)
 
-| Reads | pio 1t | pio 8t | pio low-mem | sort 1t | sort 8t | bedtools | bedops |
-|------:|-------:|-------:|------------:|--------:|--------:|---------:|-------:|
-| 10k   | 3.3 MB | 3.4 MB | 3.4 MB | 6.0 MB | 3.4 MB | 8.9 MB | 1.8 MB |
-| 100k  | 10.1 MB | 10.2 MB | 9.5 MB | 11.4 MB | 12.0 MB | 47.5 MB | 8.5 MB |
-| 1M    | 71.1 MB | 73.4 MB | 64.8 MB | 88.4 MB | 164.6 MB | 409.6 MB | 54.8 MB |
-| 5M    | 337.9 MB | 355.8 MB | 318.1 MB | 432.6 MB | 814.1 MB | 2.0 GB | 268.3 MB |
-| 10M   | 674.4 MB | 711.0 MB | 633.9 MB | 863.6 MB | 1.6 GB | 3.9 GB | 535.3 MB |
-| 50M   | 4.1 GB | 4.1 GB | **3.1 GB** | 4.2 GB | 8.0 GB | 19.4 GB | 2.6 GB |
-| 100M  | 7.2 GB | 7.2 GB | **6.2 GB** | 8.5 GB | 14.8 GB | 24.5 GB | 5.2 GB |
+| Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
+|------:|----------|----------|---------------|-----------|-----------|------------|-----------|
+| 10k   | 3.3 MB   | 3.4 MB   | 3.4 MB        | 6.0 MB    | 3.4 MB    | 8.9 MB     | **1.8 MB**|
+| 100k  | **10.1 MB**| 10.2 MB| 9.5 MB        | 11.4 MB   | 12.0 MB   | 47.5 MB    | 8.5 MB    |
+| 1M    | 71.1 MB  | 73.4 MB  | **64.8 MB**   | 88.4 MB   | 164.6 MB  | 409.6 MB   | 54.8 MB   |
+| 5M    | 337.9 MB | 355.8 MB | **318.1 MB**  | 432.6 MB  | 814.1 MB  | 2.0 GB     | 268.3 MB  |
+| 10M   | 674.4 MB | 711.0 MB | **633.9 MB**  | 863.6 MB  | 1.6 GB    | 3.9 GB     | 535.3 MB  |
+| 50M   | 4.1 GB   | 4.1 GB   | **3.1 GB**    | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
+| 100M  | 7.2 GB   | 7.2 GB   | **6.2 GB**    | 8.5 GB    | 14.8 GB   | 24.5 GB    | 5.2 GB    |
 
 **Key observations:**
 - **pioSortBed low-mem mode** reduces peak RAM on large files (50M: **3.1 GB vs 4.1 GB**; 100M: **6.2 GB vs 7.2 GB**)
