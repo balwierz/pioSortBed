@@ -275,6 +275,255 @@ static int parseRalLine(const char* buf,
 float sumList(seqread* reads, int* readBuff, int foo);
 float sumList2(seqread*, int*, int);
 
+struct lowMemNode
+{
+	size_t off;
+	int next;
+};
+
+struct lowMemRec
+{
+	int beg;
+	int end;
+	char str;
+	float weight;
+	const char* line;
+};
+
+// Low-memory file mode (SSD-friendly):
+// Pass 1: walk mmap once, build per-chromosome linked lists of line offsets.
+// Pass 2: process one chromosome at a time (parse, sort, print), so peak RAM
+// depends on the largest chromosome chunk, not the whole file.
+static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
+                          bool fRal, int fCollapse, char sortMode, int numThreads)
+{
+	time_t tstart, tend;
+	time(&tstart);
+
+	string2chrInfoT chrInfo;
+	pair<string2chrInfoT::iterator,bool> insResult =
+		chrInfo.insert(make_pair(string(""), chrInfoT()));
+	string2chrInfoT::iterator thisChrIt = insResult.first;
+
+	int nodeCap = 1024;
+	int nodeCount = 1; // index 0 reserved as end-of-list sentinel
+	lowMemNode* nodes = (lowMemNode*) malloc(nodeCap * sizeof(lowMemNode));
+	if(!nodes)
+	{
+		cerr << "Error: out of memory allocating low-memory offset table" << endl;
+		return 1;
+	}
+
+	char* mmapCur = mmapBase;
+	char* mmapLim = mmapBase + mmapSize;
+	while(mmapCur < mmapLim)
+	{
+		char* linePtr = mmapCur;
+		char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
+		if(nl)
+		{
+			if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+			*nl = '\0';
+			mmapCur = nl + 1;
+		}
+		else
+		{
+			mmapCur = mmapLim;
+		}
+
+		const char* chrPtr;
+		int chrLen;
+		int beg = 0;
+		int end = 0;
+		int numArgsRead;
+		char strandChar = '+';
+		char weight[chrNameBufSize];
+		weight[0] = '0'; weight[1] = '\0';
+		const char* tailPtr = "";
+		char chrBuf[chrNameBufSize];
+
+		if(fRal)
+		{
+			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+			                           &beg, &end, weight, chrNameBufSize,
+			                           &strandChar);
+			chrPtr = chrBuf;
+			chrLen = (int)strlen(chrBuf);
+		}
+		else
+		{
+			numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
+		}
+
+		if(numArgsRead < 3)
+		{
+			cerr << "Error in parsing line: " << linePtr << endl
+				<< "Perhaps this line is malformed?" << endl;
+			free(nodes);
+			return 1;
+		}
+		if(beg < 0)
+		{
+			cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
+			free(nodes);
+			return 1;
+		}
+
+		if((int)thisChrIt->first.size() != chrLen ||
+		   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
+		{
+			pair<string2chrInfoT::iterator,bool> ins =
+				chrInfo.insert(make_pair(string(chrPtr, chrLen), chrInfoT()));
+			thisChrIt = ins.first;
+		}
+
+		if(nodeCount == nodeCap)
+		{
+			nodeCap = (int)(nodeCap * 2);
+			lowMemNode* tmp = (lowMemNode*) realloc(nodes, nodeCap * sizeof(lowMemNode));
+			if(!tmp)
+			{
+				cerr << "Error: out of memory growing low-memory offset table" << endl;
+				free(nodes);
+				return 1;
+			}
+			nodes = tmp;
+		}
+
+		nodes[nodeCount].off = (size_t)(linePtr - mmapBase);
+		nodes[nodeCount].next = thisChrIt->second.lastRead;
+		thisChrIt->second.lastRead = nodeCount;
+		nodeCount++;
+	}
+
+	chrInfo.erase("");
+	vector<string> chroms;
+	chroms.reserve(chrInfo.size());
+	for(string2chrInfoT::iterator it = chrInfo.begin(); it != chrInfo.end(); it++)
+		chroms.push_back(it->first);
+	std::sort(chroms.begin(), chroms.end());
+
+	time(&tend);
+	fprintf(stderr, "Reading has taken %d seconds\n", (int)(difftime(tend, tstart)+0.5));
+	cerr << "We have " << nodeCount - 1 << " regions.\n"
+		 << chroms.size() << " chromosomes\nSorting..." << endl;
+	time(&tstart);
+
+	for(size_t ci = 0; ci < chroms.size(); ci++)
+	{
+		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+		vector<int> nodeIdx;
+		for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
+			nodeIdx.push_back(cur);
+
+		vector<lowMemRec> recs;
+		recs.reserve(nodeIdx.size());
+		for(size_t i = 0; i < nodeIdx.size(); i++)
+		{
+			const char* linePtr = mmapBase + nodes[nodeIdx[i]].off;
+			int beg = 0, end = 0;
+			char strandChar = '+';
+			char weight[chrNameBufSize];
+			weight[0] = '0'; weight[1] = '\0';
+			const char* chrPtr;
+			int chrLen;
+			int numArgsRead;
+			const char* tailPtr = "";
+			char chrBuf[chrNameBufSize];
+
+			if(fRal)
+			{
+				numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+				                           &beg, &end, weight, chrNameBufSize,
+				                           &strandChar);
+			}
+			else if(fCollapse || sortMode == '5')
+			{
+				numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
+				                              &beg, &end, weight, chrNameBufSize,
+				                              &strandChar, &tailPtr);
+			}
+			else
+			{
+				numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
+			}
+			if(numArgsRead < 3)
+			{
+				cerr << "Error in parsing line: " << linePtr << endl
+					 << "Perhaps this line is malformed?" << endl;
+				free(nodes);
+				return 1;
+			}
+
+			lowMemRec r;
+			r.beg = beg;
+			r.end = end;
+			r.str = strandChar;
+			r.line = linePtr;
+			r.weight = 0.0f;
+			if(fCollapse)
+			{
+				if(!sscanf(weight, "%f", &r.weight))
+				{
+					cerr << "Malformed weight " << weight << endl;
+					free(nodes);
+					return 1;
+				}
+			}
+			recs.push_back(r);
+		}
+
+		auto cmp = [sortMode](const lowMemRec& a, const lowMemRec& b) {
+			if(sortMode == 'b')
+			{
+				if(a.beg != b.beg) return a.beg < b.beg;
+				return a.end < b.end;
+			}
+			if(sortMode == '5')
+			{
+				int pa = (a.str == '-') ? a.end : a.beg;
+				int pb = (b.str == '-') ? b.end : b.beg;
+				return pa < pb;
+			}
+			return a.beg < b.beg;
+		};
+
+		if(numThreads == 1)
+			std::sort(recs.begin(), recs.end(), cmp);
+		else
+			__gnu_parallel::sort(recs.begin(), recs.end(), cmp);
+
+		if(fCollapse)
+		{
+			size_t i = 0;
+			while(i < recs.size())
+			{
+				int pos = recs[i].beg;
+				float sum = 0.0f;
+				while(i < recs.size() && recs[i].beg == pos)
+				{
+					sum += recs[i].weight;
+					i++;
+				}
+				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
+			}
+		}
+		else
+		{
+			for(size_t i = 0; i < recs.size(); i++)
+			{
+				fputs_unlocked(recs[i].line, stdout);
+				fputc_unlocked('\n', stdout);
+			}
+		}
+	}
+
+	free(nodes);
+	time(&tend);
+	fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime(tend, tstart)+0.5));
+	return 0;
+}
+
 // Fast integer-to-buffer writer. Returns number of chars written.
 static inline int writeUInt(char* buf, int val)
 {
@@ -480,12 +729,13 @@ int main(int argc, char *argv[])
 		"  Chromosome length limit: " + to_string(chrLenLimit/1000000) + "Mbp\n"
 		"  Chromosome/contig number limit: unlimited\n"
 		"  Read number limit: unlimited (but will be kept in the memory)\n"};
-	app.set_version_flag("-V,--version", "1.2.1");
+	app.set_version_flag("-V,--version", "2.0.0");
 
 	string inputFile;
 	char sortMode = 's';
 	int fCollapse = 0;
 	int fRal = 0;
+	int lowMemSSD = 0;
 	int bucketCutoff = defaultBucketCutoff;
 	int numThreads = 0;
 
@@ -500,6 +750,9 @@ int main(int argc, char *argv[])
 	app.add_flag("--collapse", fCollapse,
 		"collapse BEDWEIGHT by summing weights of the reads and truncate the coordinates, "
 		"set strand to \"+\", id to \".\". Makes no sense for --sort=b");
+	app.add_flag("--low-mem-ssd", lowMemSSD,
+		"low-memory two-pass file mode (SSD-friendly): keeps line offsets in RAM and "
+		"sorts one chromosome at a time; slower than default but uses less peak RAM");
 	app.add_option("--bucket-cutoff", bucketCutoff,
 		"use bucket sort for files with at least this many reads; "
 		"smaller files use std::sort (0 = always bucket sort)")
@@ -582,6 +835,16 @@ int main(int argc, char *argv[])
 				if(arenaInit < 4096) arenaInit = 4096;
 				arena = new Arena(arenaInit, 64UL * 1024 * 1024);
 			}
+		}
+
+		if(lowMemSSD)
+		{
+			if(!useMmap)
+			{
+				cerr << "Error: --low-mem-ssd requires file input (not stdin)" << endl;
+				return 1;
+			}
+			return lowMemSortMmap(mmapBase, mmapSize, fRal, fCollapse, sortMode, numThreads);
 		}
 
 		// allocate the guessed amount of memory:

@@ -158,7 +158,7 @@ SORT_BUF="80%"
 
 # CSV output for plotting
 CSV_FILE="$SCRIPT_DIR/benchmark_results.csv"
-echo "reads,pio1_ms,pio1_kb,pio8_ms,pio8_kb,sort1_ms,sort1_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
+echo "reads,pio1_ms,pio1_kb,pio8_ms,pio8_kb,pio_lm_ms,pio_lm_kb,sort1_ms,sort1_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
 
 SEP="%-10s"
 HDR_TIME="  %14s"
@@ -170,6 +170,7 @@ ROW_MEM="  %10s"
 printf "$SEP" "Reads"
 printf "$HDR_TIME$HDR_MEM" "pio-1t" "RSS"
 printf "$HDR_TIME$HDR_MEM" "pio-8t" "RSS"
+printf "$HDR_TIME$HDR_MEM" "pio-lm" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-1t" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-8t" "RSS"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "bedtools" "RSS"
@@ -178,6 +179,7 @@ printf "  %s" "Match"
 echo ""
 
 printf "$SEP" "-----"
+printf "$HDR_TIME$HDR_MEM" "------" "---"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
@@ -209,6 +211,11 @@ for n in "${SIZES[@]}"; do
     bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
     pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
     cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+
+    # --- pioSortBed low-memory SSD mode ---
+    bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
+    pio_lm_ms=$RESULT_MS; pio_lm_kb=$RESULT_KB
+    cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm_out.txt"
 
     # --- GNU sort single-threaded ---
     sort1_ms=0; sort1_kb=0
@@ -244,7 +251,7 @@ for n in "${SIZES[@]}"; do
     match="-"
     if (( VERIFY )); then
         match="OK"
-        for tool in pio1 pio8 bt bo; do
+        for tool in pio1 pio8 pio_lm bt bo; do
             outfile="$TMPDIR/${tool}_out.txt"
             [[ -f "$outfile" ]] || continue
             awk -F'\t' '{print $1"\t"$2}' "$outfile" > "$TMPDIR/${tool}_keys.txt"
@@ -264,6 +271,7 @@ for n in "${SIZES[@]}"; do
     printf "$SEP" "$(fmt_reads $n)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio1_ms)" "$(fmt_size $pio1_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio8_ms)" "$(fmt_size $pio8_kb)"
+    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm_ms)" "$(fmt_size $pio_lm_kb)"
     if (( HAS_SORT )); then
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort1_ms)" "$(fmt_size $sort1_kb)"
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort8_ms)" "$(fmt_size $sort8_kb)"
@@ -278,7 +286,7 @@ for n in "${SIZES[@]}"; do
     echo ""
 
     # Write CSV row
-    echo "$n,$pio1_ms,$pio1_kb,$pio8_ms,$pio8_kb,$sort1_ms,$sort1_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
+    echo "$n,$pio1_ms,$pio1_kb,$pio8_ms,$pio8_kb,$pio_lm_ms,$pio_lm_kb,$sort1_ms,$sort1_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
 
     # Clean up large files between runs
     rm -f "$BENCH_FILE" "$TMPDIR"/*.txt
@@ -295,12 +303,14 @@ echo "(values >1x mean pioSortBed-8t is faster)"
 echo ""
 
 printf "%-10s  %8s" "Reads" "vs pio1"
+printf "  %8s" "vs pio-lm"
 (( HAS_SORT ))     && printf "  %8s" "vs sort1"
 (( HAS_SORT ))     && printf "  %8s" "vs sort8"
 (( HAS_BEDTOOLS )) && printf "  %8s" "vs bt"
 (( HAS_BEDOPS ))   && printf "  %8s" "vs bo"
 echo ""
 printf "%-10s  %8s" "-----" "-------"
+printf "  %8s" "---------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_BEDTOOLS )) && printf "  %8s" "-----"
@@ -314,6 +324,7 @@ for n in "${SIZES[@]}"; do
 
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE";  pio1_ms=$RESULT_MS
     bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
+    bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
 
     sort1_ms=0; sort8_ms=0; bt_ms=0; bo_ms=0
     if (( HAS_SORT )); then
@@ -334,11 +345,13 @@ for n in "${SIZES[@]}"; do
     printf "%-10s" "$(fmt_reads $n)"
     if (( pio8_ms > 0 )); then
         printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $pio1_ms / $pio8_ms }")"
+        printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $pio_lm_ms / $pio8_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort1_ms / $pio8_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort8_ms / $pio8_ms }")"
         (( HAS_BEDTOOLS )) && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bt_ms / $pio8_ms }")"
         (( HAS_BEDOPS ))   && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bo_ms / $pio8_ms }")"
     else
+        printf "  %8s" "inf"
         printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
@@ -401,6 +414,7 @@ set style line 3 lc rgb '#4daf4a' lw 2.2 pt 7  ps 1.0
 set style line 4 lc rgb '#ff7f00' lw 2.2 pt 7  ps 1.0
 set style line 5 lc rgb '#984ea3' lw 2.2 pt 7  ps 1.0
 set style line 6 lc rgb '#a65628' lw 2.2 pt 7  ps 1.0
+set style line 7 lc rgb '#f781bf' lw 2.2 pt 7  ps 1.0
 
 # --- Wall time plot ---
 set terminal pngcairo size 900,400 enhanced font 'Arial,11'
@@ -413,10 +427,11 @@ set format y '%.2g'
 plot 'CSV_PLACEHOLDER' \
     skip 1 using 1:($2/1000.0) with linespoints ls 1 title 'pioSortBed 1t', \
  '' skip 1 using 1:($4/1000.0) with linespoints ls 2 title 'pioSortBed 8t', \
- '' skip 1 using 1:($6/1000.0) with linespoints ls 3 title 'GNU sort 1t', \
- '' skip 1 using 1:($8/1000.0) with linespoints ls 4 title 'GNU sort 8t', \
- '' skip 1 using 1:($10/1000.0) with linespoints ls 5 title 'bedtools sort', \
- '' skip 1 using 1:($12/1000.0) with linespoints ls 6 title 'bedops sort-bed'
+ '' skip 1 using 1:($6/1000.0) with linespoints ls 7 title 'pioSortBed low-mem SSD', \
+ '' skip 1 using 1:($8/1000.0) with linespoints ls 3 title 'GNU sort 1t', \
+ '' skip 1 using 1:($10/1000.0) with linespoints ls 4 title 'GNU sort 8t', \
+ '' skip 1 using 1:($12/1000.0) with linespoints ls 5 title 'bedtools sort', \
+ '' skip 1 using 1:($14/1000.0) with linespoints ls 6 title 'bedops sort-bed'
 
 # --- Memory plot ---
 set output 'PLOT_MEM_PH'
@@ -427,10 +442,11 @@ set format y '%.0f'
 plot 'CSV_PLACEHOLDER' \
     skip 1 using 1:($3/1024.0) with linespoints ls 1 title 'pioSortBed 1t', \
  '' skip 1 using 1:($5/1024.0) with linespoints ls 2 title 'pioSortBed 8t', \
- '' skip 1 using 1:($7/1024.0) with linespoints ls 3 title 'GNU sort 1t', \
- '' skip 1 using 1:($9/1024.0) with linespoints ls 4 title 'GNU sort 8t', \
- '' skip 1 using 1:($11/1024.0) with linespoints ls 5 title 'bedtools sort', \
- '' skip 1 using 1:($13/1024.0) with linespoints ls 6 title 'bedops sort-bed'
+ '' skip 1 using 1:($7/1024.0) with linespoints ls 7 title 'pioSortBed low-mem SSD', \
+ '' skip 1 using 1:($9/1024.0) with linespoints ls 3 title 'GNU sort 1t', \
+ '' skip 1 using 1:($11/1024.0) with linespoints ls 4 title 'GNU sort 8t', \
+ '' skip 1 using 1:($13/1024.0) with linespoints ls 5 title 'bedtools sort', \
+ '' skip 1 using 1:($15/1024.0) with linespoints ls 6 title 'bedops sort-bed'
 GPEOF
     sed -i "s|PLOT_TIME_PH|$PLOT_TIME|g; s|PLOT_MEM_PH|$PLOT_MEM|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$GNUPLOT_SCRIPT"
     gnuplot "$GNUPLOT_SCRIPT" && echo "Plots saved" || echo "gnuplot failed"

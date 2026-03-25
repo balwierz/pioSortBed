@@ -43,6 +43,7 @@ pioSortBed [options] -   # read from standard input
 | `-s 5` / `--sort 5` | Sort by 5' end (respects strand: col 6) |
 | `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
+| `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin). |
 | `--bucket-cutoff N` | Use bucket sort for files with ≥N reads (default: 50M; 0 = always bucket sort) |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
 | `-h` / `--help` | Show help message |
@@ -60,7 +61,7 @@ All data is loaded into memory. Expect approximately **2× the input file size**
 
 ## Benchmark
 
-Sorting random BED6 files (10 chromosomes, coordinates 0–249 Mbp). Wall time and peak RSS measured with GNU time. All tools verified to produce identical sort order.
+Sorting random BED6 files (10 chromosomes, coordinates 0–249 Mbp). Wall time and peak RSS measured with GNU time. All tools verified to produce identical sort order. Compared against [bedtools](https://github.com/arq5x/bedtools2) and [bedops](https://github.com/bedops/bedops).
 
 ### Wall time
 
