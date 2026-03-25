@@ -22,11 +22,11 @@ g++ pioSortBed.cpp -o pioSortBed -O3 -std=c++11 -fopenmp -static
 ./pioSortBed - < file.bed > sorted.bed   # read from stdin
 ```
 
-Options: `--sort s` (by start, default), `--sort b` (by start+end), `--sort 5` (by 5' end respecting strand), `--collapse` (sum weights of overlapping regions), `--ral` (RAL input format instead of BED), `--bucket-cutoff N` (use bucket sort for files with ≥N reads; default 10M; 0 = always bucket sort).
+Options: `--sort s` (by start, default), `--sort b` (by start+end), `--sort 5` (by 5' end respecting strand), `--collapse` (sum weights of overlapping regions), `--ral` (RAL input format instead of BED), `--bucket-cutoff N` (use bucket sort for files with ≥N reads; default 50M; 0 = always bucket sort).
 
 ## Architecture
 
-Single-file C++ program (`pioSortBed.cpp`). Hybrid sort strategy: files with fewer than 10M reads (configurable via `--bucket-cutoff`) use classic O(n log n) comparison sort (`std::sort` on an index array), while larger files use bucket/counting sort giving O(n+m) complexity where m = max chromosome length.
+Single-file C++ program (`pioSortBed.cpp`). Hybrid sort strategy: files with fewer than 50M reads (configurable via `--bucket-cutoff`) use classic O(n log n) comparison sort (`std::sort` on an index array), while larger files use bucket/counting sort giving O(n+m) complexity where m = max chromosome length.
 
 **Data flow:**
 1. Parse input BED/RAL lines into `seqread` structs (stored in a flat array, dynamically grown with `realloc`)
@@ -39,6 +39,6 @@ Single-file C++ program (`pioSortBed.cpp`). Hybrid sort strategy: files with few
 - `lineBufSize` = 1024 — max BED line length (stdin only; no limit for mmap)
 - `chrNameBufSize` = 256 — max chromosome name length
 - `chrLenLimit` = 1,000,000,000 — max coordinate value (1 Gbp); increase and recompile for non-standard genomes
-- `defaultBucketCutoff` = 10,000,000 — hybrid sort threshold (overridden by `--bucket-cutoff`)
+- `defaultBucketCutoff` = 50,000,000 — hybrid sort threshold (overridden by `--bucket-cutoff`)
 
 **Memory:** Stores all data in RAM. Classic sort path uses ~readCount×4 bytes extra. Bucket sort path allocates chromTable[maxChrLen+1] (up to 4 GB).

@@ -70,7 +70,7 @@ const int chrNameBufSize = 256;		// buffer for chromosme names like "chr1_random
 // chromosome length.  Bucket sort allocates a chromTable[maxChrLen] array
 // (up to 4 GB), so the classic path saves memory for smaller files while
 // bucket sort wins on throughput for large genomic datasets.
-const int defaultBucketCutoff = 10000000;
+const int defaultBucketCutoff = 50000000;
 
 
 // Arena allocator for line/weight strings.
