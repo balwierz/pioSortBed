@@ -83,9 +83,9 @@ Sorting random BED6 files (10 chromosomes, coordinates 0–249 Mbp). Wall time a
 |------:|-------:|-------:|--------:|--------:|---------:|-------:|
 | 10k   | 3.5 MB | 3.7 MB | 3.5 MB | 3.6 MB | 7.2 MB | **2.7 MB** |
 | 100k  | **9.9 MB** | 10.5 MB | 12.5 MB | 13.1 MB | 47.8 MB | 11.1 MB |
-| 1M    | **70.9 MB** | 71.7 MB | 89.4 MB | 169.4 MB | 412.8 MB | 55.6 MB |
-| 5M    | **338.3 MB** | 355.3 MB | 433.6 MB | 816.3 MB | 1.9 GB | 269.2 MB |
-| 10M   | **673.9 MB** | 710.3 MB | 864.5 MB | 1.6 GB | 3.9 GB | 536.2 MB |
+| 1M    | 70.9 MB | 71.7 MB | 89.4 MB | 169.4 MB | 412.8 MB | **55.6 MB** |
+| 5M    | 338.3 MB | 355.3 MB | 433.6 MB | 816.3 MB | 1.9 GB | **269.2 MB** |
+| 10M   | 673.9 MB | 710.3 MB | 864.5 MB | 1.6 GB | 3.9 GB | **536.2 MB** |
 | 50M   | 4.1 GB | 4.1 GB | 4.2 GB | 8.0 GB | 19.4 GB | **2.6 GB** |
 
 > pioSortBed uses a hybrid strategy: classic sort for < 50M reads, bucket sort above (configurable via `--bucket-cutoff`). At 50M reads the bucket sort kicks in — note the flat time scaling and constant memory. GNU sort 8-thread uses 2× the memory of its single-threaded mode.
