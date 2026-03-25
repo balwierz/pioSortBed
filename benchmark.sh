@@ -93,7 +93,7 @@ fmt_size() {
 fmt_time() {
     local ms=$1
     if (( ms >= 60000 )); then
-        awk "BEGIN { m=int($ms/60000); s=($ms-m*60000)/1000; printf \"%dm%04.1fs\", m, s }"
+        awk "BEGIN { m=int($ms/60000); s=($ms-m*60000)/1000; printf \"%dmin%04.1fs\", m, s }"
     elif (( ms >= 10000 )); then
         awk "BEGIN { printf \"%.2fs\", $ms / 1000 }"
     else

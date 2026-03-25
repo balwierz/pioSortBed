@@ -66,9 +66,31 @@ Sorting random BED6 files (10 chromosomes, coordinates 0–249 Mbp). Wall time a
 
 Solid lines = wall time (left axis), dashed lines = peak memory (right axis). Log–log scale.
 
-Run `bash benchmark.sh` to reproduce (requires GNU time; gnuplot for the plot).
+### Wall time
 
-> The hybrid strategy uses classic sort for < 50M reads and bucket sort above that threshold (configurable via `--bucket-cutoff`).
+| Reads | pio 1t | pio 8t | sort 1t | sort 8t | bedtools | bedops |
+|------:|-------:|-------:|--------:|--------:|---------:|-------:|
+| 10k   | < 10 ms | < 10 ms | 30 ms | 30 ms | 10 ms | 10 ms |
+| 100k  | **40 ms** | **40 ms** | 160 ms | 150 ms | 180 ms | 100 ms |
+| 1M    | 490 ms | **440 ms** | 1.85 s | 1.27 s | 1.75 s | 1.15 s |
+| 5M    | 3.13 s | **2.71 s** | 10.97 s | 7.26 s | 9.09 s | 5.92 s |
+| 10M   | 6.72 s | **5.75 s** | 24.36 s | 15.97 s | 18.78 s | 12.06 s |
+| 50M   | **29.45 s** | 29.71 s | 2min25s | 1min33s | 1min48s | 1min02s |
+
+### Peak memory (RSS)
+
+| Reads | pio 1t | pio 8t | sort 1t | sort 8t | bedtools | bedops |
+|------:|-------:|-------:|--------:|--------:|---------:|-------:|
+| 10k   | 3.5 MB | 3.7 MB | 3.5 MB | 3.6 MB | 7.2 MB | **2.7 MB** |
+| 100k  | **9.9 MB** | 10.5 MB | 12.5 MB | 13.1 MB | 47.8 MB | 11.1 MB |
+| 1M    | **70.9 MB** | 71.7 MB | 89.4 MB | 169.4 MB | 412.8 MB | 55.6 MB |
+| 5M    | **338.3 MB** | 355.3 MB | 433.6 MB | 816.3 MB | 1.9 GB | 269.2 MB |
+| 10M   | **673.9 MB** | 710.3 MB | 864.5 MB | 1.6 GB | 3.9 GB | 536.2 MB |
+| 50M   | 4.1 GB | 4.1 GB | 4.2 GB | 8.0 GB | 19.4 GB | **2.6 GB** |
+
+> pioSortBed uses a hybrid strategy: classic sort for < 50M reads, bucket sort above (configurable via `--bucket-cutoff`). At 50M reads the bucket sort kicks in — note the flat time scaling and constant memory. GNU sort 8-thread uses 2× the memory of its single-threaded mode.
+
+Run `bash benchmark.sh` to reproduce (requires GNU time; gnuplot for the plot).
 
 ## Compile-time Limits
 
@@ -83,4 +105,4 @@ These constants can be changed and the program recompiled if needed:
 
 ## Author
 
-Piotr Balwierz — Imperial College London
+Piotr Balwierz
