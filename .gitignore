@@ -3,6 +3,6 @@ CppProperties.json
 *.o
 pioSortBed
 Out/
-benchmark_results.csv
+benchmark/benchmark_results.csv
 pioSortBed-linux-x86_64
-benchmark_plot.png
+benchmark/benchmark_plot.png

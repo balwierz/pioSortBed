@@ -26,7 +26,7 @@ make
 
 Manual compilation:
 ```bash
-g++ pioSortBed.cpp -o pioSortBed -O3 -std=c++11 -fopenmp -static
+g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++11 -fopenmp -static
 ```
 
 ## Usage
@@ -87,9 +87,9 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ### Wall Time
 
-![Wall time comparison](benchmark_time.png)
+![Wall time comparison](benchmark/benchmark_time.png)
 
-![Wall time comparison (linear scale)](benchmark_time_linear.png)
+![Wall time comparison (linear scale)](benchmark/benchmark_time_linear.png)
 
 #### Legend (point style & color):
 
@@ -120,9 +120,9 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ### Peak Memory (RSS)
 
-![Peak memory usage](benchmark_memory.png)
+![Peak memory usage](benchmark/benchmark_memory.png)
 
-![Peak memory usage (linear scale)](benchmark_memory_linear.png)
+![Peak memory usage (linear scale)](benchmark/benchmark_memory_linear.png)
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
@@ -153,7 +153,7 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
   - Trade-off: **~2.2–2.8× slower** than default mode, but peak RAM ∝ largest chromosome (not whole file)
   - Best for SSD with large genomic files on small-RAM systems
 
-To reproduce: `bash benchmark.sh` (requires GNU time; gnuplot for plots).
+To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot for plots).
 
 ## Compile-time Limits
 

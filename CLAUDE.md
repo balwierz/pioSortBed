@@ -12,7 +12,7 @@ No external dependencies — CLI11 (header-only argument parser) is included in 
 
 Manual compilation:
 ```bash
-g++ pioSortBed.cpp -o pioSortBed -O3 -std=c++11 -fopenmp -static
+g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++11 -fopenmp -static
 ```
 
 ## Usage
@@ -26,7 +26,7 @@ Options: `--sort s` (by start, default), `--sort b` (by start+end), `--sort 5` (
 
 ## Architecture
 
-Single-file C++ program (`pioSortBed.cpp`). Hybrid sort strategy: files with fewer than 50M reads (configurable via `--bucket-cutoff`) use classic O(n log n) comparison sort (`std::sort` on an index array), while larger files use bucket/counting sort giving O(n+m) complexity where m = max chromosome length.
+Single-file C++ program (`src/pioSortBed.cpp`). Hybrid sort strategy: files with fewer than 50M reads (configurable via `--bucket-cutoff`) use classic O(n log n) comparison sort (`std::sort` on an index array), while larger files use bucket/counting sort giving O(n+m) complexity where m = max chromosome length.
 
 **Data flow:**
 1. Parse input BED/RAL lines into `seqread` structs (stored in a flat array, dynamically grown with `realloc`)

@@ -1,11 +1,11 @@
 CC=g++
-CFLAGS=-I. -O3 -std=c++11 -fopenmp
+CFLAGS=-Isrc -O3 -std=c++11 -fopenmp
 # static can be removed from the options, but it is safer to keep it and do not recompile often.
 LDFLAGS=-lgomp -static
-DEPS = 
+DEPS =
 
-%.o: %.cpp $(DEPS)
+src/pioSortBed.o: src/pioSortBed.cpp $(DEPS)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
-pioSortBed: pioSortBed.o
-	$(CC) -o $@ pioSortBed.o $(CFLAGS) $(LDFLAGS)
+pioSortBed: src/pioSortBed.o
+	$(CC) -o $@ src/pioSortBed.o $(CFLAGS) $(LDFLAGS)

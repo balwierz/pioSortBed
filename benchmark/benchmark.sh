@@ -6,7 +6,8 @@ set -euo pipefail
 # and verifies all tools produce output matching LC_ALL=C sort -k1,1 -k2,2n.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIO="$SCRIPT_DIR/pioSortBed"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PIO="$REPO_DIR/pioSortBed"
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/pioSortBed-bench.XXXXXX")
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -145,7 +146,10 @@ echo "===================="
 echo "  pioSortBed:    $PIO"
 (( HAS_SORT ))     && echo "  GNU sort:      $(which sort) ($(sort --version | head -1))"
 (( HAS_BEDTOOLS )) && echo "  bedtools sort:  $(which bedtools) ($(bedtools --version))"
-(( HAS_BEDOPS ))   && echo "  bedops sort-bed: $(which sort-bed) ($(sort-bed --version 2>&1 | head -1))"
+if (( HAS_BEDOPS )); then
+    bedops_ver=$(sort-bed --version 2>&1 | awk -F'version:' '/version:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    echo "  bedops sort-bed: $(which sort-bed) (version: $bedops_ver)"
+fi
 echo "  Temp dir:      $TMPDIR"
 echo ""
 
@@ -202,15 +206,19 @@ for n in "${SIZES[@]}"; do
         awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_keys.txt"
     fi
 
+
     # --- pioSortBed single-threaded ---
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE"
     pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
     cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
 
-    # --- pioSortBed 8-threaded ---
-    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
-    pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
-    cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+    # --- pioSortBed 8-threaded (only for classic sort path) ---
+    pio8_ms=0; pio8_kb=0
+    if (( n < 50000000 )); then
+        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
+        pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
+        cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+    fi
 
     # --- pioSortBed low-memory SSD mode ---
     bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
@@ -233,7 +241,7 @@ for n in "${SIZES[@]}"; do
 
     # --- bedtools sort ---
     bt_ms=0; bt_kb=0
-    if (( HAS_BEDTOOLS )); then
+    if (( HAS_BEDTOOLS )) && (( n < 100000000 )); then
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS; bt_kb=$RESULT_KB
         cp "$TMPDIR/output.tmp" "$TMPDIR/bt_out.txt"
@@ -323,7 +331,10 @@ for n in "${SIZES[@]}"; do
     generate_bed "$n" "$BENCH_FILE"
 
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE";  pio1_ms=$RESULT_MS
-    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
+    pio8_ms=0
+    if (( n < 50000000 )); then
+        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
+    fi
     bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
 
     sort1_ms=0; sort8_ms=0; bt_ms=0; bo_ms=0
@@ -333,7 +344,7 @@ for n in "${SIZES[@]}"; do
         bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$SORT_BUF '$BENCH_FILE'"
         sort8_ms=$RESULT_MS
     fi
-    if (( HAS_BEDTOOLS )); then
+    if (( HAS_BEDTOOLS )) && (( n < 100000000 )); then
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS
     fi
@@ -392,11 +403,13 @@ echo ""
 # Generate plot with gnuplot
 # ---------------------------------------------------------------------------
 
-PLOT_TIME="$SCRIPT_DIR/benchmark_time.png"
-PLOT_MEM="$SCRIPT_DIR/benchmark_memory.png"
+PLOT_TIME_SVG="$SCRIPT_DIR/benchmark_time.svg"
+PLOT_MEM_SVG="$SCRIPT_DIR/benchmark_memory.svg"
+PLOT_TIME_PDF="$SCRIPT_DIR/benchmark_time.pdf"
+PLOT_MEM_PDF="$SCRIPT_DIR/benchmark_memory.pdf"
 
 if command -v gnuplot &>/dev/null; then
-    echo "Generating plots: $PLOT_TIME, $PLOT_MEM"
+    echo "Generating plots: $PLOT_TIME_SVG, $PLOT_MEM_SVG, $PLOT_TIME_PDF, $PLOT_MEM_PDF"
     GNUPLOT_SCRIPT="$TMPDIR/plot.gp"
     cat > "$GNUPLOT_SCRIPT" <<'GPEOF'
 set datafile separator ','
@@ -416,41 +429,31 @@ set style line 4 lc rgb '#ff7f00' lw 2.2 pt 7  ps 1.0
 set style line 5 lc rgb '#984ea3' lw 2.2 pt 7  ps 1.0
 set style line 6 lc rgb '#a65628' lw 2.2 pt 7  ps 1.0
 set style line 7 lc rgb '#f781bf' lw 2.2 pt 7  ps 1.0
-
-# --- Wall time plot ---
-set terminal pngcairo size 900,600 enhanced font 'Arial,11'
-set output 'PLOT_TIME_PH'
-set title "Wall time" font ',14'
-set xlabel 'Number of reads'
-set ylabel 'Wall time (seconds)'
-set format y '%.2g'
-
-plot 'CSV_PLACEHOLDER' \
-    skip 1 using 1:($2/1000.0) with linespoints ls 1 title 'pioSortBed 1t', \
- '' skip 1 using 1:($4/1000.0) with linespoints ls 2 title 'pioSortBed 8t', \
- '' skip 1 using 1:($6/1000.0) with linespoints ls 7 title 'pioSortBed low-mem SSD', \
- '' skip 1 using 1:($8/1000.0) with linespoints ls 3 title 'GNU sort 1t', \
- '' skip 1 using 1:($10/1000.0) with linespoints ls 4 title 'GNU sort 8t', \
- '' skip 1 using 1:($12/1000.0) with linespoints ls 5 title 'bedtools sort', \
- '' skip 1 using 1:($14/1000.0) with linespoints ls 6 title 'bedops sort-bed'
-
-# --- Memory plot ---
-set output 'PLOT_MEM_PH'
-set title "Peak memory (RSS)" font ',14'
-set ylabel 'Peak RSS (MB)'
-set format y '%.0f'
-
-plot 'CSV_PLACEHOLDER' \
-    skip 1 using 1:($3/1024.0) with linespoints ls 1 title 'pioSortBed 1t', \
- '' skip 1 using 1:($5/1024.0) with linespoints ls 2 title 'pioSortBed 8t', \
- '' skip 1 using 1:($7/1024.0) with linespoints ls 7 title 'pioSortBed low-mem SSD', \
- '' skip 1 using 1:($9/1024.0) with linespoints ls 3 title 'GNU sort 1t', \
- '' skip 1 using 1:($11/1024.0) with linespoints ls 4 title 'GNU sort 8t', \
- '' skip 1 using 1:($13/1024.0) with linespoints ls 5 title 'bedtools sort', \
- '' skip 1 using 1:($15/1024.0) with linespoints ls 6 title 'bedops sort-bed'
-GPEOF
-    sed -i "s|PLOT_TIME_PH|$PLOT_TIME|g; s|PLOT_MEM_PH|$PLOT_MEM|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$GNUPLOT_SCRIPT"
-    gnuplot "$GNUPLOT_SCRIPT" && echo "Plots saved" || echo "gnuplot failed"
+    # Wall time SVG
+    echo "set terminal svg size 900,600 enhanced font 'Arial,11'" > "$TMPDIR/plot_wall_svg.gp"
+    echo "set output '$PLOT_TIME_SVG'" >> "$TMPDIR/plot_wall_svg.gp"
+    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Wall time plot ---/,$p' | sed '/# --- Memory plot ---/q' >> "$TMPDIR/plot_wall_svg.gp"
+    sed -i "s|PLOT_TIME_PH|$PLOT_TIME_SVG|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_wall_svg.gp"
+    gnuplot "$TMPDIR/plot_wall_svg.gp"
+    # Memory SVG
+    echo "set terminal svg size 900,600 enhanced font 'Arial,11'" > "$TMPDIR/plot_mem_svg.gp"
+    echo "set output '$PLOT_MEM_SVG'" >> "$TMPDIR/plot_mem_svg.gp"
+    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Memory plot ---/,$p' >> "$TMPDIR/plot_mem_svg.gp"
+    sed -i "s|PLOT_MEM_PH|$PLOT_MEM_SVG|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_mem_svg.gp"
+    gnuplot "$TMPDIR/plot_mem_svg.gp"
+    # Wall time PDF
+    echo "set terminal pdfcairo size 9,6 font 'Arial,11'" > "$TMPDIR/plot_wall_pdf.gp"
+    echo "set output '$PLOT_TIME_PDF'" >> "$TMPDIR/plot_wall_pdf.gp"
+    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Wall time plot ---/,$p' | sed '/# --- Memory plot ---/q' >> "$TMPDIR/plot_wall_pdf.gp"
+    sed -i "s|PLOT_TIME_PH|$PLOT_TIME_PDF|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_wall_pdf.gp"
+    gnuplot "$TMPDIR/plot_wall_pdf.gp"
+    # Memory PDF
+    echo "set terminal pdfcairo size 9,6 font 'Arial,11'" > "$TMPDIR/plot_mem_pdf.gp"
+    echo "set output '$PLOT_MEM_PDF'" >> "$TMPDIR/plot_mem_pdf.gp"
+    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Memory plot ---/,$p' >> "$TMPDIR/plot_mem_pdf.gp"
+    sed -i "s|PLOT_MEM_PH|$PLOT_MEM_PDF|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_mem_pdf.gp"
+    gnuplot "$TMPDIR/plot_mem_pdf.gp"
+    echo "Plots saved as SVG and PDF."
 else
     echo "gnuplot not found — skipping plot generation"
 fi
