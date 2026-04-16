@@ -6,7 +6,8 @@ set -euo pipefail
 # Default region: chr20 (~128M reads, ~5 GB BED, ~12 GB streamed from NCBI FTP).
 # Usage: bash benchmark_na12878.sh [REGION]
 #   REGION: samtools region string, default "chr20"
-#   Examples: "chr1"  "chr20"  "chr1 chr2 chr3"
+#   Special: "all100M" — exactly 100M reads sampled from all standard chromosomes
+#   Examples: "chr1"  "chr20"  "chr1 chr2 chr3"  "all100M"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -14,6 +15,10 @@ PIO="$REPO_DIR/pioSortBed"
 TIME_BIN=/usr/bin/time
 
 BAM_URL="https://ftp.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/NA12878/NIST_NA12878_HG001_HiSeq_300x/NHGRI_Illumina300X_novoalign_bams/HG001.GRCh38_full_plus_hs38d1_analysis_set_minus_alts.300x.bam"
+
+STANDARD_CHROMS=(chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10
+                 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19
+                 chr20 chr21 chr22 chrX chrY)
 
 # Region(s) to extract — passed as separate samtools arguments
 if [[ $# -ge 1 ]]; then
@@ -32,7 +37,7 @@ BED_FILE="$SCRIPT_DIR/NA12878_GRCh38_${REGION_TAG}.bed"
 if [[ ! -x "$PIO" ]]; then
     echo "Error: pioSortBed binary not found at $PIO (run 'make' first)" >&2; exit 1
 fi
-for tool in samtools bedtools sort sort-bed; do
+for tool in samtools bedtools sort sort-bed shuf; do
     command -v "$tool" &>/dev/null || echo "Warning: $tool not found, will be skipped"
 done
 
@@ -45,28 +50,59 @@ command -v sort-bed &>/dev/null && HAS_BEDOPS=1
 # ---------------------------------------------------------------------------
 
 if [[ ! -f "$BED_FILE" ]]; then
-    # Rough size estimates for chr20 at 300x (scale accordingly for other regions)
     echo "NA12878 WGS BED file not found: $(basename "$BED_FILE")"
     echo ""
     echo "Dataset : HG001 (NA12878) 300x Illumina WGS, GRCh38 — GIAB/NHGRI"
     echo "Source  : NCBI FTP (samtools HTTP streaming)"
-    echo "Region  : ${REGIONS[*]}"
     echo ""
-    echo "Estimated transfer : ~12 GB (chr20; proportionally more for larger regions)"
-    echo "Estimated BED size : ~5 GB (chr20)"
-    echo "Requirements       : samtools, bedtools, internet access"
-    echo ""
-    read -r -p "Proceed with streaming and conversion? [y/N] " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+    if [[ "$REGION_TAG" == "all100M" ]]; then
+        echo "Mode    : 2% subsample of all standard chromosomes → shuf to exactly 100M reads"
+        echo "Estimated transfer : ~11 GB  (2% of full-genome BAM)"
+        echo "Estimated disk     : ~13 GB  (~8 GB oversample temp + ~6.5 GB final BED)"
+    else
+        echo "Region  : ${REGIONS[*]}"
+        echo "Estimated transfer : ~12 GB (chr20; proportionally more for larger regions)"
+        echo "Estimated BED size : ~5 GB (chr20)"
+    fi
 
     echo ""
-    echo "Streaming BAM → BED (samtools | bedtools bamtobed)..."
-    echo "This may take 10–30 minutes depending on network speed."
-    SECONDS=0
-    samtools view -b -@ 4 "$BAM_URL" "${REGIONS[@]}" \
-        | bedtools bamtobed -i stdin \
-        > "$BED_FILE"
-    echo "Done in ${SECONDS}s. $(wc -l < "$BED_FILE") reads → $BED_FILE"
+    read -r -p "Proceed? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    echo ""
+
+    if [[ "$REGION_TAG" == "all100M" ]]; then
+        OVERSAMPLE_BED="$SCRIPT_DIR/.NA12878_GRCh38_all100M_oversample.bed"
+        echo "Pass 1: streaming 2% subsample of all chromosomes (samtools -s 42.02)..."
+        echo "This may take 15–30 minutes depending on network speed."
+        SECONDS=0
+        samtools view -b -s 42.02 -@ 4 "$BAM_URL" "${STANDARD_CHROMS[@]}" \
+            | bedtools bamtobed -i stdin \
+            > "$OVERSAMPLE_BED"
+        OVERSAMPLE_COUNT=$(wc -l < "$OVERSAMPLE_BED")
+        echo "Pass 1 done in ${SECONDS}s: $OVERSAMPLE_COUNT reads."
+
+        if (( OVERSAMPLE_COUNT < 100000000 )); then
+            echo "Error: oversample has fewer than 100M reads ($OVERSAMPLE_COUNT). Increase fraction." >&2
+            rm -f "$OVERSAMPLE_BED"; exit 1
+        fi
+
+        echo "Pass 2: randomly selecting exactly 100M reads (shuf -n 100000000)..."
+        SECONDS=0
+        shuf -n 100000000 "$OVERSAMPLE_BED" > "$BED_FILE"
+        echo "Pass 2 done in ${SECONDS}s."
+        rm -f "$OVERSAMPLE_BED"
+    else
+        echo "Streaming BAM → BED (samtools | bedtools bamtobed)..."
+        echo "This may take 10–30 minutes depending on network speed."
+        SECONDS=0
+        samtools view -b -@ 4 "$BAM_URL" "${REGIONS[@]}" \
+            | bedtools bamtobed -i stdin \
+            > "$BED_FILE"
+        echo "Done in ${SECONDS}s."
+    fi
+
+    echo "$(wc -l < "$BED_FILE") reads → $BED_FILE"
 fi
 
 READ_COUNT=$(wc -l < "$BED_FILE")

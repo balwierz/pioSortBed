@@ -173,6 +173,22 @@ Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned
 
 To reproduce: `bash benchmark/benchmark_na12878.sh` (streams ~12 GB from NCBI FTP on first run).
 
+### Real-data Benchmark: NA12878 WGS (all chromosomes, exactly 100M reads)
+
+100,000,000 reads randomly sampled from all standard chromosomes (chr1–22, X, Y) of the same HG001 GRCh38 300x BAM. Sampled by streaming a 2% subsample (~114M reads) then `shuf -n 100000000`. Reads span all chromosomes — realistic multi-chromosome sort workload.
+
+| Tool | Wall time | Peak RSS |
+|------|-----------|----------|
+| **pioSortBed 1t** | 38.0 s | 9.7 GB |
+| **pioSortBed 8t** | 37.2 s | 9.7 GB |
+| **pioSortBed low-mem** | 39.7 s | 8.6 GB |
+| **GNU sort 1t** | 3min 07.5s | 11.0 GB |
+| **GNU sort 8t** | 57.0 s | 17.3 GB |
+| **bedops sort-bed** | 1min 10.2s | 8.2 GB |
+| **bedtools sort** | 6min 24.7s | 40.1 GB |
+
+**pioSortBed is 4.9× faster than GNU sort (single-thread) and 1.5× faster than GNU sort (8-thread).** bedops has the lowest memory (8.2 GB) but is 1.9× slower. bedtools is slowest and uses the most RAM.
+
 ## Compile-time Limits
 
 These constants can be changed and the program recompiled if needed:
