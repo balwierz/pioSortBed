@@ -175,9 +175,15 @@ if (( HAS_BEDOPS )); then
     printf "%-22s  %14s  %10s\n" "bedops sort-bed" "$(fmt_time $bo_ms)" "$(fmt_size $bo_kb)"
 fi
 
-# bedtools: skip — memory usage at 100M+ reads exceeds practical limits
+# bedtools sort
+HAS_BEDTOOLS=0
+command -v bedtools &>/dev/null && HAS_BEDTOOLS=1
+if (( HAS_BEDTOOLS )); then
+    run_and_measure bedtools sort -i "$BED_FILE"
+    bt_ms=$RESULT_MS; bt_kb=$RESULT_KB
+    printf "%-22s  %14s  %10s\n" "bedtools sort" "$(fmt_time $bt_ms)" "$(fmt_size $bt_kb)"
+fi
 echo ""
-echo "Note: bedtools sort skipped (peak RSS exceeds ~40 GB at this read count)"
 
 echo ""
 echo "Dataset: NA12878 HG001 GRCh38 300x WGS, region: ${REGIONS[*]}, reads: $READ_COUNT"

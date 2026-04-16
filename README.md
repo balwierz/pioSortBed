@@ -157,7 +157,7 @@ To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot for plot
 
 ### Real-data Benchmark: NA12878 WGS (chr20, 120M reads)
 
-Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned to GRCh38 (GIAB/NHGRI). 120,499,538 reads, 7.9 GB BED file. All tools use the bucket-sort path (>50M reads). bedtools skipped (>40 GB RAM at this scale).
+Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned to GRCh38 (GIAB/NHGRI). 120,499,538 reads, 7.9 GB BED file. All tools use the bucket-sort path (>50M reads).
 
 | Tool | Wall time | Peak RSS |
 |------|-----------|----------|
@@ -167,8 +167,9 @@ Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned
 | **GNU sort 1t** | 1min 09.8s | 13.2 GB |
 | **GNU sort 8t** | 33.9 s | 22.2 GB |
 | **bedops sort-bed** | 59.3 s | 9.9 GB |
+| **bedtools sort** | 6min 14.3s | 40.3 GB |
 
-**pioSortBed is 7.4× faster than GNU sort (single-thread) and 3.6× faster than GNU sort (8-thread).** bedops is competitive on memory but 6.3× slower than pioSortBed.
+**pioSortBed is 7.4× faster than GNU sort (single-thread) and 3.6× faster than GNU sort (8-thread).** bedops is competitive on memory but 6.3× slower than pioSortBed. bedtools is the slowest and uses the most RAM (40.3 GB).
 
 To reproduce: `bash benchmark/benchmark_na12878.sh` (streams ~12 GB from NCBI FTP on first run).
 
