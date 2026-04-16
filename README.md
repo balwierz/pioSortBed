@@ -80,7 +80,7 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n input.bed` (single-thread) |
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n --parallel=8 input.bed` (8 threads) |
 | **bedtools** | 2.31.1 | `bedtools sort -i input.bed` |
-| **bedops sort-bed** | — | `sort-bed input.bed` |
+| **bedops sort-bed** | 2.4.42 | `sort-bed input.bed` |
 
 Wall time and peak RSS (resident set size) measured with GNU time. Times in seconds or milliseconds; memory in MB or GB.
 
