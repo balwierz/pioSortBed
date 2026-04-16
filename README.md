@@ -65,10 +65,10 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 
 ### System Configuration
 
-**Hardware:**
+**Hardware:** Lenovo ThinkPad P1 Gen7
 - CPU: Intel Core Ultra 7 155H (16 cores, P+E architecture)
-- RAM: 32 GB
-- Storage: SSD (NVME)
+- RAM: 32 GB LPCAMM2 @ 7467 MT/s
+- SSD: KIOXIA KXG8AZNV1T02 NVMe — random 4 kB read: 177 MiB/s, 45.3k IOPS (fio: `--rw=randread --bs=4k --size=1G --numjobs=4 --runtime=30`)
 
 **Tools & Command Lines:**
 
