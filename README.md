@@ -95,13 +95,13 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Tool                | Color      | Point Style | Description |
 |---------------------|------------|-------------|-------------|
-| **pioSortBed 1t**   | <span style="color:#e41a1c">red</span>      | ●           | Single-thread (default) |
-| **pioSortBed 8t**   | <span style="color:#377eb8">blue</span>     | ■           | 8 threads |
-| **pioSortBed low-mem** | <span style="color:#f781bf">pink</span>  | ◆           | Low-memory SSD mode |
-| **GNU sort 1t**     | <span style="color:#4daf4a">green</span>    | ▲           | Single-thread |
-| **GNU sort 8t**     | <span style="color:#ff7f00">orange</span>   | ▼           | 8 threads |
-| **bedtools**        | <span style="color:#984ea3">purple</span>   | ✚           | bedtools sort |
-| **bedops**          | <span style="color:#a65628">brown</span>    | ✦           | bedops sort-bed |
+| **pioSortBed 1t**   | <span style="color:#e41a1c">████</span> | ●           | Single-thread (default) |
+| **pioSortBed 8t**   | <span style="color:#377eb8">████</span> | ■           | 8 threads |
+| **pioSortBed low-mem** | <span style="color:#f781bf">████</span> | ◆        | Low-memory SSD mode |
+| **GNU sort 1t**     | <span style="color:#4daf4a">████</span> | ▲           | Single-thread |
+| **GNU sort 8t**     | <span style="color:#ff7f00">████</span> | ▼           | 8 threads |
+| **bedtools**        | <span style="color:#984ea3">████</span> | ✚           | bedtools sort |
+| **bedops**          | <span style="color:#a65628">████</span> | ✦           | bedops sort-bed |
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
