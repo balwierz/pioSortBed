@@ -89,6 +89,8 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ![Wall time comparison](benchmark_time.png)
 
+![Wall time comparison (linear scale)](benchmark_time_linear.png)
+
 #### Legend (point style & color):
 
 | Tool                | Color      | Point Style | Description |
@@ -119,6 +121,8 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 ### Peak Memory (RSS)
 
 ![Peak memory usage](benchmark_memory.png)
+
+![Peak memory usage (linear scale)](benchmark_memory_linear.png)
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
