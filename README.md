@@ -155,6 +155,23 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot for plots).
 
+### Real-data Benchmark: NA12878 WGS (chr20, 120M reads)
+
+Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned to GRCh38 (GIAB/NHGRI). 120,499,538 reads, 7.9 GB BED file. All tools use the bucket-sort path (>50M reads). bedtools skipped (>40 GB RAM at this scale).
+
+| Tool | Wall time | Peak RSS |
+|------|-----------|----------|
+| **pioSortBed 1t** | 9.4 s | 10.8 GB |
+| **pioSortBed 8t** | 9.2 s | 10.8 GB |
+| **pioSortBed low-mem** | 12.0 s | 15.5 GB |
+| **GNU sort 1t** | 1min 09.8s | 13.2 GB |
+| **GNU sort 8t** | 33.9 s | 22.2 GB |
+| **bedops sort-bed** | 59.3 s | 9.9 GB |
+
+**pioSortBed is 7.4× faster than GNU sort (single-thread) and 3.6× faster than GNU sort (8-thread).** bedops is competitive on memory but 6.3× slower than pioSortBed.
+
+To reproduce: `bash benchmark/benchmark_na12878.sh` (streams ~12 GB from NCBI FTP on first run).
+
 ## Compile-time Limits
 
 These constants can be changed and the program recompiled if needed:
