@@ -66,7 +66,7 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 ### System Configuration
 
 **Hardware:** Lenovo ThinkPad P1 Gen7
-- CPU: Intel Core Ultra 7 155H (16 cores, P+E architecture)
+- CPU: Intel Core Ultra 7 155H (Meteor Lake, Intel 4) — 16 cores / 22 threads: 6 P-cores (Redwood Cove, up to 4.8 GHz) + 8 E-cores (Crestmont, up to 3.8 GHz) + 2 LP E-cores (Crestmont, up to 2.5 GHz)
 - RAM: 32 GB LPCAMM2 @ 7467 MT/s
 - SSD: KIOXIA KXG8AZNV1T02 NVMe — random 4 kB read: 177 MiB/s, 45.3k IOPS (fio: `--rw=randread --bs=4k --size=1G --numjobs=4 --runtime=30`)
 
