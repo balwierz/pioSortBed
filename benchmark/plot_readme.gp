@@ -3,7 +3,7 @@ set logscale x 10
 set format x '%.0s%c'
 set xtics nomirror
 set ytics nomirror
-set key top left font ',10' spacing 1.2
+set key top left font ',13' spacing 1.3
 set grid xtics ytics lt 0 lw 0.5 lc rgb '#dddddd'
 set xrange [1e5:]
 
