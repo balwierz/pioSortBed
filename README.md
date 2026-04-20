@@ -26,7 +26,7 @@ make
 
 Manual compilation:
 ```bash
-g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++11 -fopenmp -static
+g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++11 -fopenmp -lgomp
 ```
 
 ## Usage
@@ -41,18 +41,23 @@ pioSortBed [options] -   # read from standard input
 | `-s s` / `--sort s` | Sort by start coordinate (default) |
 | `-s b` / `--sort b` | Sort by start and end coordinate |
 | `-s 5` / `--sort 5` | Sort by 5' end (respects strand: col 6) |
+| `-n` / `--natural-sort` | Natural chromosome order: `chr2 < chr10` (default: lexicographic) |
 | `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
-| `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin). |
+| `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin or gzip). |
 | `--bucket-cutoff N` | Use bucket sort for files with ≥N reads (default: 50M; 0 = always bucket sort) |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
 | `-h` / `--help` | Show help message |
 
+BED header lines (`track`, `browser`, `#` comments) are passed through unchanged to output. Gzip-compressed input (`.gz` extension) is transparently decompressed.
+
 **Examples:**
 ```bash
 pioSortBed input.bed > sorted.bed
+pioSortBed input.bed.gz > sorted.bed          # gzip input
 cat input.bed | pioSortBed - > sorted.bed
 pioSortBed --sort b input.bed > sorted.bed
+pioSortBed --natural-sort input.bed > sorted.bed   # chr2 before chr10
 ```
 
 ## Memory Requirements
