@@ -20,7 +20,7 @@ for arg in "$@"; do
     esac
 done
 
-SIZES=(10000 100000 1000000 5000000 10000000 50000000 100000000)
+SIZES=(100000 1000000 5000000 10000000 50000000)
 CHROMS=("chr1" "chr2" "chr3" "chr4" "chr5" "chr10" "chr11" "chr20" "chrX" "chrY")
 
 # ---------------------------------------------------------------------------
@@ -212,13 +212,10 @@ for n in "${SIZES[@]}"; do
     pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
     cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
 
-    # --- pioSortBed 8-threaded (only for classic sort path) ---
-    pio8_ms=0; pio8_kb=0
-    if (( n < 50000000 )); then
-        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
-        pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
-        cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
-    fi
+    # --- pioSortBed 8-threaded (parallelizes at all sizes since v2.1.0) ---
+    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
+    pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
+    cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
 
     # --- pioSortBed low-memory SSD mode ---
     bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
@@ -331,10 +328,7 @@ for n in "${SIZES[@]}"; do
     generate_bed "$n" "$BENCH_FILE"
 
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE";  pio1_ms=$RESULT_MS
-    pio8_ms=0
-    if (( n < 50000000 )); then
-        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
-    fi
+    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
     bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
 
     sort1_ms=0; sort8_ms=0; bt_ms=0; bo_ms=0
@@ -400,60 +394,27 @@ printf "  Stdin: %s, %s peak RSS\n" "$(fmt_time $stdin_ms)" "$(fmt_size $stdin_k
 echo ""
 
 # ---------------------------------------------------------------------------
-# Generate plot with gnuplot
+# Convert results CSV to README plot format and regenerate PNGs via plot_readme.gp
 # ---------------------------------------------------------------------------
 
-PLOT_TIME_SVG="$SCRIPT_DIR/benchmark_time.svg"
-PLOT_MEM_SVG="$SCRIPT_DIR/benchmark_memory.svg"
-PLOT_TIME_PDF="$SCRIPT_DIR/benchmark_time.pdf"
-PLOT_MEM_PDF="$SCRIPT_DIR/benchmark_memory.pdf"
+# benchmark_results.csv: 15 cols, time-ms and memory-kb interleaved per tool.
+# benchmark_readme.csv:  15 cols, reads + 7 ms cols + 7 mb cols. Used by plot_readme.gp.
+README_CSV="$SCRIPT_DIR/benchmark_readme.csv"
+awk -F',' 'BEGIN{OFS=","}
+NR==1 {
+    print "reads,pio1_ms,pio8_ms,piolm_ms,sort1_ms,sort8_ms,bt_ms,bo_ms,pio1_mb,pio8_mb,piolm_mb,sort1_mb,sort8_mb,bt_mb,bo_mb"
+    next
+}
+{
+    printf "%s,%d,%d,%d,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+        $1, $2,$4,$6,$8,$10,$12,$14,
+        $3/1024,$5/1024,$7/1024,$9/1024,$11/1024,$13/1024,$15/1024
+}' "$CSV_FILE" > "$README_CSV"
+echo "Wrote $README_CSV"
 
 if command -v gnuplot &>/dev/null; then
-    echo "Generating plots: $PLOT_TIME_SVG, $PLOT_MEM_SVG, $PLOT_TIME_PDF, $PLOT_MEM_PDF"
-    GNUPLOT_SCRIPT="$TMPDIR/plot.gp"
-    cat > "$GNUPLOT_SCRIPT" <<'GPEOF'
-set datafile separator ','
-set logscale x 10
-set xrange [1e6:]
-set logscale y 10
-set format x '%.0s%c'
-set xtics nomirror
-set ytics nomirror
-set key top left font ',10' spacing 1.2
-set grid xtics ytics lt 0 lw 0.5 lc rgb '#dddddd'
-
-set style line 1 lc rgb '#e41a1c' lw 2.2 pt 7  ps 1.0
-set style line 2 lc rgb '#377eb8' lw 2.2 pt 7  ps 1.0
-set style line 3 lc rgb '#4daf4a' lw 2.2 pt 7  ps 1.0
-set style line 4 lc rgb '#ff7f00' lw 2.2 pt 7  ps 1.0
-set style line 5 lc rgb '#984ea3' lw 2.2 pt 7  ps 1.0
-set style line 6 lc rgb '#a65628' lw 2.2 pt 7  ps 1.0
-set style line 7 lc rgb '#f781bf' lw 2.2 pt 7  ps 1.0
-    # Wall time SVG
-    echo "set terminal svg size 900,600 enhanced font 'Arial,11'" > "$TMPDIR/plot_wall_svg.gp"
-    echo "set output '$PLOT_TIME_SVG'" >> "$TMPDIR/plot_wall_svg.gp"
-    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Wall time plot ---/,$p' | sed '/# --- Memory plot ---/q' >> "$TMPDIR/plot_wall_svg.gp"
-    sed -i "s|PLOT_TIME_PH|$PLOT_TIME_SVG|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_wall_svg.gp"
-    gnuplot "$TMPDIR/plot_wall_svg.gp"
-    # Memory SVG
-    echo "set terminal svg size 900,600 enhanced font 'Arial,11'" > "$TMPDIR/plot_mem_svg.gp"
-    echo "set output '$PLOT_MEM_SVG'" >> "$TMPDIR/plot_mem_svg.gp"
-    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Memory plot ---/,$p' >> "$TMPDIR/plot_mem_svg.gp"
-    sed -i "s|PLOT_MEM_PH|$PLOT_MEM_SVG|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_mem_svg.gp"
-    gnuplot "$TMPDIR/plot_mem_svg.gp"
-    # Wall time PDF
-    echo "set terminal pdfcairo size 9,6 font 'Arial,11'" > "$TMPDIR/plot_wall_pdf.gp"
-    echo "set output '$PLOT_TIME_PDF'" >> "$TMPDIR/plot_wall_pdf.gp"
-    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Wall time plot ---/,$p' | sed '/# --- Memory plot ---/q' >> "$TMPDIR/plot_wall_pdf.gp"
-    sed -i "s|PLOT_TIME_PH|$PLOT_TIME_PDF|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_wall_pdf.gp"
-    gnuplot "$TMPDIR/plot_wall_pdf.gp"
-    # Memory PDF
-    echo "set terminal pdfcairo size 9,6 font 'Arial,11'" > "$TMPDIR/plot_mem_pdf.gp"
-    echo "set output '$PLOT_MEM_PDF'" >> "$TMPDIR/plot_mem_pdf.gp"
-    cat "$GNUPLOT_SCRIPT" | sed -n '/# --- Memory plot ---/,$p' >> "$TMPDIR/plot_mem_pdf.gp"
-    sed -i "s|PLOT_MEM_PH|$PLOT_MEM_PDF|g; s|CSV_PLACEHOLDER|$CSV_FILE|g" "$TMPDIR/plot_mem_pdf.gp"
-    gnuplot "$TMPDIR/plot_mem_pdf.gp"
-    echo "Plots saved as SVG and PDF."
+    (cd "$SCRIPT_DIR" && gnuplot plot_readme.gp)
+    echo "Plots regenerated in $SCRIPT_DIR (4 PNGs: time/memory × log/linear)"
 else
     echo "gnuplot not found — skipping plot generation"
 fi

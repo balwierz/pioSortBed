@@ -6,11 +6,14 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <parallel/algorithm>
+#include <condition_variable>
+#include <execution>
 #include <iostream>
+#include <mutex>
+#include <thread>
 #include <time.h>
-#include <omp.h>
 #include <unordered_map>
+#include <tbb/global_control.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -264,8 +267,40 @@ static int parseRalLine(const char* buf,
 	return 5;
 }
 
-float sumList(seqread* reads, int* readBuff, int foo);
-float sumList2(seqread*, int*, int);
+// Parse a weight string written into reads[idx].line (collapse mode) using
+// strtof (faster + locale-independent compared to sscanf). Aborts on malformed input.
+static inline float parseWeight(const seqread* reads, int idx)
+{
+	char* endptr;
+	float w = strtof(reads[idx].line, &endptr);
+	if(endptr == reads[idx].line)
+	{
+		cerr << "Malformed weight " << reads[idx].line << endl;
+		exit(1);
+	}
+	return w;
+}
+
+// Sum weights across a contiguous int buffer of read indices.
+static inline float sumWeightsBuf(const seqread* reads, const int* idxs, int n)
+{
+	float sum = 0.0f;
+	for(int j = 0; j < n; ++j) sum += parseWeight(reads, idxs[j]);
+	return sum;
+}
+
+// Sum weights along a chromTable linked list at a given position, consuming the list.
+// On return chromTable[pos] == 0.
+static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
+{
+	float sum = 0.0f;
+	while(chromTable[pos])
+	{
+		sum += parseWeight(reads, chromTable[pos]);
+		chromTable[pos] = reads[chromTable[pos]].next;
+	}
+	return sum;
+}
 
 struct lowMemNode
 {
@@ -535,7 +570,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		if(numThreads == 1)
 			std::sort(recs.begin(), recs.end(), cmp);
 		else
-			__gnu_parallel::sort(recs.begin(), recs.end(), cmp);
+			std::sort(std::execution::par, recs.begin(), recs.end(), cmp);
 
 		if(fCollapse)
 		{
@@ -593,6 +628,150 @@ static inline void writeBedLine(const char* chr, int beg, int end,
 	fwrite_unlocked(buf, 1, n, out);
 	if(tail[0]) fputs_unlocked(tail, out);
 	fputc_unlocked('\n', out);
+}
+
+// Print one read. fullLine==true means reads[idx].line holds the entire input
+// line (RAL or mmap path) — a single fputs+\n is enough. fullLine==false means
+// .line is just the tail (stdin/gzip BED path), so reconstruct chr/beg/end.
+static inline void printRead(const seqread* reads, int idx, const char* chr,
+                             bool fullLine, FILE* out)
+{
+	if(fullLine)
+	{
+		fputs_unlocked(reads[idx].line, out);
+		fputc_unlocked('\n', out);
+	}
+	else
+	{
+		writeBedLine(chr, reads[idx].beg, reads[idx].end, reads[idx].line, out);
+	}
+}
+
+// Comparator that orders read indices by (chrIdx, sort-key). The SortMode
+// template parameter selects the secondary key:
+//   's' — start coord only
+//   'b' — start, then end
+//   '5' — 5'-end (end if strand=='-', else beg)
+// `if constexpr` collapses each instantiation to a single int compare per arm
+// at compile time, giving the same generated code as the old hand-unrolled lambdas.
+template<char SortMode>
+struct ReadCmp
+{
+	seqread* reads;
+	bool operator()(int a, int b) const
+	{
+		if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
+		if constexpr(SortMode == 'b')
+		{
+			if(reads[a].beg != reads[b].beg) return reads[a].beg < reads[b].beg;
+			return reads[a].end < reads[b].end;
+		}
+		else if constexpr(SortMode == '5')
+		{
+			int posA = (reads[a].str == '-') ? reads[a].end : reads[a].beg;
+			int posB = (reads[b].str == '-') ? reads[b].end : reads[b].beg;
+			return posA < posB;
+		}
+		else  // 's'
+		{
+			return reads[a].beg < reads[b].beg;
+		}
+	}
+};
+
+template<char SortMode>
+static void sortIndices(int* order, int n, seqread* reads, int numThreads)
+{
+	ReadCmp<SortMode> cmp{reads};
+	if(numThreads == 1)
+		std::sort(order, order + n, cmp);
+	else
+		std::sort(std::execution::par, order, order + n, cmp);
+}
+
+// Dispatch the templated sort by the runtime sortMode char.
+static void sortIndicesDispatch(int* order, int n, seqread* reads, char sortMode, int numThreads)
+{
+	switch(sortMode)
+	{
+		case 'b': sortIndices<'b'>(order, n, reads, numThreads); break;
+		case '5': sortIndices<'5'>(order, n, reads, numThreads); break;
+		default:  sortIndices<'s'>(order, n, reads, numThreads); break;
+	}
+}
+
+// Bucket-sort one chromosome: scatter its linked list of reads into
+// chromTable[chosenPosition], then scan positions in order and emit the result.
+// chromTable and (for --sort b) numReadsBeg must be sized at least thisChrLen+1
+// and zero-initialized; on return all touched slots are 0 again so the buffers
+// can be reused for another chromosome.
+static void processChromBucket(const char* chrName, int thisChrLen, int firstRead,
+                               seqread* reads, char sortMode, int fCollapse, bool fullLine,
+                               int* chromTable, int* numReadsBeg, FILE* out)
+{
+	// Phase 1: scatter into chromTable linked lists keyed by chosenPosition.
+	int currRead = firstRead;
+	int maxNumReads = 0;
+	while(currRead)
+	{
+		int chosenPosition = (sortMode == '5')
+			? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg)
+			: reads[currRead].beg;
+		int oldPtr = chromTable[chosenPosition];
+		chromTable[chosenPosition] = currRead;
+		currRead = reads[currRead].next;        // must read .next before overwriting it below
+		reads[chromTable[chosenPosition]].next = oldPtr;
+		if(sortMode == 'b')
+		{
+			numReadsBeg[chosenPosition]++;
+			if(numReadsBeg[chosenPosition] > maxNumReads) maxNumReads++;
+		}
+	}
+
+	// Phase 2: scan positions in order, emit and consume each bucket.
+	if(sortMode == 'b')
+	{
+		int* readBuff = (int*) calloc((size_t)maxNumReads, sizeof(int));
+		for(int pos = 0; pos <= thisChrLen; pos++)
+		{
+			if(!chromTable[pos]) continue;
+			int n = 0;
+			int foo = numReadsBeg[pos];
+			while(chromTable[pos])
+			{
+				readBuff[n++] = chromTable[pos];
+				chromTable[pos] = reads[chromTable[pos]].next;
+			}
+			std::sort(readBuff, readBuff + foo, [reads](int a, int b) {
+				return reads[a].end < reads[b].end;
+			});
+			if(fCollapse)
+				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
+				        sumWeightsBuf(reads, readBuff, foo));
+			else
+				for(int j = 0; j < foo; ++j)
+					printRead(reads, readBuff[j], chrName, fullLine, out);
+			numReadsBeg[pos] = 0;
+		}
+		free(readBuff);
+	}
+	else  // sortMode in {5, s}: positions already give the final order.
+	{
+		for(int pos = 0; pos <= thisChrLen; pos++)
+		{
+			if(!chromTable[pos]) continue;
+			if(fCollapse)
+				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
+				        sumWeightsList(reads, chromTable, pos));
+			else
+				while(chromTable[pos])
+				{
+					int ri = chromTable[pos];
+					printRead(reads, ri, chrName, fullLine, out);
+					chromTable[pos] = reads[ri].next;
+				}
+		}
+	}
 }
 
 // Parsing loop, templated on UseMmap to eliminate per-line branch.
@@ -764,6 +943,332 @@ static void parseLines(
 	}
 }
 
+// ============================================================================
+// Parallel mmap parsing (used when --threads > 1 on a non-gzip mmap input)
+// ----------------------------------------------------------------------------
+// Mmap is split into N newline-aligned chunks. A first parallel pass counts
+// newlines per chunk so we can size the global `reads` array exactly;
+// prefix-sums then give each chunk a base index. A second parallel pass
+// parses each chunk into its slot, building per-chunk per-chrom partial
+// linked lists. A serial merge step concatenates them.
+//
+// Header lines (track/browser/#) are emitted to stdout *before* chunking,
+// in a leading pre-pass over the mmap (only header lines at the start of
+// the file are recognized; per BED convention headers are leading).
+// ============================================================================
+
+struct ChunkChrPartial
+{
+	int head;   // global idx of head (most recently inserted read)
+	int tail;   // global idx of tail (read whose .next is 0)
+	int len;    // max chosenPosition seen
+};
+
+typedef std::unordered_map<std::string, ChunkChrPartial> ChunkChrMap;
+
+struct ChunkResult
+{
+	int firstIdx;
+	int count;
+	ChunkChrMap chr;
+};
+
+// Parse [start, end) of the mmap into reads[base+1 .. base+count].
+// All indices stored (head/tail and reads[i].next) are global, so no
+// rebase pass is needed. Mutates the chunk in place: replaces '\n' (and
+// preceding '\r') with '\0' to NUL-terminate each line.
+static void parseChunkMmap(char* start, char* end,
+                           seqread* reads, int base,
+                           ChunkResult& result,
+                           bool fRal, char sortMode)
+{
+	const bool needExtra = fRal || (sortMode == '5');
+	char* mmapCur = start;
+	char* mmapLim = end;
+	int idx = base + 1;
+	auto thisChrIt = result.chr.end();
+
+	while(mmapCur < mmapLim)
+	{
+		char* linePtr = mmapCur;
+		char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
+		if(nl)
+		{
+			if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+			*nl = '\0';
+			mmapCur = nl + 1;
+		}
+		else
+		{
+			mmapCur = mmapLim;
+		}
+
+		int beg = 0, lineEnd = 0;
+		char strandChar = '+';
+		char weight[chrNameBufSize];
+		weight[0] = '0'; weight[1] = '\0';
+		char chrBuf[chrNameBufSize];
+		const char* chrPtr;
+		int chrLen;
+		const char* tailPtr = "";
+		int numArgsRead;
+
+		if(fRal)
+		{
+			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+			                           &beg, &lineEnd, weight, chrNameBufSize,
+			                           &strandChar);
+			chrPtr = chrBuf;
+			chrLen = (int)strlen(chrBuf);
+		}
+		else if(needExtra)
+		{
+			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
+			                               &beg, &lineEnd, weight, chrNameBufSize,
+			                               &strandChar, &tailPtr);
+		}
+		else
+		{
+			numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &lineEnd, &tailPtr);
+		}
+
+		if(numArgsRead < 3)
+		{
+			cerr << "Error in parsing line: " << linePtr << endl
+				 << "Perhaps this line is malformed?" << endl;
+			exit(1);
+		}
+		if(beg < 0)
+		{
+			cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
+			exit(1);
+		}
+
+		reads[idx].line = linePtr;
+		reads[idx].beg = beg;
+		reads[idx].end = lineEnd;
+		reads[idx].str = strandChar;
+		int chosenPosition = (sortMode == '5') ? (strandChar == '-' ? lineEnd : beg) : beg;
+
+		// Same-chr fast path within this chunk.
+		if(thisChrIt != result.chr.end() &&
+		   (int)thisChrIt->first.size() == chrLen &&
+		   memcmp(thisChrIt->first.data(), chrPtr, chrLen) == 0)
+		{
+			reads[idx].next = thisChrIt->second.head;
+			thisChrIt->second.head = idx;
+			if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
+		}
+		else
+		{
+			auto ins = result.chr.try_emplace(std::string(chrPtr, chrLen));
+			thisChrIt = ins.first;
+			if(ins.second)
+			{
+				reads[idx].next = 0;
+				thisChrIt->second.head = idx;
+				thisChrIt->second.tail = idx;
+				thisChrIt->second.len = chosenPosition;
+			}
+			else
+			{
+				reads[idx].next = thisChrIt->second.head;
+				thisChrIt->second.head = idx;
+				if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
+			}
+		}
+		idx++;
+	}
+
+	result.firstIdx = base + 1;
+	result.count = idx - (base + 1);
+}
+
+// Single-thread mmap parser. Wraps parseLines<true> with the same return shape
+// as parseMmapParallel so the dispatch site can ignore which one ran. Skips
+// the pre-count pass entirely (the legacy parser estimates capacity from the
+// first 64 KB and grows via realloc — one less full pass over the mmap).
+//
+// Body parsing starts at `bodyStart` (after any leading header lines that
+// the caller has already emitted to stdout).
+static seqread* parseMmapSerial(char* mmapBase, size_t bodyStart, size_t mmapSize,
+                                bool fRal, int fCollapse, char sortMode,
+                                Arena* arena,
+                                string2chrInfoT& chrInfo,
+                                int& outReadCount)
+{
+	int currMaxReads = 1024;
+	size_t bodySize = mmapSize - bodyStart;
+	size_t scanSize = bodySize < 65536 ? bodySize : 65536;
+	int nLines = 0;
+	for(size_t i = 0; i < scanSize; i++)
+		if(mmapBase[bodyStart + i] == '\n') nLines++;
+	if(nLines > 0)
+		currMaxReads = (int)((double)bodySize / (double)scanSize * nLines * 1.1);
+	if(currMaxReads < 1024) currMaxReads = 1024;
+
+	seqread* reads = (seqread*) malloc((size_t)currMaxReads * sizeof(seqread));
+	if(!reads)
+	{
+		cerr << "Error: out of memory allocating reads array" << endl;
+		exit(1);
+	}
+
+	int readCount = 1;  // slot 0 is the end-of-list sentinel
+	auto ins = chrInfo.insert(std::make_pair(std::string(""), chrInfoT()));
+	auto thisChrIt = ins.first;
+	parseLines<true>(mmapBase + bodyStart, bodySize, NULL,
+	                 reads, readCount, currMaxReads,
+	                 chrInfo, thisChrIt, arena,
+	                 fRal, fCollapse, sortMode);
+	chrInfo.erase("");
+	outReadCount = readCount - 1;
+	return reads;
+}
+
+// Top-level mmap parser. Emits any leading header lines to stdout, then
+// either runs parseMmapSerial (N==1) or chunks the body and parses in
+// parallel. Returns the malloc'd reads array; caller frees.
+static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
+                                  bool fRal, int fCollapse, char sortMode,
+                                  int numThreads,
+                                  Arena* arena,
+                                  string2chrInfoT& chrInfo,
+                                  int& outReadCount)
+{
+	// Pre-pass: emit leading header lines (#, track, browser) to stdout and
+	// advance bodyStart past them. BED convention puts headers at the top.
+	size_t bodyStart = 0;
+	while(bodyStart < mmapSize)
+	{
+		char* lineStart = mmapBase + bodyStart;
+		char* nl = (char*) memchr(lineStart, '\n', mmapSize - bodyStart);
+		size_t lineLen = (size_t)((nl ? nl : mmapBase + mmapSize) - lineStart);
+		bool isHeader = (lineLen > 0 && lineStart[0] == '#') ||
+		                (lineLen >= 6 && memcmp(lineStart, "track ",   6) == 0) ||
+		                (lineLen >= 8 && memcmp(lineStart, "browser ", 8) == 0);
+		if(!isHeader) break;
+		fwrite_unlocked(lineStart, 1, lineLen, stdout);
+		fputc_unlocked('\n', stdout);
+		bodyStart = (nl ? (size_t)(nl - mmapBase) + 1 : mmapSize);
+	}
+
+	int N = numThreads;
+	if(N < 1) N = 1;
+	{
+		size_t bytesPerChunk = 256 * 1024;
+		size_t bodySize = mmapSize - bodyStart;
+		int byBytes = (int)((bodySize + bytesPerChunk - 1) / bytesPerChunk);
+		if(byBytes < 1) byBytes = 1;
+		if(N > byBytes) N = byBytes;
+	}
+
+	// Single-thread fast path uses the legacy realloc-grow parser to avoid
+	// a separate pre-count pass over the mmap.
+	if(N == 1)
+		return parseMmapSerial(mmapBase, bodyStart, mmapSize,
+		                       fRal, fCollapse, sortMode, arena,
+		                       chrInfo, outReadCount);
+
+	// --collapse mode in parallel would need per-thread arenas for the weight
+	// strings — fall back to the serial parser for now.
+	if(fCollapse)
+		return parseMmapSerial(mmapBase, bodyStart, mmapSize,
+		                       fRal, fCollapse, sortMode, arena,
+		                       chrInfo, outReadCount);
+
+	// Newline-aligned chunk boundaries within [bodyStart, mmapSize).
+	std::vector<size_t> chunkStart(N + 1);
+	chunkStart[0] = bodyStart;
+	chunkStart[N] = mmapSize;
+	for(int i = 1; i < N; i++)
+	{
+		size_t guess = bodyStart + ((mmapSize - bodyStart) / (size_t)N) * (size_t)i;
+		while(guess < mmapSize && mmapBase[guess] != '\n') guess++;
+		if(guess < mmapSize) guess++;
+		chunkStart[i] = guess;
+	}
+
+	// Pass 1: count newlines per chunk in parallel.
+	std::vector<int> chunkCount(N, 0);
+	std::vector<int> indices(N);
+	for(int i = 0; i < N; i++) indices[i] = i;
+	std::for_each(std::execution::par, indices.begin(), indices.end(),
+		[&](int i) {
+			size_t a = chunkStart[i], b = chunkStart[i + 1];
+			int c = 0;
+			const char* p = mmapBase + a;
+			const char* pe = mmapBase + b;
+			while(p < pe)
+			{
+				const char* q = (const char*) memchr(p, '\n', (size_t)(pe - p));
+				if(!q) break;
+				c++;
+				p = q + 1;
+			}
+			chunkCount[i] = c;
+		});
+	// Trailing-no-newline: the last chunk has one extra line.
+	if(mmapSize > bodyStart && mmapBase[mmapSize - 1] != '\n')
+		chunkCount[N - 1]++;
+
+	std::vector<int> chunkBase(N + 1);
+	chunkBase[0] = 0;
+	for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
+	int totalReads = chunkBase[N];
+
+	seqread* reads = (seqread*) malloc(((size_t)totalReads + 1) * sizeof(seqread));
+	if(!reads)
+	{
+		cerr << "Error: out of memory allocating reads array (" << totalReads << " entries)" << endl;
+		exit(1);
+	}
+
+	std::vector<ChunkResult> chunkRes(N);
+	std::for_each(std::execution::par, indices.begin(), indices.end(),
+		[&](int i) {
+			parseChunkMmap(mmapBase + chunkStart[i], mmapBase + chunkStart[i + 1],
+			               reads, chunkBase[i], chunkRes[i],
+			               fRal, sortMode);
+		});
+
+	for(int i = 0; i < N; i++)
+	{
+		if(chunkRes[i].count != chunkCount[i])
+		{
+			cerr << "Internal error: chunk " << i << " parsed " << chunkRes[i].count
+			     << " reads, expected " << chunkCount[i] << endl;
+			exit(1);
+		}
+	}
+
+	// Merge: concatenate per-chunk per-chrom lists into the global chrInfo.
+	for(int t = 0; t < N; t++)
+	{
+		for(auto& kv : chunkRes[t].chr)
+		{
+			const std::string& name = kv.first;
+			const ChunkChrPartial& partial = kv.second;
+			auto ins = chrInfo.try_emplace(name);
+			chrInfoT& info = ins.first->second;
+			if(ins.second)
+			{
+				info.lastRead = partial.head;
+				info.len = partial.len;
+			}
+			else
+			{
+				reads[partial.tail].next = info.lastRead;
+				info.lastRead = partial.head;
+				if(info.len < partial.len) info.len = partial.len;
+			}
+		}
+	}
+
+	outReadCount = totalReads;
+	return reads;
+}
+
 int main(int argc, char *argv[])
 {
 	// 8MB output buffer — amortises write syscalls on 100M+ read files
@@ -824,8 +1329,14 @@ int main(int argc, char *argv[])
 	CLI11_PARSE(app, argc, argv);
 
 	if(numThreads <= 0)
-		numThreads = omp_get_max_threads();
-	omp_set_num_threads(numThreads);
+	{
+		unsigned hw = std::thread::hardware_concurrency();
+		numThreads = hw ? (int)hw : 1;
+	}
+	// TBB owns the worker pool used by std::execution::par. Capping it here
+	// gives `--threads N` the same behavior the OpenMP build had.
+	tbb::global_control tbbThreadCap(
+		tbb::global_control::max_allowed_parallelism, (size_t)numThreads);
 
 	int readCount = 1;	// count == 0 is used as an end of a list.
 	int currMaxReads = 1024;
@@ -934,27 +1445,36 @@ int main(int argc, char *argv[])
 		                      numThreads, naturalSort);
 	}
 
-	seqread *reads = (seqread*) malloc(currMaxReads * sizeof(seqread));
-
 	time_t tstart, tend;
 	time(&tstart);
 
 	int maxChrLen = 0;
 	string2chrInfoT chrInfo;
-	pair<string2chrInfoT::iterator,bool> insResult =
-		chrInfo.insert(make_pair(string(""), chrInfoT()));
-	string2chrInfoT::iterator thisChrIt = insResult.first;
+	seqread* reads = NULL;
 
 	if(useMmap)
-		parseLines<true>(mmapBase, mmapSize, fh,
-		                 reads, readCount, currMaxReads,
-		                 chrInfo, thisChrIt, arena,
-		                 fRal, fCollapse, sortMode);
+	{
+		// Parallel parser dispatches to parseMmapSerial when N==1 or --collapse,
+		// or to parseChunkMmap-per-chunk otherwise. Header lines (track/browser/#)
+		// are emitted to stdout in a leading pre-pass before chunking.
+		int parsed = 0;
+		reads = parseMmapDispatch(mmapBase, mmapSize,
+		                          (bool)fRal, fCollapse, sortMode,
+		                          numThreads, arena, chrInfo, parsed);
+		readCount = parsed + 1;  // matches the legacy "readCount-1 = total reads" semantics
+	}
 	else
+	{
+		reads = (seqread*) malloc(currMaxReads * sizeof(seqread));
+		pair<string2chrInfoT::iterator,bool> insResult =
+			chrInfo.insert(make_pair(string(""), chrInfoT()));
+		string2chrInfoT::iterator thisChrIt = insResult.first;
 		parseLines<false>(mmapBase, mmapSize, fh,
 		                  reads, readCount, currMaxReads,
 		                  chrInfo, thisChrIt, arena,
 		                  fRal, fCollapse, sortMode);
+		chrInfo.erase("");
+	}
 
 	if(isGzip && fh) pclose(fh);
 	else if(fh && fh != stdin) fclose(fh);
@@ -966,7 +1486,6 @@ int main(int argc, char *argv[])
 	/***********************************
 	 *  the actual sorting starts here *
 	 * *********************************/
-	chrInfo.erase("");
 	int nChrom = chrInfo.size();
 	std::vector<std::string> chroms;
 	for(string2chrInfoT::iterator it=chrInfo.begin(); it!=chrInfo.end(); it++)
@@ -1030,61 +1549,12 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if(numThreads == 1)
-		{
-			if(sortMode == 'b')
-			{
-				std::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					if(reads[a].beg != reads[b].beg) return reads[a].beg < reads[b].beg;
-					return reads[a].end < reads[b].end;
-				});
-			}
-			else if(sortMode == '5')
-			{
-				std::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					int posA = (reads[a].str == '-') ? reads[a].end : reads[a].beg;
-					int posB = (reads[b].str == '-') ? reads[b].end : reads[b].beg;
-					return posA < posB;
-				});
-			}
-			else
-			{
-				std::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					return reads[a].beg < reads[b].beg;
-				});
-			}
-		}
-		else
-		{
+		// Both 1-thread and N-thread paths go through sortIndicesDispatch which
+		// picks the templated comparator at compile time and chooses serial vs
+		// std::execution::par based on numThreads.
+		if(numThreads > 1)
 			cerr << "Parallel sort using " << numThreads << " threads" << endl;
-			if(sortMode == 'b')
-			{
-				__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					if(reads[a].beg != reads[b].beg) return reads[a].beg < reads[b].beg;
-					return reads[a].end < reads[b].end;
-				});
-			}
-			else if(sortMode == '5')
-			{
-				__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					int posA = (reads[a].str == '-') ? reads[a].end : reads[a].beg;
-					int posB = (reads[b].str == '-') ? reads[b].end : reads[b].beg;
-					return posA < posB;
-				});
-			}
-			else
-			{
-				__gnu_parallel::sort(order, order + totalReads, [reads](int a, int b) {
-					if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
-					return reads[a].beg < reads[b].beg;
-				});
-			}
-		}
+		sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
 
 		if(fCollapse)
 		{
@@ -1094,19 +1564,12 @@ int main(int argc, char *argv[])
 				int ri = order[i];
 				int ci = reads[ri].chrIdx;
 				int pos = reads[ri].beg;
-				float sum = 0.0;
+				float sum = 0.0f;
 				while(i < totalReads)
 				{
 					int rj = order[i];
 					if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
-					char* endptr;
-					float w = strtof(reads[rj].line, &endptr);
-					if(endptr == reads[rj].line)
-					{
-						cerr << "Malformed weight " << reads[rj].line << endl;
-						exit(1);
-					}
-					sum += w;
+					sum += parseWeight(reads, rj);
 					i++;
 				}
 				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
@@ -1114,23 +1577,11 @@ int main(int argc, char *argv[])
 		}
 		else
 		{
-			if(fRal || useMmap)
+			const bool fullLine = fRal || useMmap;
+			for(int i = 0; i < totalReads; i++)
 			{
-				for(int i = 0; i < totalReads; i++)
-				{
-					fputs_unlocked(reads[order[i]].line, stdout);
-					fputc_unlocked('\n', stdout);
-				}
-			}
-			else
-			{
-				for(int i = 0; i < totalReads; i++)
-				{
-					int ri = order[i];
-					writeBedLine(chroms[reads[ri].chrIdx].c_str(),
-					             reads[ri].beg, reads[ri].end,
-					             reads[ri].line, stdout);
-				}
+				int ri = order[i];
+				printRead(reads, ri, chroms[reads[ri].chrIdx].c_str(), fullLine, stdout);
 			}
 		}
 		free(order);
@@ -1139,135 +1590,88 @@ int main(int argc, char *argv[])
 	{
 		/*************************************************************
 		 * BUCKET SORT PATH — O(n + m) counting/bucket sort
+		 *
+		 * Single-thread: one shared chromTable[maxChrLen+1] reused across chromosomes.
+		 * Multi-thread: chromosomes processed in parallel via std::for_each(par, ...).
+		 *   Each worker allocates its own per-chrom chromTable, writes output to an
+		 *   open_memstream buffer, then waits at a producer-consumer barrier for its
+		 *   alphabetical turn before flushing to stdout. The chromTable is freed
+		 *   BEFORE the wait so a thread holding chr1 doesn't pin ~1 GB while it waits.
 		 *************************************************************/
-		int* chromTable = (int*) calloc(maxChrLen+1, sizeof(int));
-		int* numReadsBeg = NULL;
-		if(sortMode == 'b')
-			numReadsBeg = (int*) calloc(maxChrLen+1, sizeof(int));
+		const bool fullLine = fRal || useMmap;
 
-		for(std::vector<std::string>::iterator it=chroms.begin(); it!=chroms.end(); it++)
+		if(numThreads <= 1)
 		{
-			cerr << "Sorting " << *it << endl;
-			string2chrInfoT::iterator cit = chrInfo.find(*it);
-			int thisChrLen = cit->second.len;
-			int currRead = cit->second.lastRead;
-			int maxNumReads = 0;
-			while(currRead)
+			int* chromTable = (int*) calloc((size_t)maxChrLen + 1, sizeof(int));
+			int* numReadsBeg = (sortMode == 'b')
+				? (int*) calloc((size_t)maxChrLen + 1, sizeof(int))
+				: NULL;
+			for(const std::string& chrom : chroms)
 			{
-				int chosenPosition = (sortMode == '5') ? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg) : reads[currRead].beg;
-				int oldPtr = chromTable[chosenPosition];
-				chromTable[chosenPosition] = currRead;
-				currRead = reads[currRead].next;
-				reads[chromTable[chosenPosition]].next = oldPtr;
-				if(sortMode == 'b')
-				{
-					numReadsBeg[chosenPosition] ++;
-					if(numReadsBeg[chosenPosition] > maxNumReads)
-						maxNumReads ++;
-				}
+				cerr << "Sorting " << chrom << endl;
+				string2chrInfoT::iterator cit = chrInfo.find(chrom);
+				processChromBucket(chrom.c_str(), cit->second.len, cit->second.lastRead,
+				                   reads, sortMode, fCollapse, fullLine,
+				                   chromTable, numReadsBeg, stdout);
 			}
-			if(sortMode == 'b')
-			{
-				int* readBuff = (int*) calloc(maxNumReads, sizeof(int));
-				for(int pos=0; pos<=thisChrLen; pos++)
-				{
-					if(chromTable[pos])
-					{
-						int i=0;
-						int foo = numReadsBeg[pos];
-						while(chromTable[pos])
-						{
-							readBuff[i++] = chromTable[pos];
-							chromTable[pos] = reads[chromTable[pos]].next;
-						}
-						std::sort(readBuff, readBuff + foo, [reads](int a, int b) {
-							return reads[a].end < reads[b].end;
-						});
-						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList(reads, readBuff, foo));
-						else if(fRal || useMmap)
-							for(int j = 0; j < foo; ++j)
-							{
-								fputs_unlocked(reads[readBuff[j]].line, stdout);
-								fputc_unlocked('\n', stdout);
-							}
-						else
-							for(int j = 0; j < foo; ++j)
-								writeBedLine(it->c_str(), reads[readBuff[j]].beg,
-								             reads[readBuff[j]].end,
-								             reads[readBuff[j]].line, stdout);
-						numReadsBeg[pos] = 0;
-					}
-				}
-				free(readBuff);
-			}
-			else
-			{
-				for(int pos=0; pos<=thisChrLen; pos++)
-					if(chromTable[pos])
-					{
-						if(fCollapse)
-							printf("%s\t%d\t%d\t.\t%g\t+\n", it->c_str(), pos, pos+1, sumList2(reads, chromTable, pos));
-						else if(fRal || useMmap)
-							while(chromTable[pos])
-							{
-								fputs_unlocked(reads[chromTable[pos]].line, stdout);
-								fputc_unlocked('\n', stdout);
-								chromTable[pos] = reads[chromTable[pos]].next;
-							}
-						else
-							while(chromTable[pos])
-							{
-								int ri = chromTable[pos];
-								writeBedLine(it->c_str(), reads[ri].beg, reads[ri].end,
-								             reads[ri].line, stdout);
-								chromTable[pos] = reads[ri].next;
-							}
-					}
-			}
+			free(chromTable);
+			if(numReadsBeg) free(numReadsBeg);
 		}
-		free(chromTable);
-		if(numReadsBeg) free(numReadsBeg);
+		else
+		{
+			cerr << "Parallel bucket sort using up to " << numThreads << " threads ("
+			     << chroms.size() << " chromosomes)" << endl;
+			std::vector<int> idxs(chroms.size());
+			for(size_t i = 0; i < chroms.size(); i++) idxs[i] = (int)i;
+
+			std::mutex printMtx;
+			std::condition_variable printCv;
+			int nextChromToPrint = 0;
+
+			std::for_each(std::execution::par, idxs.begin(), idxs.end(),
+				[&](int ci) {
+					const std::string& chrom = chroms[ci];
+					string2chrInfoT::iterator cit = chrInfo.find(chrom);
+					int thisChrLen = cit->second.len;
+
+					char* memBuf = NULL;
+					size_t memBufSz = 0;
+					FILE* sink = open_memstream(&memBuf, &memBufSz);
+					if(!sink)
+					{
+						cerr << "open_memstream failed for chrom " << chrom << endl;
+						exit(1);
+					}
+					{
+						std::vector<int> chromTable((size_t)thisChrLen + 1, 0);
+						std::vector<int> numReadsBeg;
+						if(sortMode == 'b') numReadsBeg.assign((size_t)thisChrLen + 1, 0);
+
+						processChromBucket(chrom.c_str(), thisChrLen, cit->second.lastRead,
+						                   reads, sortMode, fCollapse, fullLine,
+						                   chromTable.data(),
+						                   sortMode == 'b' ? numReadsBeg.data() : NULL,
+						                   sink);
+						// chromTable / numReadsBeg destruct here, releasing ~thisChrLen*4
+						// bytes BEFORE we block at the print barrier.
+					}
+					fclose(sink);
+
+					{
+						std::unique_lock<std::mutex> lk(printMtx);
+						printCv.wait(lk, [&]{ return nextChromToPrint == ci; });
+						fwrite_unlocked(memBuf, 1, memBufSz, stdout);
+						free(memBuf);
+						nextChromToPrint++;
+					}
+					printCv.notify_all();
+				});
+		}
 	}
 	time(&tend);
 	double difftime_sorting = difftime(tend, tstart);
 	fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime_sorting+0.5));
 	return 0;
-}
-
-float sumList(seqread* reads, int* readBuff, int foo)
-{
-	float sum = 0.0;
-	for(int j = 0; j < foo; ++j)
-	{
-		char* endptr;
-		float w = strtof(reads[readBuff[j]].line, &endptr);
-		if(endptr == reads[readBuff[j]].line)
-		{
-			cerr << "Malformed weight " << reads[readBuff[j]].line << endl;
-			exit(1);
-		}
-		sum += w;
-	}
-	return sum;
-}
-
-float sumList2(seqread* reads, int* chromTable, int pos)
-{
-	float sum = 0.0;
-	while(chromTable[pos])
-	{
-		char* endptr;
-		float w = strtof(reads[chromTable[pos]].line, &endptr);
-		if(endptr == reads[chromTable[pos]].line)
-		{
-			cerr << "Malformed weight " << reads[chromTable[pos]].line << endl;
-			exit(1);
-		}
-		sum += w;
-		chromTable[pos] = reads[chromTable[pos]].next;
-	}
-	return sum;
 }
 
 /* some stats:

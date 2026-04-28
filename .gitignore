@@ -1,4 +1,5 @@
 .vs
+.claude/
 CppProperties.json
 *.o
 pioSortBed

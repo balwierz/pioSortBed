@@ -11,23 +11,34 @@ but significantly faster on large datasets. Supports BED3, BED6, and extended BE
 ## Algorithm
 
 pioSortBed uses a hybrid sort strategy:
-- **Files with < 50M reads** (configurable via `--bucket-cutoff`): classic **O(n log n)** comparison sort (`std::sort` on an index array). Optionally parallel via `--threads`.
+- **Files with < 50M reads** (configurable via `--bucket-cutoff`): classic **O(n log n)** comparison sort (`std::sort` on an index array). Single-threaded by default; parallel via TBB-backed `std::sort(std::execution::par, ...)` at `--threads > 1`.
 - **Files with ≥ 50M reads**: bucket sort (counting sort), which avoids coordinate comparisons entirely — reads are placed directly into position-indexed buckets. This gives **O(n + m)** complexity, where *n* is the number of regions and *m* is the maximum chromosome length.
 
-> Bucket sort has overhead proportional to chromosome length (up to 4 GB allocation), so the classic sort path is preferred for smaller files.
+Both phases parallelize:
+- **Parsing** (mmap path): file is split into newline-aligned chunks parsed concurrently into per-chunk per-chromosome partial linked lists, merged in a final serial pass. Header lines are emitted to stdout in a leading pre-pass before chunking.
+- **Bucket sort** (multi-thread): chromosomes processed concurrently, each thread allocating its own per-chromosome `chromTable` sized exactly to that chromosome's max coordinate. Output goes through a producer-consumer barrier so per-chromosome buffers are flushed to stdout in alphabetical order as soon as their turn comes up — capping live output buffers to roughly the worker count.
+
+> Bucket sort has overhead proportional to chromosome length, and the parallel bucket-sort path also pays for per-thread `chromTable` slabs and queued output buffers. Use `--threads 1` if RAM is tight; the single-threaded path keeps a flat ~4 GB ceiling at 50M reads.
 
 ## Installation
 
-**Dependencies:** GCC (no external libraries needed — CLI11 is bundled)
+**Dependencies:** GCC ≥ 9 (C++17), oneTBB (`libtbb-dev` on Debian/Ubuntu).
+CLI11 is bundled in this repo.
 
 ```bash
 make
+make test       # optional: runs the test suite
+make install    # optional: installs to /usr/local/bin (override PREFIX=...)
 ```
 
 Manual compilation:
 ```bash
-g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++11 -fopenmp -lgomp
+g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
+    -static-libstdc++ -static-libgcc -ltbb -DVERSION_STRING=\"2.1.0\"
 ```
+
+> Parallelism uses C++17 `std::execution::par` algorithms backed by oneTBB,
+> not OpenMP. The C++ runtime is linked statically; libtbb stays dynamic.
 
 ## Usage
 
@@ -79,9 +90,9 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 
 | Tool | Version | Command |
 |------|---------|---------|
-| **pioSortBed** (v2.0.0) | 2.0.0 | `pioSortBed -t 1 input.bed` (single-thread) |
-| **pioSortBed** | 2.0.0 | `pioSortBed -t 8 input.bed` (8 threads) |
-| **pioSortBed** (low-mem) | 2.0.0 | `pioSortBed --low-mem-ssd input.bed` (two-pass SSD-friendly mode) |
+| **pioSortBed** | 2.1.0 | `pioSortBed -t 1 input.bed` (single-thread) |
+| **pioSortBed** | 2.1.0 | `pioSortBed -t 8 input.bed` (8 threads) |
+| **pioSortBed** (low-mem) | 2.1.0 | `pioSortBed --low-mem-ssd input.bed` (two-pass SSD-friendly mode) |
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n input.bed` (single-thread) |
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n --parallel=8 input.bed` (8 threads) |
 | **bedtools** | 2.31.1 | `bedtools sort -i input.bed` |
@@ -110,18 +121,23 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 100k  | 20 ms    | 10 ms    | 20 ms         | 70 ms     | 70 ms     | 80 ms      | 60 ms     |
-| 1M    | 270 ms   | 200 ms   | 210 ms        | 840 ms    | 320 ms    | 830 ms     | 590 ms    |
-| 5M    | 1830 ms  | 1160 ms  | 1040 ms       | 4970 ms   | 1530 ms   | 4270 ms    | 3140 ms   |
-| 10M   | 3860 ms  | 2390 ms  | 2020 ms       | 10.85 s   | 3160 ms   | 8670 ms    | 6290 ms   |
-| 50M   | 18.53 s  | 18.67 s  | 10.48 s       | 1min03.8s | 19.12 s   | 51.86 s    | 33.73 s   |
+| 100k  | 20 ms    | 10 ms    | 20 ms         | 70 ms     | 70 ms     | 90 ms      | 60 ms     |
+| 1M    | 330 ms   | 170 ms   | 230 ms        | 880 ms    | 340 ms    | 930 ms     | 610 ms    |
+| 5M    | 2040 ms  | 1030 ms  | 1150 ms       | 5410 ms   | 1660 ms   | 4740 ms    | 3230 ms   |
+| 10M   | 4310 ms  | 2050 ms  | 2300 ms       | 11.47 s   | 3470 ms   | 9570 ms    | 6610 ms   |
+| 50M   | 21.42 s  | **8.52 s** | 11.94 s     | 1min07.2s | 19.98 s   | 53.92 s    | 33.70 s   |
 
 **Key observations:**
-- **pioSortBed 1t** dominates at moderate sizes (100k–10M reads)
-- **pioSortBed low-mem mode** wins on large files (50M+), achieving **2.2–2.8× speedup** over default mode
-- **pioSortBed 8t** offers modest speedup at 1M–10M; diminishing returns at 50M+ (thread contention on hybrid strategy)
-- **bedops sort-bed** is consistently competitive, especially on very large files; uses low memory
-- **GNU sort with parallel threads** can exceed single-threaded if file > 1M
+- **pioSortBed 8t** is fastest at every size; the gap widens on the large-file
+  end where parallel parsing and parallel per-chromosome bucket sort engage
+  (50M: **3.4× over pioSortBed 1t, 3.2× over GNU sort 8t, 5.2× over bedops,
+  8.4× over bedtools, 10.4× over GNU sort 1t**).
+- **pioSortBed low-mem mode** is competitive at moderate sizes and uses the
+  least RAM of the pio variants — useful when 8t's memory peak is too high.
+- **bedops sort-bed** remains the closest single-threaded competitor and uses
+  the lowest memory of any tool tested.
+- **GNU sort 8t** scales well at 1M–10M but cannot match per-chromosome
+  parallelism on a single-file sort at 50M.
 
 ### Peak Memory (RSS)
 
@@ -131,32 +147,41 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 | Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
 |------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 100k  | 10.3 MB  | 10.4 MB  | 9.1 MB        | 11.6 MB   | 12.1 MB   | 48.1 MB    | 8.4 MB    |
-| 1M    | 71.2 MB  | 73.7 MB  | 65.1 MB       | 88.2 MB   | 164.7 MB  | 412.4 MB   | 54.7 MB   |
-| 5M    | 337.8 MB | 355.6 MB | 318.8 MB      | 432.6 MB  | 814.2 MB  | 2.0 GB     | 268.3 MB  |
-| 10M   | 674.3 MB | 710.9 MB | 632.8 MB      | 863.6 MB  | 1.6 GB    | 3.9 GB     | 535.4 MB  |
-| 50M   | 4.1 GB   | 4.1 GB   | 3.1 GB        | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
+| 100k  | 15.6 MB  | 16.6 MB  | 15.7 MB       | 10.0 MB   | 9.8 MB    | 44.4 MB    | 6.8 MB    |
+| 1M    | 79.0 MB  | 84.1 MB  | 76.9 MB       | 86.6 MB   | 162.0 MB  | 401.2 MB   | 54.8 MB   |
+| 5M    | 347.0 MB | 358.4 MB | 316.6 MB      | 431.0 MB  | 810.9 MB  | 1.9 GB     | 268.1 MB  |
+| 10M   | 682.1 MB | 713.3 MB | 621.2 MB      | 861.1 MB  | 1.6 GB    | 3.9 GB     | 534.6 MB  |
+| 50M   | 4.1 GB   | **12.5 GB** | 3.0 GB     | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
 
 **Key observations:**
-- **pioSortBed low-mem mode** reduces peak RAM on large files (50M: **3.1 GB vs 4.1 GB**; 100M: **6.2 GB vs 7.2 GB**)
-- **bedops** achieves lowest memory on small-to-medium files; peaks near pioSortBed on large files
-- **GNU sort 8t** uses ~2× memory of single-threaded variant (thread-local buffers)
-- **bedtools** memory usage grows rapidly (409.6 MB @ 1M → 24.5 GB @ 100M)
+- **pioSortBed 8t at 50M (12.5 GB)** is the price for the 3.4× speedup —
+  each thread allocates its own per-chromosome `chromTable` and queued
+  per-chromosome output buffers accumulate. Below 50M the 8t and 1t memory
+  are within ~5% (the classic-sort path doesn't allocate per-chromosome
+  scratch).
+- **pioSortBed low-mem mode** keeps a flat ~3 GB ceiling at 50M by
+  processing one chromosome at a time — pick this when both wall time and
+  RAM matter and you're on SSD.
+- **bedops** achieves the lowest memory on small-to-medium files and is
+  competitive throughout.
+- **GNU sort 8t** uses ~2× the RAM of single-threaded sort (thread-local buffers).
+- **bedtools** memory grows ~linearly with input — 19.4 GB at 50M.
 
 ### Performance Summary
 
 **pioSortBed strategy:**
-- **Files < 50M reads** (configurable `--bucket-cutoff`): Classic **O(n log n)** comparison sort using an index array
-  - Single-threaded std::sort with inlined comparator
-  - Optional parallelism via `--threads` (8 threads effective on medium sizes, diminishing on large files)
+- **Files < 50M reads** (configurable `--bucket-cutoff`): Classic **O(n log n)** comparison sort on an index array
+  - Single-threaded `std::sort` with inlined comparator at `-t 1`
+  - Parallel `std::sort(std::execution::par, ...)` (TBB) at `-t > 1`
 - **Files ≥ 50M reads**: Bucket/counting sort — O(n + m) complexity where m = max chromosome length
-  - Allocates position-indexed buckets (up to 4 GB for human genomes)
-  - Excellent scaling on SSD (linear I/O pattern)
+  - Single-thread: one shared `chromTable[maxChrLen+1]` reused across chromosomes
+  - Multi-thread (v2.1.0): chromosomes processed concurrently, each thread allocates its own `chromTable[thisChrLen+1]`. Per-chrom output is buffered through `open_memstream` and flushed under a producer-consumer barrier so output is written in alphabetical order
+- **Parallel parsing** (mmap path): file split into newline-aligned chunks parsed in parallel; per-chunk per-chromosome partials merged at the end
 - **Low-memory mode** (`--low-mem-ssd`): Two-pass algorithm for RAM-constrained environments
   - Pass 1: Scan file once, store line offsets per chromosome (minimal RAM)
   - Pass 2: Process one chromosome at a time, sorting and printing in isolation
-  - Trade-off: **~2.2–2.8× slower** than default mode, but peak RAM ∝ largest chromosome (not whole file)
-  - Best for SSD with large genomic files on small-RAM systems
+  - Trade-off: slower than default mode, but peak RAM ∝ largest chromosome (not whole file)
+  - Best for large genomic files on small-RAM systems
 
 To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot for plots).
 

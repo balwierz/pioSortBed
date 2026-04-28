@@ -244,6 +244,72 @@ check_eq "collapse chr2:50 weight"  "$(echo "$line3" | awk '{print $5}')" "4"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "--- Parallel paths (-t 8) ---"
+
+# Larger fixture so the parallel parser actually splits; default-sort + sort-b + sort-5.
+PAR="$TMPDIR_BASE/parallel.bed"
+gen_bed6 200000 5 1000000 > "$PAR"
+
+want_par=$(ref_sort   < "$PAR" | canon)
+want_par_b=$(ref_sort_b < "$PAR" | canon)
+
+got=$("$PIO" -t 8 "$PAR" 2>/dev/null | canon)
+check_eq "-t 8 default" "$got" "$want_par"
+
+got=$("$PIO" -t 8 --sort b "$PAR" 2>/dev/null | canon)
+check_eq "-t 8 --sort b" "$got" "$want_par_b"
+
+# --sort 5 with -t 8: monotonicity (multiset already covered by classic).
+got_par5=$("$PIO" -t 8 --sort 5 "$PAR" 2>/dev/null)
+mono_par5=$(echo "$got_par5" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last&&pos<lpos){ok=0;exit}; last=$1;lpos=pos}END{print ok}')
+[[ "$mono_par5" == "1" ]] && ok "-t 8 --sort 5 monotonic within chr" || fail "-t 8 --sort 5 monotonic within chr"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Forced bucket-sort path with all sort modes ---"
+
+got=$("$PIO" --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
+check_eq "bucket --sort s" "$got" "$want_par"
+
+got=$("$PIO" --bucket-cutoff 0 --sort b "$PAR" 2>/dev/null | canon)
+check_eq "bucket --sort b" "$got" "$want_par_b"
+
+got_buck5=$("$PIO" --bucket-cutoff 0 --sort 5 "$PAR" 2>/dev/null)
+mono_buck5=$(echo "$got_buck5" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last&&pos<lpos){ok=0;exit}; last=$1;lpos=pos}END{print ok}')
+[[ "$mono_buck5" == "1" ]] && ok "bucket --sort 5 monotonic within chr" || fail "bucket --sort 5 monotonic within chr"
+
+# Bucket vs classic must agree on multiset (with --sort b they must be deterministic-equivalent).
+got_b_classic=$("$PIO" --sort b "$PAR" 2>/dev/null | canon)
+got_b_bucket=$("$PIO" --bucket-cutoff 0 --sort b "$PAR" 2>/dev/null | canon)
+check_eq "bucket vs classic (--sort b)" "$got_b_classic" "$got_b_bucket"
+
+# Parallel bucket vs serial bucket must agree on multiset.
+got_pb=$("$PIO" -t 8 --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
+got_sb=$("$PIO" -t 1 --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
+check_eq "parallel bucket vs serial bucket" "$got_pb" "$got_sb"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- RAL input format ---"
+
+# RAL fields: id chr strand+context beg end weight ...
+RAL="$TMPDIR_BASE/data.ral"
+awk 'BEGIN{srand(42); for(i=0;i<2000;i++){
+    c="chr"((i%5)+1); strand=(rand()>0.5)?"+":"-"
+    beg=int(rand()*1000000); endp=beg+int(rand()*200)+1
+    printf "id%d\t%s\t%s\t%d\t%d\t%g\n", i, c, strand, beg, endp, int(rand()*100)/10
+}}' > "$RAL"
+
+# RAL output preserves the input format. Reference: sort by chr (col 2), beg (col 4).
+want_ral=$(LC_ALL=C sort -k2,2 -k4,4n "$RAL" | canon)
+got=$("$PIO" --ral "$RAL" 2>/dev/null | canon)
+check_eq "ral default" "$got" "$want_ral"
+
+got=$("$PIO" --ral -t 8 "$RAL" 2>/dev/null | canon)
+check_eq "ral -t 8" "$got" "$want_ral"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "--- Version flag ---"
 
 ver=$("$PIO" --version 2>&1)
