@@ -374,19 +374,25 @@ static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
 	return sum;
 }
 
+// One node per line in --low-mem-ssd's pass-1 index.
+//
+//   off  — byte offset of the line's start within the mmap. uint32_t (rather
+//          than size_t) saves 4 bytes per node and bounds the mode to files
+//          <4 GB (the BED equivalent is well above 100M reads).
+//   next — index of the next node in this chromosome's linked list (0 = end).
+//   beg, end — pre-parsed BED start/end coordinates. Storing them here lets
+//          pass 2 sort and emit without re-parsing the line; the only modes
+//          that still need a re-read are --sort 5 (strand) and --collapse
+//          (weight), each of which consults a single field.
+//
+// 16 bytes / node — same size as the previous {size_t off, int next} layout,
+// so 50M reads still cost ~800 MB of node table.
 struct lowMemNode
 {
-	size_t off;
+	uint32_t off;
 	int next;
-};
-
-struct lowMemRec
-{
 	int beg;
 	int end;
-	char str;
-	float weight;
-	const char* line;
 };
 
 // Natural (version-sort) comparison for chromosome names.
@@ -430,6 +436,16 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 {
 	time_t tstart, tend;
 	time(&tstart);
+
+	// uint32_t offsets cap the file at <4 GB. Above that we'd silently
+	// truncate; bail out cleanly instead.
+	if(mmapSize > (size_t)UINT32_MAX)
+	{
+		cerr << "Error: --low-mem-ssd doesn't support files >= 4 GB "
+		     << "(input is " << (mmapSize >> 30) << " GB). "
+		     << "Use the default --threads N path, or rebuild with size_t offsets." << endl;
+		return 1;
+	}
 
 	string2chrInfoT chrInfo;
 	pair<string2chrInfoT::iterator,bool> insResult =
@@ -533,8 +549,10 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			nodes = tmp;
 		}
 
-		nodes[nodeCount].off = (size_t)(linePtr - mmapBase);
+		nodes[nodeCount].off = (uint32_t)(linePtr - mmapBase);
 		nodes[nodeCount].next = thisChrIt->second.lastRead;
+		nodes[nodeCount].beg = beg;
+		nodes[nodeCount].end = end;
 		thisChrIt->second.lastRead = nodeCount;
 		nodeCount++;
 	}
@@ -558,115 +576,157 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	// Pass 2 accesses lines in chromosome-sorted order (not file order).
 	madvise(mmapBase, mmapSize, MADV_RANDOM);
 
-	// Pass 2: for each chromosome, re-parse lines, sort, and print.
+	// Pass 2: for each chromosome, sort by configured key and print. Most modes
+	// don't re-parse — beg/end live in nodes[]. Only --sort 5 (needs strand)
+	// and --collapse (needs weight) read one extra field per line.
+	const bool needStrand = (sortMode == '5') && !fCollapse;
 	for(size_t ci = 0; ci < chroms.size(); ci++)
 	{
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+
+		// Collect node indices for this chromosome (linked-list walk).
 		vector<int> nodeIdx;
 		for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
 			nodeIdx.push_back(cur);
 
-		vector<lowMemRec> recs;
-		recs.reserve(nodeIdx.size());
-		for(size_t i = 0; i < nodeIdx.size(); i++)
+		// --collapse path: parse the weight per line, sort by beg, group, sum.
+		// Stores (beg, weight) pairs (8 bytes each, vs the prior 24-byte
+		// lowMemRec). Sorts directly on the pair vector.
+		if(fCollapse)
 		{
-			const char* linePtr = mmapBase + nodes[nodeIdx[i]].off;
-			int beg = 0, end = 0;
-			char strandChar = '+';
-			char weight[chrNameBufSize];
-			weight[0] = '0'; weight[1] = '\0';
-			const char* chrPtr;
-			int chrLen;
-			int numArgsRead;
-			const char* tailPtr = "";
-			char chrBuf[chrNameBufSize];
-
-			if(fRal)
+			vector<pair<int, float>> wp;
+			wp.reserve(nodeIdx.size());
+			for(size_t i = 0; i < nodeIdx.size(); i++)
 			{
-				numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-				                           &beg, &end, weight, chrNameBufSize,
-				                           &strandChar);
-			}
-			else if(fCollapse || sortMode == '5')
-			{
-				numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
-				                              &beg, &end, weight, chrNameBufSize,
-				                              &strandChar, &tailPtr);
-			}
-			else
-			{
-				numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
-			}
-			if(numArgsRead < 3)
-			{
-				cerr << "Error in parsing line: " << linePtr << endl
-					 << "Perhaps this line is malformed?" << endl;
-				free(nodes);
-				return 1;
-			}
-
-			lowMemRec r;
-			r.beg = beg;
-			r.end = end;
-			r.str = strandChar;
-			r.line = linePtr;
-			r.weight = 0.0f;
-			if(fCollapse)
-			{
+				int idx = nodeIdx[i];
+				const char* linePtr = mmapBase + nodes[idx].off;
+				char weight[chrNameBufSize];
+				weight[0] = '0'; weight[1] = '\0';
+				int dummy_beg = 0, dummy_end = 0;
+				char dummy_str = '+';
+				const char* chrPtr; int chrLen;
+				const char* tailPtr = "";
+				char chrBuf[chrNameBufSize];
+				int n;
+				if(fRal)
+					n = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+					                 &dummy_beg, &dummy_end, weight, chrNameBufSize, &dummy_str);
+				else
+					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
+					                     weight, chrNameBufSize, &dummy_str, &tailPtr);
+				if(n < 3)
+				{
+					cerr << "Error in parsing line: " << linePtr << endl;
+					free(nodes); return 1;
+				}
 				char* endptr;
-				r.weight = strtof(weight, &endptr);
+				float w = strtof(weight, &endptr);
 				if(endptr == weight)
 				{
 					cerr << "Malformed weight " << weight << endl;
-					free(nodes);
-					return 1;
+					free(nodes); return 1;
 				}
+				wp.emplace_back(nodes[idx].beg, w);
 			}
-			recs.push_back(r);
+			if(numThreads == 1)
+				std::sort(wp.begin(), wp.end(),
+				          [](const pair<int, float>& a, const pair<int, float>& b) {
+				              return a.first < b.first;
+				          });
+			else
+				std::sort(std::execution::par, wp.begin(), wp.end(),
+				          [](const pair<int, float>& a, const pair<int, float>& b) {
+				              return a.first < b.first;
+				          });
+
+			size_t i = 0;
+			while(i < wp.size())
+			{
+				int pos = wp[i].first;
+				float sum = 0.0f;
+				while(i < wp.size() && wp[i].first == pos)
+				{
+					sum += wp[i].second;
+					i++;
+				}
+				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
+			}
+			continue;
 		}
 
-		auto cmp = [sortMode](const lowMemRec& a, const lowMemRec& b) {
+		// --sort 5 path: read strand per line, sort by strand-aware 5'-end.
+		// Sorts (chosenPos, idx) pairs to keep strand co-located with idx.
+		if(needStrand)
+		{
+			vector<pair<int, int>> kp;  // (chosenPos, nodeIdx)
+			kp.reserve(nodeIdx.size());
+			for(size_t i = 0; i < nodeIdx.size(); i++)
+			{
+				int idx = nodeIdx[i];
+				const char* linePtr = mmapBase + nodes[idx].off;
+				char strandChar = '+';
+				int dummy_beg = 0, dummy_end = 0;
+				char weight[chrNameBufSize]; weight[0] = '0'; weight[1] = '\0';
+				const char* chrPtr; int chrLen;
+				const char* tailPtr = "";
+				char chrBuf[chrNameBufSize];
+				int n;
+				if(fRal)
+					n = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+					                 &dummy_beg, &dummy_end, weight, chrNameBufSize, &strandChar);
+				else
+					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
+					                     weight, chrNameBufSize, &strandChar, &tailPtr);
+				if(n < 5)
+				{
+					cerr << "Error in parsing line: " << linePtr << endl;
+					free(nodes); return 1;
+				}
+				int pos = (strandChar == '-') ? nodes[idx].end : nodes[idx].beg;
+				kp.emplace_back(pos, idx);
+			}
+			if(numThreads == 1)
+				std::sort(kp.begin(), kp.end());
+			else
+				std::sort(std::execution::par, kp.begin(), kp.end());
+			for(auto& p : kp)
+			{
+				fputs_unlocked(mmapBase + nodes[p.second].off, stdout);
+				fputc_unlocked('\n', stdout);
+			}
+			continue;
+		}
+
+		// --sort s and --sort b: copy {beg, end, off} into a contiguous
+		// 12-byte sort-rec. We could sort node indices directly but that
+		// would scatter accesses across the entire 800 MB nodes[] array
+		// during the ~log(N) comparisons per element — a bad fit for L2.
+		// 12 B/elem is still half the prior 24-byte lowMemRec, and the
+		// contiguous layout makes the sort itself cache-friendly.
+		struct SortRecSB { int beg; int end; uint32_t off; };
+		static_assert(sizeof(SortRecSB) == 12, "SortRecSB should pack to 12 bytes");
+		vector<SortRecSB> sr;
+		sr.reserve(nodeIdx.size());
+		for(int idx : nodeIdx)
+			sr.push_back({nodes[idx].beg, nodes[idx].end, nodes[idx].off});
+
+		auto cmpSB = [sortMode](const SortRecSB& a, const SortRecSB& b) {
 			if(sortMode == 'b')
 			{
 				if(a.beg != b.beg) return a.beg < b.beg;
 				return a.end < b.end;
 			}
-			if(sortMode == '5')
-			{
-				int pa = (a.str == '-') ? a.end : a.beg;
-				int pb = (b.str == '-') ? b.end : b.beg;
-				return pa < pb;
-			}
 			return a.beg < b.beg;
 		};
-
 		if(numThreads == 1)
-			std::sort(recs.begin(), recs.end(), cmp);
+			std::sort(sr.begin(), sr.end(), cmpSB);
 		else
-			std::sort(std::execution::par, recs.begin(), recs.end(), cmp);
+			std::sort(std::execution::par, sr.begin(), sr.end(), cmpSB);
 
-		if(fCollapse)
+		for(const auto& r : sr)
 		{
-			size_t i = 0;
-			while(i < recs.size())
-			{
-				int pos = recs[i].beg;
-				float sum = 0.0f;
-				while(i < recs.size() && recs[i].beg == pos)
-				{
-					sum += recs[i].weight;
-					i++;
-				}
-				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
-			}
-		}
-		else
-		{
-			for(size_t i = 0; i < recs.size(); i++)
-			{
-				fputs_unlocked(recs[i].line, stdout);
-				fputc_unlocked('\n', stdout);
-			}
+			fputs_unlocked(mmapBase + r.off, stdout);
+			fputc_unlocked('\n', stdout);
 		}
 	}
 

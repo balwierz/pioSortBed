@@ -72,6 +72,42 @@ for a 28% wall-time hit. Pick a budget that fits your RAM minus
 
 ---
 
+## [2.2.2] — 2026-04-29
+
+### Performance
+- **`--low-mem-ssd`: ~26% faster, ~3.5% lower peak RSS at 50M reads.**
+  Two changes, made together so the wins stack:
+  1. **`uint32_t` line offsets in `lowMemNode`.** Previously `size_t off`
+     used 8 bytes; the `next` field's 4-byte alignment forced 4 bytes of
+     padding for a 16-byte node. Switching to `uint32_t off` opens the
+     freed 8 bytes for inline `beg`+`end` storage at no memory cost (still
+     16 B/node). Adds a sanity check that bails out cleanly if the input
+     mmap exceeds 4 GB (BED equivalent: well above 100M reads).
+  2. **Pre-parsed `beg`+`end` in `lowMemNode`.** Pass 2 used to re-parse
+     every line a second time to populate `lowMemRec`. With `beg`+`end`
+     already in the node, `--sort s` and `--sort b` skip pass-2 parsing
+     entirely and sort a contiguous 12-byte `{beg, end, off}` array (vs
+     the prior 24-byte `lowMemRec` — also halves the per-chromosome sort
+     buffer). `--sort 5` and `--collapse` still fetch one extra field
+     (strand or weight respectively) but no longer waste a parse on
+     `chr`/`beg`/`end`.
+
+  Measured (50M reads, 10-chrom benchmark fixture, perf stat -r 5):
+
+  |                | before | v2.2.2 |
+  |----------------|-------:|-------:|
+  | task-clock     | 18.8 s | 13.5 s |
+  | cycles         | 77.6 B | 53.6 B |
+  | instructions   | 71.8 B | 53.1 B |
+  | wall time      | 10.2 s | **7.54 s** (-26%) |
+  | peak RSS       | 3.15 GB | **3.04 GB** (-3.5%) |
+
+### Notes
+- Output is bit-identical to the previous `--low-mem-ssd` (verified by
+  diffing both runs' stdout on a 50M-row fixture).
+
+---
+
 ## [Unreleased]
 
 ### Performance
