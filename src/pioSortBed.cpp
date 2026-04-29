@@ -7,6 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include <condition_variable>
+#include <cstdint>
 #include <execution>
 #include <iostream>
 #include <mutex>
@@ -679,9 +680,115 @@ struct ReadCmp
 	}
 };
 
+// LSD radix sort by 64-bit key, 8-bit digits, 8 passes. Sorts (key, idx)
+// pairs so we can reconstruct the sorted index order. Skips passes where
+// the byte is constant across all keys (typical for high bytes when
+// chrIdx is small and positions fit in 32 bits).
+//
+// Aux buffers are scratch and freed before return. After the sort, the
+// final index order is written back into `order` (the caller's buffer).
+static void radixSort64(uint64_t* keys, int* order, int n)
+{
+	if(n < 2) return;
+
+	uint64_t* keysAux = (uint64_t*) malloc((size_t)n * sizeof(uint64_t));
+	int* idxsAux = (int*) malloc((size_t)n * sizeof(int));
+	if(!keysAux || !idxsAux)
+	{
+		cerr << "Error: out of memory for radix sort scratch (" << n << " entries)" << endl;
+		exit(1);
+	}
+
+	// Find which bytes vary across all keys; constant bytes can be skipped.
+	uint64_t allOr = 0;
+	uint64_t allAnd = ~uint64_t(0);
+	for(int i = 0; i < n; i++) { allOr |= keys[i]; allAnd &= keys[i]; }
+	uint64_t varies = allOr ^ allAnd;
+
+	uint64_t* k0 = keys;
+	uint64_t* k1 = keysAux;
+	int* i0 = order;
+	int* i1 = idxsAux;
+	int passesDone = 0;
+
+	for(int pass = 0; pass < 8; pass++)
+	{
+		if(((varies >> (pass * 8)) & 0xff) == 0) continue;  // skip constant byte
+		const int shift = pass * 8;
+
+		// Histogram offset by 1 so the prefix-sum gives starting positions.
+		size_t hist[257] = {0};
+		for(int i = 0; i < n; i++) hist[((k0[i] >> shift) & 0xff) + 1]++;
+		for(int b = 1; b < 257; b++) hist[b] += hist[b - 1];
+
+		for(int i = 0; i < n; i++)
+		{
+			size_t pos = hist[(k0[i] >> shift) & 0xff]++;
+			k1[pos] = k0[i];
+			i1[pos] = i0[i];
+		}
+		std::swap(k0, k1);
+		std::swap(i0, i1);
+		passesDone++;
+	}
+
+	// If we did an odd number of passes, the final data is in the aux buffer;
+	// copy it back so the caller's `order` holds the result.
+	if(passesDone & 1)
+		memcpy(order, i0, (size_t)n * sizeof(int));
+
+	free(keysAux);
+	free(idxsAux);
+}
+
+// Build 64-bit radix keys for SortMode 's' or '5'.
+// Layout: high 32 bits = chrIdx, low 32 bits = position (beg or 5'-end).
+template<char SortMode>
+static void buildRadixKeys(uint64_t* keys, const int* order, int n, const seqread* reads)
+{
+	static_assert(SortMode == 's' || SortMode == '5',
+	              "radix path only supports SortMode 's' or '5'");
+	for(int i = 0; i < n; i++)
+	{
+		int idx = order[i];
+		uint32_t pos;
+		if constexpr(SortMode == '5')
+			pos = (reads[idx].str == '-') ? (uint32_t)reads[idx].end : (uint32_t)reads[idx].beg;
+		else
+			pos = (uint32_t)reads[idx].beg;
+		keys[i] = (uint64_t((uint32_t)reads[idx].chrIdx) << 32) | pos;
+	}
+}
+
+// Radix path threshold: below this, std::sort's smaller setup cost wins.
+// Above, radix amortises its histogram + double-buffer cost.
+static constexpr int RADIX_SORT_THRESHOLD = 100000;
+
 template<char SortMode>
 static void sortIndices(int* order, int n, seqread* reads, int numThreads)
 {
+	// Radix path: single-thread, large enough, sortMode supports a single
+	// 32-bit position key. --sort b needs a tertiary key (end), which doesn't
+	// pack into 64 bits at the BED coordinate range — fall through to std::sort.
+	if constexpr(SortMode == 's' || SortMode == '5')
+	{
+		if(numThreads == 1 && n >= RADIX_SORT_THRESHOLD)
+		{
+			uint64_t* keys = (uint64_t*) malloc((size_t)n * sizeof(uint64_t));
+			if(!keys)
+			{
+				cerr << "Error: out of memory for radix keys (" << n << " entries)" << endl;
+				exit(1);
+			}
+			buildRadixKeys<SortMode>(keys, order, n, reads);
+			radixSort64(keys, order, n);
+			free(keys);
+			return;
+		}
+	}
+
+	// Fallback: comparator-based std::sort (handles --sort b and the
+	// parallel multi-threaded path uniformly).
 	ReadCmp<SortMode> cmp{reads};
 	if(numThreads == 1)
 		std::sort(order, order + n, cmp);
