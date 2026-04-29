@@ -705,9 +705,14 @@ static void sortIndicesDispatch(int* order, int n, seqread* reads, char sortMode
 // chromTable and (for --sort b) numReadsBeg must be sized at least thisChrLen+1
 // and zero-initialized; on return all touched slots are 0 again so the buffers
 // can be reused for another chromosome.
-static void processChromBucket(const char* chrName, int thisChrLen, int firstRead,
-                               seqread* reads, char sortMode, int fCollapse, bool fullLine,
-                               int* chromTable, int* numReadsBeg, FILE* out)
+// Templated on FullLine so gcc constant-folds the printRead branch in the
+// per-read inner loop; otherwise we'd pay an extra well-predicted-but-real
+// fetch/decode branch per emitted line at -t 1 on multi-million-read files.
+template<bool FullLine>
+static __attribute__((always_inline)) inline void processChromBucketTpl(
+    const char* chrName, int thisChrLen, int firstRead,
+    seqread* reads, char sortMode, int fCollapse,
+    int* chromTable, int* numReadsBeg, FILE* out)
 {
 	// Phase 1: scatter into chromTable linked lists keyed by chosenPosition.
 	int currRead = firstRead;
@@ -748,9 +753,16 @@ static void processChromBucket(const char* chrName, int thisChrLen, int firstRea
 			if(fCollapse)
 				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
 				        sumWeightsBuf(reads, readBuff, foo));
+			else if constexpr(FullLine)
+				for(int j = 0; j < foo; ++j)
+				{
+					fputs_unlocked(reads[readBuff[j]].line, out);
+					fputc_unlocked('\n', out);
+				}
 			else
 				for(int j = 0; j < foo; ++j)
-					printRead(reads, readBuff[j], chrName, fullLine, out);
+					writeBedLine(chrName, reads[readBuff[j]].beg, reads[readBuff[j]].end,
+					             reads[readBuff[j]].line, out);
 			numReadsBeg[pos] = 0;
 		}
 		free(readBuff);
@@ -761,17 +773,45 @@ static void processChromBucket(const char* chrName, int thisChrLen, int firstRea
 		{
 			if(!chromTable[pos]) continue;
 			if(fCollapse)
+			{
 				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
 				        sumWeightsList(reads, chromTable, pos));
-			else
+			}
+			else if constexpr(FullLine)
+			{
 				while(chromTable[pos])
 				{
 					int ri = chromTable[pos];
-					printRead(reads, ri, chrName, fullLine, out);
+					fputs_unlocked(reads[ri].line, out);
+					fputc_unlocked('\n', out);
 					chromTable[pos] = reads[ri].next;
 				}
+			}
+			else
+			{
+				while(chromTable[pos])
+				{
+					int ri = chromTable[pos];
+					writeBedLine(chrName, reads[ri].beg, reads[ri].end, reads[ri].line, out);
+					chromTable[pos] = reads[ri].next;
+				}
+			}
 		}
 	}
+}
+
+// Runtime dispatch over the FullLine template parameter.
+static __attribute__((always_inline)) inline void processChromBucket(
+    const char* chrName, int thisChrLen, int firstRead,
+    seqread* reads, char sortMode, int fCollapse, bool fullLine,
+    int* chromTable, int* numReadsBeg, FILE* out)
+{
+	if(fullLine)
+		processChromBucketTpl<true>(chrName, thisChrLen, firstRead, reads, sortMode, fCollapse,
+		                            chromTable, numReadsBeg, out);
+	else
+		processChromBucketTpl<false>(chrName, thisChrLen, firstRead, reads, sortMode, fCollapse,
+		                             chromTable, numReadsBeg, out);
 }
 
 // Parsing loop, templated on UseMmap to eliminate per-line branch.
@@ -1577,11 +1617,24 @@ int main(int argc, char *argv[])
 		}
 		else
 		{
-			const bool fullLine = fRal || useMmap;
-			for(int i = 0; i < totalReads; i++)
+			// Hoist fullLine outside the per-read loop so gcc fully constant-folds it.
+			if(fRal || useMmap)
 			{
-				int ri = order[i];
-				printRead(reads, ri, chroms[reads[ri].chrIdx].c_str(), fullLine, stdout);
+				for(int i = 0; i < totalReads; i++)
+				{
+					fputs_unlocked(reads[order[i]].line, stdout);
+					fputc_unlocked('\n', stdout);
+				}
+			}
+			else
+			{
+				for(int i = 0; i < totalReads; i++)
+				{
+					int ri = order[i];
+					writeBedLine(chroms[reads[ri].chrIdx].c_str(),
+					             reads[ri].beg, reads[ri].end,
+					             reads[ri].line, stdout);
+				}
 			}
 		}
 		free(order);
