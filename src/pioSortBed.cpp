@@ -20,8 +20,10 @@
 #include <unistd.h>
 #include "CLI11.hpp"
 
+// Fallback for manual compilation without -DVERSION_STRING; the Makefile
+// always injects the real version, so this only matters for one-off builds.
 #ifndef VERSION_STRING
-#define VERSION_STRING "2.0.0"
+#define VERSION_STRING "manual-build"
 #endif
 
 /* Copyright: Piotr Balwierz */
@@ -44,12 +46,12 @@ class seqread
 	char str;
 };
 
-// make sure we call find or [] on a chr only once!
 class chrInfoT
 {
 	public:
-	int len;		// length (the max beg position)
-	int lastRead;	// keeps the head of the list of all reads at a given chromosome
+	int len;		// max value of the bucket-sort key seen on this chromosome:
+					//   beg for --sort s/b, or strand-aware 5'-end for --sort 5
+	int lastRead;	// head of the linked list of read indices for this chromosome
 	int idx;		// sequential chromosome index, assigned after parsing & alphabetical sort
 	chrInfoT() : len(0), lastRead(0), idx(0) {}
 };
@@ -133,8 +135,8 @@ const int chrLenLimit = 1000000000;	// 1 Gbp. we don't believe there are longer 
 									// And change the text chrTooLongMsg below.
 									// Corresponds to 1000M * 4B = 4GB on a 64bit machine
 const char chrTooLongMsg[] = "That is more than 3 times the length of human chr1! If you are sure this is correct recompile the program with an increased chrLenLimit value";
-const int chrNameBufSize = 256;		// buffer for chromosme names like "chr1_random"
-									// and strand too, although it should be only "+" or "-"
+const int chrNameBufSize = 256;		// buffer for chromosome names like "chr1_random"
+									// (also used for the BED weight field's stack buffer)
 
 // Hybrid sort strategy cutoff: files with fewer than this many reads use
 // classic O(n log n) comparison sort (std::sort on an index array).
@@ -1627,7 +1629,7 @@ int main(int argc, char *argv[])
 		"  Chromosome name limit: " + to_string(chrNameBufSize) + "\n"
 		"  Chromosome length limit: " + to_string(chrLenLimit/1000000) + "Mbp\n"
 		"  Chromosome/contig number limit: unlimited\n"
-		"  Read number limit: unlimited (but will be kept in the memory)\n"};
+		"  Read number limit: unlimited (but the whole file is held in RAM)\n"};
 	app.set_version_flag("-V,--version", VERSION_STRING);
 
 	string inputFile;
@@ -2090,13 +2092,3 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime_sorting+0.5));
 	return 0;
 }
-
-/* some stats:
- * for 108'170'237 reads required 20GB Reading has taken 241 seconds
- * Sorting has taken 834 seconds
- *
- * After optimizing the same set:
- * Reading has taken 113 seconds
- * Sorting has taken 30 seconds
- * 9.7 GB RAM
- */
