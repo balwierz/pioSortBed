@@ -20,7 +20,7 @@ for arg in "$@"; do
     esac
 done
 
-SIZES=(100000 1000000 5000000 10000000 50000000)
+SIZES=(100000 200000 1000000 2000000 5000000 10000000 20000000 50000000)
 CHROMS=("chr1" "chr2" "chr3" "chr4" "chr5" "chr10" "chr11" "chr20" "chrX" "chrY")
 
 # ---------------------------------------------------------------------------
@@ -418,6 +418,18 @@ if command -v gnuplot &>/dev/null; then
 else
     echo "gnuplot not found — skipping plot generation"
 fi
+
+# ---------------------------------------------------------------------------
+# Archive a versioned snapshot of benchmark_readme.csv to history/ so we
+# keep an audit trail across releases. Plots only show the latest.
+# ---------------------------------------------------------------------------
+HIST_DIR="$SCRIPT_DIR/history"
+mkdir -p "$HIST_DIR"
+PIO_VER=$("$PIO" --version 2>&1 | head -1)
+GIT_SHA=$(cd "$SCRIPT_DIR/.." && git rev-parse --short=8 HEAD 2>/dev/null || echo "nogit")
+HIST_FILE="$HIST_DIR/v${PIO_VER}_${GIT_SHA}_$(date -u +%Y%m%d-%H%M%S).csv"
+cp "$README_CSV" "$HIST_FILE"
+echo "Archived snapshot: $HIST_FILE"
 
 echo ""
 echo "Done."
