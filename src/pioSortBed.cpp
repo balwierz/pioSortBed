@@ -1296,12 +1296,17 @@ struct ChunkResult
 // All indices stored (head/tail and reads[i].next) are global, so no
 // rebase pass is needed. Mutates the chunk in place: replaces '\n' (and
 // preceding '\r') with '\0' to NUL-terminate each line.
+//
+// If fCollapse is set, the per-chunk `arena` is used to copy weight strings
+// out of the (possibly clobbered) line buffer; reads[i].line then points at
+// the arena copy. arena must be non-null whenever fCollapse is set.
 static void parseChunkMmap(char* start, char* end,
                            seqread* reads, int base,
                            ChunkResult& result,
-                           bool fRal, char sortMode)
+                           bool fRal, int fCollapse, char sortMode,
+                           Arena* arena)
 {
-	const bool needExtra = fRal || (sortMode == '5');
+	const bool needExtra = fRal || fCollapse || (sortMode == '5');
 	char* mmapCur = start;
 	char* mmapLim = end;
 	int idx = base + 1;
@@ -1363,7 +1368,18 @@ static void parseChunkMmap(char* start, char* end,
 			exit(1);
 		}
 
-		reads[idx].line = linePtr;
+		// Collapse mode stores only the weight (used in the output sum); the line
+		// pointer goes into a per-chunk arena so we don't depend on the mmap
+		// buffer beyond the parser. Non-collapse: zero-copy mmap pointer.
+		if(fCollapse)
+		{
+			size_t wlen = strlen(weight);
+			reads[idx].line = arena->alloc(weight, wlen + 1);
+		}
+		else
+		{
+			reads[idx].line = linePtr;
+		}
 		reads[idx].beg = beg;
 		reads[idx].end = lineEnd;
 		reads[idx].str = strandChar;
@@ -1452,6 +1468,7 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
                                   bool fRal, int fCollapse, char sortMode,
                                   int numThreads,
                                   Arena* arena,
+                                  std::vector<Arena*>* chunkArenas,
                                   string2chrInfoT& chrInfo,
                                   int& outReadCount)
 {
@@ -1489,12 +1506,15 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 		                       fRal, fCollapse, sortMode, arena,
 		                       chrInfo, outReadCount);
 
-	// --collapse mode in parallel would need per-thread arenas for the weight
-	// strings — fall back to the serial parser for now.
+	// In --collapse mode each chunk needs its own Arena to hold weight strings
+	// (mutex-sharing one would serialise the parse). The arenas are kept alive
+	// by the caller's `chunkArenas` vector for the duration of the program.
 	if(fCollapse)
-		return parseMmapSerial(mmapBase, bodyStart, mmapSize,
-		                       fRal, fCollapse, sortMode, arena,
-		                       chrInfo, outReadCount);
+	{
+		chunkArenas->resize(N);
+		for(int i = 0; i < N; i++)
+			(*chunkArenas)[i] = new Arena(4UL * 1024 * 1024, 64UL * 1024 * 1024);
+	}
 
 	// Newline-aligned chunk boundaries within [bodyStart, mmapSize).
 	std::vector<size_t> chunkStart(N + 1);
@@ -1546,9 +1566,10 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	std::vector<ChunkResult> chunkRes(N);
 	std::for_each(std::execution::par, indices.begin(), indices.end(),
 		[&](int i) {
+			Arena* a = fCollapse ? (*chunkArenas)[i] : NULL;
 			parseChunkMmap(mmapBase + chunkStart[i], mmapBase + chunkStart[i + 1],
 			               reads, chunkBase[i], chunkRes[i],
-			               fRal, sortMode);
+			               fRal, fCollapse, sortMode, a);
 		});
 
 	for(int i = 0; i < N; i++)
@@ -1792,15 +1813,21 @@ int main(int argc, char *argv[])
 	string2chrInfoT chrInfo;
 	seqread* reads = NULL;
 
+	// Per-chunk arenas for parallel mmap + --collapse. Owned by main; freed at exit.
+	std::vector<Arena*> chunkArenas;
+
 	if(useMmap)
 	{
-		// Parallel parser dispatches to parseMmapSerial when N==1 or --collapse,
-		// or to parseChunkMmap-per-chunk otherwise. Header lines (track/browser/#)
-		// are emitted to stdout in a leading pre-pass before chunking.
+		// Parallel parser dispatches to parseMmapSerial when N==1, or to
+		// parseChunkMmap-per-chunk otherwise (incl. --collapse, with one Arena
+		// per chunk so weight-string copies don't serialise on a shared mutex).
+		// Header lines (track/browser/#) are emitted to stdout in a leading
+		// pre-pass before chunking.
 		int parsed = 0;
 		reads = parseMmapDispatch(mmapBase, mmapSize,
 		                          (bool)fRal, fCollapse, sortMode,
-		                          numThreads, arena, chrInfo, parsed);
+		                          numThreads, arena, &chunkArenas,
+		                          chrInfo, parsed);
 		readCount = parsed + 1;  // matches the legacy "readCount-1 = total reads" semantics
 	}
 	else

@@ -43,6 +43,35 @@ for a 28% wall-time hit. Pick a budget that fits your RAM minus
 
 ---
 
+## [2.2.1] — 2026-04-29
+
+### Performance
+- **`--collapse` no longer disables parallel mmap parsing.** Previously, when
+  the input was an mmap'd file with `--collapse` and `--threads > 1`,
+  `parseMmapDispatch` fell back to the legacy single-threaded
+  `parseMmapSerial` because the per-read weight strings need to be copied
+  out of the mmap (the line buffer gets `\n` overwritten with `\0` during
+  parse). The parallel parser now allocates one `Arena` per chunk so each
+  thread copies its weight strings into its own buffer with no
+  cross-thread contention, and the collapse path runs at full parallelism.
+
+  Measured on 10M random BEDWEIGHT rows:
+  - `-t 1`: 5.72 s (`Reading has taken 1 seconds`)
+  - `-t 4`: 5.15 s (`Reading has taken 0 seconds` — parsing accelerated)
+  - `-t 8`: 5.14 s (same)
+
+  ~10% wall-time win at 10M; bigger win expected at 50M+ where parsing
+  dominates more. Output phase is unchanged (still single-threaded
+  collapsed-output writer).
+
+### Notes
+- Per-chunk arenas are owned by `main` (a `std::vector<Arena*>` passed
+  to `parseMmapDispatch` by reference) so they outlive the parser and
+  remain valid through the bucket-sort/output phase, where
+  `reads[i].line` points into them.
+
+---
+
 ## [Unreleased]
 
 ### Performance
