@@ -685,9 +685,14 @@ struct ReadCmp
 // the byte is constant across all keys (typical for high bytes when
 // chrIdx is small and positions fit in 32 bits).
 //
-// Aux buffers are scratch and freed before return. After the sort, the
-// final index order is written back into `order` (the caller's buffer).
-static void radixSort64(uint64_t* keys, int* order, int n)
+// numThreads <= 1: serial path.
+// numThreads >  1: thread-local histograms in parallel, serial 2D prefix sum
+// over (T threads x 256 buckets), then parallel scatter. Each thread owns a
+// disjoint output range so no atomics are needed.
+//
+// Aux buffers are scratch and freed before return. After the sort, the final
+// index order is written back into `order` (the caller's buffer).
+static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 {
 	if(n < 2) return;
 
@@ -711,25 +716,94 @@ static void radixSort64(uint64_t* keys, int* order, int n)
 	int* i1 = idxsAux;
 	int passesDone = 0;
 
-	for(int pass = 0; pass < 8; pass++)
+	// Decide on chunk count. A few hundred K of work per thread keeps the
+	// scheduling overhead amortised; below that the serial path is faster.
+	int T = numThreads;
+	if(T < 1) T = 1;
+	if((long long)n / 200000 < T) T = (int)std::max<long long>(1, (long long)n / 200000);
+
+	if(T <= 1)
 	{
-		if(((varies >> (pass * 8)) & 0xff) == 0) continue;  // skip constant byte
-		const int shift = pass * 8;
-
-		// Histogram offset by 1 so the prefix-sum gives starting positions.
-		size_t hist[257] = {0};
-		for(int i = 0; i < n; i++) hist[((k0[i] >> shift) & 0xff) + 1]++;
-		for(int b = 1; b < 257; b++) hist[b] += hist[b - 1];
-
-		for(int i = 0; i < n; i++)
+		// ---- Serial path ----
+		for(int pass = 0; pass < 8; pass++)
 		{
-			size_t pos = hist[(k0[i] >> shift) & 0xff]++;
-			k1[pos] = k0[i];
-			i1[pos] = i0[i];
+			if(((varies >> (pass * 8)) & 0xff) == 0) continue;
+			const int shift = pass * 8;
+
+			size_t hist[257] = {0};
+			for(int i = 0; i < n; i++) hist[((k0[i] >> shift) & 0xff) + 1]++;
+			for(int b = 1; b < 257; b++) hist[b] += hist[b - 1];
+
+			for(int i = 0; i < n; i++)
+			{
+				size_t pos = hist[(k0[i] >> shift) & 0xff]++;
+				k1[pos] = k0[i];
+				i1[pos] = i0[i];
+			}
+			std::swap(k0, k1);
+			std::swap(i0, i1);
+			passesDone++;
 		}
-		std::swap(k0, k1);
-		std::swap(i0, i1);
-		passesDone++;
+	}
+	else
+	{
+		// ---- Parallel path ----
+		std::vector<int> chunkStart(T + 1);
+		for(int t = 0; t <= T; t++)
+			chunkStart[t] = (int)((long long)n * t / T);
+
+		std::vector<int> tIds(T);
+		for(int t = 0; t < T; t++) tIds[t] = t;
+
+		// Per-thread histograms: hist[t * 256 + b].
+		std::vector<size_t> hist((size_t)T * 256);
+		// Per-thread, per-bucket write cursors.
+		std::vector<size_t> cursor((size_t)T * 256);
+
+		for(int pass = 0; pass < 8; pass++)
+		{
+			if(((varies >> (pass * 8)) & 0xff) == 0) continue;
+			const int shift = pass * 8;
+
+			// Phase 1: parallel local histograms.
+			std::for_each(std::execution::par, tIds.begin(), tIds.end(), [&](int t) {
+				size_t* h = hist.data() + (size_t)t * 256;
+				for(int b = 0; b < 256; b++) h[b] = 0;
+				int e = chunkStart[t + 1];
+				for(int i = chunkStart[t]; i < e; i++)
+					h[(k0[i] >> shift) & 0xff]++;
+			});
+
+			// Phase 2: serial 2D prefix sum (T*256 cells = ~6 KB at T=22).
+			// cursor[t * 256 + b] = starting write position for thread t's
+			// bucket b in the output buffer.
+			size_t base = 0;
+			for(int b = 0; b < 256; b++)
+			{
+				for(int t = 0; t < T; t++)
+				{
+					cursor[(size_t)t * 256 + b] = base;
+					base += hist[(size_t)t * 256 + b];
+				}
+			}
+
+			// Phase 3: parallel scatter. Each thread's writes go into a disjoint
+			// per-(thread, bucket) range, so no contention.
+			std::for_each(std::execution::par, tIds.begin(), tIds.end(), [&](int t) {
+				size_t* c = cursor.data() + (size_t)t * 256;
+				int e = chunkStart[t + 1];
+				for(int i = chunkStart[t]; i < e; i++)
+				{
+					size_t pos = c[(k0[i] >> shift) & 0xff]++;
+					k1[pos] = k0[i];
+					i1[pos] = i0[i];
+				}
+			});
+
+			std::swap(k0, k1);
+			std::swap(i0, i1);
+			passesDone++;
+		}
 	}
 
 	// If we did an odd number of passes, the final data is in the aux buffer;
@@ -760,19 +834,25 @@ static void buildRadixKeys(uint64_t* keys, const int* order, int n, const seqrea
 	}
 }
 
-// Radix path threshold: below this, std::sort's smaller setup cost wins.
-// Above, radix amortises its histogram + double-buffer cost.
-static constexpr int RADIX_SORT_THRESHOLD = 100000;
+// Radix path thresholds. Single-thread: ~100k is where radix amortises its
+// histogram+double-buffer cost vs std::sort. Multi-thread: parallel radix
+// has more setup (T*256 histograms, two parallel_for syncs per pass), so
+// stay on the heavily-tuned std::sort(par) below ~3M reads.
+static constexpr int RADIX_SORT_THRESHOLD       = 100000;
+static constexpr int RADIX_SORT_THRESHOLD_PAR   = 3000000;
 
 template<char SortMode>
 static void sortIndices(int* order, int n, seqread* reads, int numThreads)
 {
-	// Radix path: single-thread, large enough, sortMode supports a single
-	// 32-bit position key. --sort b needs a tertiary key (end), which doesn't
-	// pack into 64 bits at the BED coordinate range — fall through to std::sort.
+	// Radix path: large enough, sortMode supports a single 32-bit position key.
+	// --sort b needs a tertiary key (end), which doesn't pack into 64 bits at
+	// the BED coordinate range — falls through to std::sort. Same key-packing
+	// works for both single-thread and multi-thread; radixSort64 internally
+	// dispatches to a serial or parallel histogram + scatter pipeline.
 	if constexpr(SortMode == 's' || SortMode == '5')
 	{
-		if(numThreads == 1 && n >= RADIX_SORT_THRESHOLD)
+		const int threshold = (numThreads > 1) ? RADIX_SORT_THRESHOLD_PAR : RADIX_SORT_THRESHOLD;
+		if(n >= threshold)
 		{
 			uint64_t* keys = (uint64_t*) malloc((size_t)n * sizeof(uint64_t));
 			if(!keys)
@@ -781,14 +861,14 @@ static void sortIndices(int* order, int n, seqread* reads, int numThreads)
 				exit(1);
 			}
 			buildRadixKeys<SortMode>(keys, order, n, reads);
-			radixSort64(keys, order, n);
+			radixSort64(keys, order, n, numThreads);
 			free(keys);
 			return;
 		}
 	}
 
-	// Fallback: comparator-based std::sort (handles --sort b and the
-	// parallel multi-threaded path uniformly).
+	// Fallback: comparator-based std::sort. Used for --sort b at any thread
+	// count, and for small n where radix's scheduling overhead would dominate.
 	ReadCmp<SortMode> cmp{reads};
 	if(numThreads == 1)
 		std::sort(order, order + n, cmp);
