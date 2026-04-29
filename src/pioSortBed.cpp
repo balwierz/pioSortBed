@@ -13,7 +13,6 @@
 #include <mutex>
 #include <thread>
 #include <time.h>
-#include <unordered_map>
 #include <tbb/global_control.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -55,7 +54,77 @@ class chrInfoT
 	chrInfoT() : len(0), lastRead(0), idx(0) {}
 };
 
-typedef std::unordered_map<string, chrInfoT> string2chrInfoT;
+// Small flat-vector "map" keyed by chromosome name.
+//
+// Real BED files have <100 chromosomes, so the linear scan beats the
+// std::unordered_map<string, V> alternative by avoiding both the per-lookup
+// hash + bucket probe and (more importantly) the std::string construction
+// the unordered_map forces on every miss. The reserved capacity (1024) is
+// far above the practical chromosome count; we never resize it, so cached
+// iterators stay valid across emplaces.
+template<typename Value>
+class ChrNameMap
+{
+public:
+	using Entry = std::pair<std::string, Value>;
+	using iterator = typename std::vector<Entry>::iterator;
+	using const_iterator = typename std::vector<Entry>::const_iterator;
+
+	std::vector<Entry> entries;
+
+	ChrNameMap() { entries.reserve(1024); }
+
+	iterator       begin()       { return entries.begin(); }
+	iterator       end()         { return entries.end();   }
+	const_iterator begin() const { return entries.begin(); }
+	const_iterator end()   const { return entries.end();   }
+	size_t         size()  const { return entries.size();  }
+	void           clear()       { entries.clear();        }
+
+	// Find by (ptr, len) — avoids constructing a std::string at the call site.
+	iterator findByPtr(const char* name, int len)
+	{
+		for(auto it = entries.begin(); it != entries.end(); ++it)
+			if((int)it->first.size() == len && memcmp(it->first.data(), name, len) == 0)
+				return it;
+		return entries.end();
+	}
+	iterator find(const std::string& name)
+	{
+		return findByPtr(name.data(), (int)name.size());
+	}
+
+	// Emplace a new entry only if (ptr, len) isn't already present.
+	// Returns (iterator, true_if_inserted), matching std::unordered_map::try_emplace.
+	std::pair<iterator, bool> tryEmplaceByPtr(const char* name, int len)
+	{
+		iterator it = findByPtr(name, len);
+		if(it != entries.end()) return {it, false};
+		entries.emplace_back(std::string(name, len), Value{});
+		return {entries.end() - 1, true};
+	}
+	std::pair<iterator, bool> try_emplace(const std::string& name)
+	{
+		return tryEmplaceByPtr(name.data(), (int)name.size());
+	}
+	std::pair<iterator, bool> insert(const std::pair<std::string, Value>& kv)
+	{
+		iterator it = find(kv.first);
+		if(it != entries.end()) return {it, false};
+		entries.push_back(kv);
+		return {entries.end() - 1, true};
+	}
+
+	size_t erase(const std::string& name)
+	{
+		iterator it = find(name);
+		if(it == entries.end()) return 0;
+		entries.erase(it);
+		return 1;
+	}
+};
+
+typedef ChrNameMap<chrInfoT> string2chrInfoT;
 
 const int lineBufSize = 1024;		// buffer for the read file lines (stdin path only; mmap has no line length limit)
 const int chrLenLimit = 1000000000;	// 1 Gbp. we don't believe there are longer chromosomes;
@@ -443,8 +512,9 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		if((int)thisChrIt->first.size() != chrLen ||
 		   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
 		{
-			pair<string2chrInfoT::iterator,bool> ins =
-				chrInfo.insert(make_pair(string(chrPtr, chrLen), chrInfoT()));
+			// tryEmplaceByPtr avoids constructing a std::string when the chrom
+			// already exists; we only allocate one if we actually insert.
+			auto ins = chrInfo.tryEmplaceByPtr(chrPtr, chrLen);
 			thisChrIt = ins.first;
 		}
 
@@ -1139,8 +1209,9 @@ static void parseLines(
 			if((int)thisChrIt->first.size() != chrLen ||
 			   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
 			{
-				pair<string2chrInfoT::iterator,bool> ins =
-					chrInfo.insert(make_pair(string(chrPtr, chrLen), chrInfoT()));
+				// tryEmplaceByPtr avoids std::string construction on the common
+				// "chrom already exists" path; only allocates on a true insert.
+				auto ins = chrInfo.tryEmplaceByPtr(chrPtr, chrLen);
 				thisChrIt = ins.first;
 				if(!ins.second)
 				{
@@ -1191,7 +1262,7 @@ struct ChunkChrPartial
 	int len;    // max chosenPosition seen
 };
 
-typedef std::unordered_map<std::string, ChunkChrPartial> ChunkChrMap;
+typedef ChrNameMap<ChunkChrPartial> ChunkChrMap;
 
 struct ChunkResult
 {
@@ -1288,7 +1359,7 @@ static void parseChunkMmap(char* start, char* end,
 		}
 		else
 		{
-			auto ins = result.chr.try_emplace(std::string(chrPtr, chrLen));
+			auto ins = result.chr.tryEmplaceByPtr(chrPtr, chrLen);
 			thisChrIt = ins.first;
 			if(ins.second)
 			{
