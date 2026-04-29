@@ -4,6 +4,45 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [2.2.0] — 2026-04-29
+
+### Added
+- **`--max-mem=N[GMK]`** — memory budget for the parallel bucket-sort path.
+  Caps concurrent per-chromosome `chromTable` allocations via a
+  `mutex+condition_variable` gate; tasks acquire their `chromTable`'s
+  byte cost from a shared budget before starting and release after the
+  chromosome is fully processed. A chromosome whose own cost exceeds the
+  budget runs alone (clamping its draw to the full budget). Default:
+  no cap (preserves the v2.1.x behavior).
+
+### Performance
+- v2.1.1: LSD radix sort for `--sort s/5` at -t 1 (~2× at 10M).
+- v2.1.2: parallel LSD radix sort for `--sort s/5` at -t > 1 (~8% at 5M+).
+- v2.1.3 / 2.2.0: optional `--max-mem` budget cap (see Added above).
+
+### Other improvements since v2.1.0
+- 752ae9c: -t 1 `fullLine` hoist (recovers a small post-integration regression).
+- 29d1131: `MAP_POPULATE` + `MADV_HUGEPAGE` on the mmap path (cold-cache win).
+- daba255: `benchmark/history/` directory for per-version CSV snapshots; benchmark
+  SIZES extended to include 200k, 2M, 20M.
+- bad5b2c: `unordered_map<string, V>` → flat-vector `ChrNameMap<V>` template
+  (-7% instructions, -8.6% branches, wall time within noise).
+
+### Memory cap measurements (50M reads, 10-chrom benchmark fixture, -t 8)
+| `--max-mem` | wall time | peak RSS | vs no cap |
+|------------:|----------:|---------:|----------:|
+| (no cap)    | 6.37 s    | 12.6 GB  | baseline  |
+| `8G`        | 5.88 s    | 12.6 GB  | tied      |
+| `6G`        | 8.16 s    | 10.2 GB  | -19% RAM, +28% time |
+| **`4G`**    | **8.17 s** | **8.6 GB** | **-32% RAM, +28% time** |
+| `2G`        | 12.06 s   | 6.5 GB   | -48% RAM, +89% time |
+
+Sweet spot is roughly `--max-mem=4G` on this hardware: a 32% peak-RAM cut
+for a 28% wall-time hit. Pick a budget that fits your RAM minus
+~3 GB for the input mmap, reads array, and runtime overhead.
+
+---
+
 ## [Unreleased]
 
 ### Performance

@@ -962,6 +962,27 @@ static void sortIndicesDispatch(int* order, int n, seqread* reads, char sortMode
 // chromTable and (for --sort b) numReadsBeg must be sized at least thisChrLen+1
 // and zero-initialized; on return all touched slots are 0 again so the buffers
 // can be reused for another chromosome.
+// Parse a memory-size string like "4G", "500M", "1024K", or a bare byte count.
+// Returns 0 on empty/malformed input. Suffixes use binary multipliers (1024).
+static size_t parseMemSize(const std::string& s)
+{
+	if(s.empty()) return 0;
+	size_t mult = 1;
+	std::string num = s;
+	char back = s.back();
+	if(back == 'G' || back == 'g') { mult = 1ULL << 30; num.pop_back(); }
+	else if(back == 'M' || back == 'm') { mult = 1ULL << 20; num.pop_back(); }
+	else if(back == 'K' || back == 'k') { mult = 1ULL << 10; num.pop_back(); }
+	if(num.empty()) return 0;
+	try
+	{
+		long long v = std::stoll(num);
+		if(v < 0) return 0;
+		return (size_t)v * mult;
+	}
+	catch(...) { return 0; }
+}
+
 // Templated on FullLine so gcc constant-folds the printRead branch in the
 // per-read inner loop; otherwise we'd pay an extra well-predicted-but-real
 // fetch/decode branch per emitted line at -t 1 on multi-million-read files.
@@ -1596,6 +1617,7 @@ int main(int argc, char *argv[])
 	int bucketCutoff = defaultBucketCutoff;
 	int numThreads = 0;
 	bool naturalSort = false;
+	std::string maxMemStr;
 
 	app.add_option("input-file", inputFile,
 		"input file; \"-\" reads from stdin; .gz files are decompressed automatically")
@@ -1623,8 +1645,14 @@ int main(int argc, char *argv[])
 	app.add_flag("-n,--natural-sort", naturalSort,
 		"sort chromosomes in natural order (chr2 < chr10) instead of "
 		"lexicographic order (chr10 < chr2)");
+	app.add_option("--max-mem", maxMemStr,
+		"memory budget for the parallel bucket-sort path "
+		"(e.g. 4G, 500M, 2048K, or bare bytes). Caps concurrent per-chromosome "
+		"chromTable allocations so peak RAM stays within budget. "
+		"Default: no cap (each thread allocates its own chromTable).");
 
 	CLI11_PARSE(app, argc, argv);
+	const size_t maxMemBytes = parseMemSize(maxMemStr);
 
 	if(numThreads <= 0)
 	{
@@ -1945,7 +1973,11 @@ int main(int argc, char *argv[])
 		else
 		{
 			cerr << "Parallel bucket sort using up to " << numThreads << " threads ("
-			     << chroms.size() << " chromosomes)" << endl;
+			     << chroms.size() << " chromosomes)";
+			if(maxMemBytes > 0)
+				cerr << ", chromTable budget = " << (maxMemBytes >> 20) << " MB";
+			cerr << endl;
+
 			std::vector<int> idxs(chroms.size());
 			for(size_t i = 0; i < chroms.size(); i++) idxs[i] = (int)i;
 
@@ -1953,11 +1985,35 @@ int main(int argc, char *argv[])
 			std::condition_variable printCv;
 			int nextChromToPrint = 0;
 
+			// Optional chromTable memory-budget gate. When --max-mem is set,
+			// each task acquires `effCost` bytes from `budgetRemaining` before
+			// allocating its chromTable, and releases them after the chrom is
+			// fully processed. If a single chrom's cost exceeds the budget it
+			// runs alone (clamping its draw to the full budget).
+			std::mutex memMtx;
+			std::condition_variable memCv;
+			size_t budgetRemaining = maxMemBytes;
+
 			std::for_each(std::execution::par, idxs.begin(), idxs.end(),
 				[&](int ci) {
 					const std::string& chrom = chroms[ci];
 					string2chrInfoT::iterator cit = chrInfo.find(chrom);
 					int thisChrLen = cit->second.len;
+
+					// Cost = chromTable + (numReadsBeg if --sort b).
+					size_t cost = (size_t)(thisChrLen + 1) * sizeof(int);
+					if(sortMode == 'b') cost *= 2;
+					size_t effCost = (maxMemBytes > 0)
+						? std::min(cost, maxMemBytes)  // a chrom bigger than the
+						                               // whole budget runs alone
+						: 0;
+
+					if(effCost > 0)
+					{
+						std::unique_lock<std::mutex> lk(memMtx);
+						memCv.wait(lk, [&]{ return budgetRemaining >= effCost; });
+						budgetRemaining -= effCost;
+					}
 
 					char* memBuf = NULL;
 					size_t memBufSz = 0;
@@ -1981,6 +2037,15 @@ int main(int argc, char *argv[])
 						// bytes BEFORE we block at the print barrier.
 					}
 					fclose(sink);
+
+					if(effCost > 0)
+					{
+						{
+							std::lock_guard<std::mutex> lk(memMtx);
+							budgetRemaining += effCost;
+						}
+						memCv.notify_all();
+					}
 
 					{
 						std::unique_lock<std::mutex> lk(printMtx);
