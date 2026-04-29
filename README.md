@@ -72,10 +72,6 @@ pioSortBed --sort b input.bed > sorted.bed
 pioSortBed --natural-sort input.bed > sorted.bed   # chr2 before chr10
 ```
 
-## Memory Requirements
-
-All data is loaded into memory. Expect approximately **2× the input file size** in RAM usage.
-
 ## Benchmark Results
 
 Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordinates 0–249 Mbp). All tools verified to produce identical sort order.
