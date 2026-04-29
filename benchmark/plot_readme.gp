@@ -5,7 +5,7 @@ set xtics nomirror
 set ytics nomirror
 set key top left font ',13' spacing 1.3
 set grid xtics ytics lt 0 lw 0.5 lc rgb '#dddddd'
-set xrange [1e5:]
+set xrange [1e4:]
 
 set style line 1 lc rgb '#e41a1c' lw 2.2 pt 7  ps 1.0 # pioSortBed 1t (red, circle)
 set style line 2 lc rgb '#377eb8' lw 2.2 pt 5  ps 1.0 # pioSortBed 8t (blue, square)
