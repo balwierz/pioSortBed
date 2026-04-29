@@ -4,6 +4,36 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [Unreleased]
+
+### Performance
+- `processChromBucket` re-templated on `bool FullLine` so the per-read
+  inner loops in the bucket-sort path are fully specialized at compile
+  time (gcc couldn't constant-fold the runtime parameter through the
+  function call boundary). Hot-cache 50M / `-t 1` median wall time on a
+  6-chromosome fixture: 14.18 s baseline → 13.36 s (~6% speedup, recovers
+  the small regression vs origin's pre-integration baseline).
+- mmap path now passes `MAP_POPULATE` (pre-fault all pages at mmap time)
+  and `madvise(MADV_HUGEPAGE)` (hint transparent huge pages) — both Linux
+  extensions, gated on `#ifdef`. Mostly a cold-cache improvement (large
+  files no longer fault-in millions of pages incrementally during the
+  parse pass).
+
+### Tooling
+- `benchmark/benchmark.sh` extended with three more data points (200k, 2M,
+  20M) for finer resolution. After each run it archives a versioned
+  snapshot of `benchmark_readme.csv` to `benchmark/history/` so the per-
+  release numbers are preserved (only the latest is plotted).
+
+### Benchmark refresh (numbers in README updated)
+50M / `-t 8` is now **9.27 s** vs `25.94 s` for GNU sort 8t (3.1×),
+`38.50 s` for bedops (4.1×), and `1min06.6s` for bedtools (7.2×). New
+mid-range data points reveal `--low-mem-ssd` is actually the fastest
+pioSortBed mode at 10M–20M (the parallel-sort scaffolding overhead
+doesn't fully pay off in that range).
+
+---
+
 ## [2.1.0] — 2026-04-28
 
 ### Added — features

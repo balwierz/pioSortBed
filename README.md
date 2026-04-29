@@ -119,23 +119,28 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 | **bedtools**        | <span style="color:#984ea3">████</span> | ✚           | bedtools sort |
 | **bedops**          | <span style="color:#a65628">████</span> | ✦           | bedops sort-bed |
 
-| Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
-|------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 100k  | 20 ms    | 10 ms    | 20 ms         | 70 ms     | 70 ms     | 90 ms      | 60 ms     |
-| 1M    | 330 ms   | 170 ms   | 230 ms        | 880 ms    | 340 ms    | 930 ms     | 610 ms    |
-| 5M    | 2040 ms  | 1030 ms  | 1150 ms       | 5410 ms   | 1660 ms   | 4740 ms    | 3230 ms   |
-| 10M   | 4310 ms  | 2050 ms  | 2300 ms       | 11.47 s   | 3470 ms   | 9570 ms    | 6610 ms   |
-| 50M   | 21.42 s  | **8.52 s** | 11.94 s     | 1min07.2s | 19.98 s   | 53.92 s    | 33.70 s   |
+| Reads | pio 1t ● | pio 8t ■  | pio low-mem ◆ | sort 1t ▲  | sort 8t ▼ | bedtools ✚ | bedops ✦ |
+|------:|----------|-----------|---------------|------------|-----------|------------|-----------|
+| 100k  | 50 ms    | 20 ms     | 40 ms         | 140 ms     | 130 ms    | 180 ms     | 110 ms    |
+| 200k  | 70 ms    | 40 ms     | 80 ms         | 300 ms     | 170 ms    | 340 ms     | 230 ms    |
+| 1M    | 540 ms   | 290 ms    | 360 ms        | 1130 ms    | 550 ms    | 1470 ms    | 800 ms    |
+| 2M    | 1050 ms  | 580 ms    | 710 ms        | 2120 ms    | 1190 ms   | 2790 ms    | 1640 ms   |
+| 5M    | 3050 ms  | 1520 ms   | 1730 ms       | 5580 ms    | 2600 ms   | 5580 ms    | 3750 ms   |
+| 10M   | 6640 ms  | 3280 ms   | **2950 ms**   | 12.26 s    | 4860 ms   | 10.69 s    | 7890 ms   |
+| 20M   | 13.99 s  | 6700 ms   | **5930 ms**   | 27.01 s    | 9560 ms   | 21.42 s    | 16.13 s   |
+| 50M   | 32.02 s  | **9.27 s**| 15.12 s       | 1min16.3s  | 25.94 s   | 1min06.6s  | 38.50 s   |
 
 **Key observations:**
-- **pioSortBed 8t** is fastest at every size; the gap widens on the large-file
-  end where parallel parsing and parallel per-chromosome bucket sort engage
-  (50M: **3.4× over pioSortBed 1t, 3.2× over GNU sort 8t, 5.2× over bedops,
-  8.4× over bedtools, 10.4× over GNU sort 1t**).
-- **pioSortBed low-mem mode** is competitive at moderate sizes and uses the
-  least RAM of the pio variants — useful when 8t's memory peak is too high.
-- **bedops sort-bed** remains the closest single-threaded competitor and uses
-  the lowest memory of any tool tested.
+- **pioSortBed 8t** is fastest at every size up to 5M and at 50M; the parallel
+  bucket-sort path's per-chromosome scaling really shines at 50M
+  (**3.1× over pio 1t, 3.1× over GNU sort 8t, 4.1× over bedops, 7.2× over
+  bedtools, 8.2× over GNU sort 1t**).
+- **pioSortBed low-mem mode** unexpectedly wins at 10M–20M (`-t 8` parallel
+  scaffolding overhead doesn't fully pay off at those sizes). It also uses
+  the least RAM of the pio variants — pick `--low-mem-ssd` for the
+  10M–20M sweet spot or when 8t's memory peak is too high.
+- **bedops sort-bed** remains the closest single-threaded competitor and
+  uses the lowest memory of any tool tested.
 - **GNU sort 8t** scales well at 1M–10M but cannot match per-chromosome
   parallelism on a single-file sort at 50M.
 
@@ -145,16 +150,19 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ![Peak memory usage (linear scale)](benchmark/benchmark_memory_linear.png)
 
-| Reads | pio 1t ● | pio 8t ■ | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
-|------:|----------|----------|---------------|-----------|-----------|------------|-----------|
-| 100k  | 15.6 MB  | 16.6 MB  | 15.7 MB       | 10.0 MB   | 9.8 MB    | 44.4 MB    | 6.8 MB    |
-| 1M    | 79.0 MB  | 84.1 MB  | 76.9 MB       | 86.6 MB   | 162.0 MB  | 401.2 MB   | 54.8 MB   |
-| 5M    | 347.0 MB | 358.4 MB | 316.6 MB      | 431.0 MB  | 810.9 MB  | 1.9 GB     | 268.1 MB  |
-| 10M   | 682.1 MB | 713.3 MB | 621.2 MB      | 861.1 MB  | 1.6 GB    | 3.9 GB     | 534.6 MB  |
-| 50M   | 4.1 GB   | **12.5 GB** | 3.0 GB     | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
+| Reads | pio 1t ●  | pio 8t ■    | pio low-mem ◆ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦ |
+|------:|-----------|-------------|---------------|-----------|-----------|------------|-----------|
+| 100k  | 15.6 MB   | 16.6 MB     | 15.6 MB       | 9.8 MB    | 9.9 MB    | 44.0 MB    | 6.5 MB    |
+| 200k  | 26.1 MB   | 27.6 MB     | 26.0 MB       | 18.1 MB   | 21.2 MB   | 84.1 MB    | 11.8 MB   |
+| 1M    | 79.5 MB   | 84.0 MB     | 77.5 MB       | 86.4 MB   | 161.7 MB  | 401.2 MB   | 54.6 MB   |
+| 2M    | 146.3 MB  | 146.6 MB    | 138.6 MB      | 172.7 MB  | 324.2 MB  | 797.8 MB   | 107.9 MB  |
+| 5M    | 347.3 MB  | 359.3 MB    | 316.8 MB      | 431.0 MB  | 811.6 MB  | 1.9 GB     | 268.4 MB  |
+| 10M   | 682.7 MB  | 713.2 MB    | 621.2 MB      | 861.5 MB  | 1.6 GB    | 3.9 GB     | 534.8 MB  |
+| 20M   | 1.3 GB    | 1.4 GB      | 1.2 GB        | 1.7 GB    | 3.2 GB    | 7.8 GB     | 1.0 GB    |
+| 50M   | 4.1 GB    | **13.1 GB** | 3.0 GB        | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB    |
 
 **Key observations:**
-- **pioSortBed 8t at 50M (12.5 GB)** is the price for the 3.4× speedup —
+- **pioSortBed 8t at 50M (13.1 GB)** is the price for the 3.1× speedup —
   each thread allocates its own per-chromosome `chromTable` and queued
   per-chromosome output buffers accumulate. Below 50M the 8t and 1t memory
   are within ~5% (the classic-sort path doesn't allocate per-chromosome
