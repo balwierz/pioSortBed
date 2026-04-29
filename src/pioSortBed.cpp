@@ -1442,7 +1442,18 @@ int main(int argc, char *argv[])
 
 			// Map one extra byte so the NUL sentinel past EOF is always accessible,
 			// even when file size is an exact multiple of the page size.
-			mmapBase = (char*) mmap(NULL, (size_t)fileSize + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+			//
+			// MAP_POPULATE pre-faults all pages at mmap() time, avoiding millions
+			// of page-fault traps during the parse pass on cold-cache files.
+			// MADV_HUGEPAGE hints the kernel to back the region with transparent
+			// huge pages, cutting TLB pressure on large genomic files.
+			// Both flags are Linux extensions; gated on availability so the
+			// source still compiles on non-Linux systems if anyone ports.
+			int mmapFlags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+			mmapFlags |= MAP_POPULATE;
+#endif
+			mmapBase = (char*) mmap(NULL, (size_t)fileSize + 1, PROT_READ | PROT_WRITE, mmapFlags, fd, 0);
 			if(mmapBase == MAP_FAILED)
 			{
 				cerr << "Error: mmap failed for " << inputFile << endl;
@@ -1451,6 +1462,9 @@ int main(int argc, char *argv[])
 			}
 			close(fd);
 			madvise(mmapBase, (size_t)fileSize, MADV_SEQUENTIAL);
+#ifdef MADV_HUGEPAGE
+			madvise(mmapBase, (size_t)fileSize, MADV_HUGEPAGE);
+#endif
 			mmapSize = (size_t)fileSize;
 			useMmap = true;
 
