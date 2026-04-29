@@ -21,7 +21,28 @@ install: pioSortBed
 test: pioSortBed
 	bash test/test.sh
 
-clean:
-	rm -f src/pioSortBed.o pioSortBed
+# Build a self-contained Linux x86_64 release binary with libtbb statically
+# linked. Requires building oneTBB locally first because Debian/Ubuntu only
+# ship libtbb as a shared object (libtbb.so), not as an archive (libtbb.a).
+#
+# Set TBB_LIB to your locally-built libtbb.a, e.g.:
+#   make release-binary TBB_LIB=/path/to/oneTBB/build/.../libtbb.a
+# To build oneTBB statically:
+#   git clone --branch v2022.3.0 https://github.com/uxlfoundation/oneTBB.git
+#   cd oneTBB && mkdir build && cd build
+#   cmake -DTBB_TEST=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release \
+#         -DCMAKE_CXX_FLAGS='-fPIC -Wno-error -Wno-stringop-overflow' .. && make -j
+TBB_LIB ?=
+release-binary: src/pioSortBed.o
+	@if [ -z "$(TBB_LIB)" ] || [ ! -f "$(TBB_LIB)" ]; then \
+		echo "Error: set TBB_LIB to a static libtbb.a"; \
+		echo "  e.g. make release-binary TBB_LIB=/path/to/libtbb.a"; \
+		exit 1; \
+	fi
+	$(CC) -o pioSortBed-linux-x86_64 src/pioSortBed.o $(CFLAGS) \
+	    -static-libstdc++ -static-libgcc "$(TBB_LIB)" -lpthread
 
-.PHONY: install test clean
+clean:
+	rm -f src/pioSortBed.o pioSortBed pioSortBed-linux-x86_64
+
+.PHONY: install test release-binary clean

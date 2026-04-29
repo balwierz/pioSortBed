@@ -6,5 +6,6 @@ pioSortBed
 Out/
 benchmark/benchmark_results.csv
 pioSortBed-linux-x86_64
+pioSortBed-linux-x86_64-2.*
 benchmark/benchmark_plot.png
 .~lock.*#
