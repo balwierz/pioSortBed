@@ -108,6 +108,49 @@ for a 28% wall-time hit. Pick a budget that fits your RAM minus
 
 ---
 
+## [2.2.3] — 2026-04-29
+
+### Performance
+- **`--low-mem-ssd` pass 1 now parses in parallel.** Previously pass 1 was
+  always single-threaded; pass 2's per-chrom sort already used parallel
+  `std::sort`. Pass 1 dominates total time on cold inputs, so going parallel
+  there gives the biggest remaining `--low-mem-ssd` lever.
+
+  The parallel chunk parser mirrors the regular `parseMmapDispatch`: split
+  the body of the mmap into newline-aligned chunks, count newlines per
+  chunk to size `nodes[]` exactly, parse each chunk into its slice using
+  global node indices (per-chunk ChrNameMap partials), then merge by
+  prepending each chunk's per-chrom list to the global one. Per-chunk
+  partials are O(K_chroms) total, ~80 KB at 22 chunks — the per-thread
+  memory cost is genuinely negligible, unlike the regular path's per-chrom
+  `chromTable` slabs.
+
+  Header pre-pass extracted: leading `#`/`track`/`browser` lines are now
+  emitted once before chunking, matching the regular path's behaviour.
+  Mid-file headers are no longer passed through (they would have failed
+  to parse as data anyway).
+
+  Measured (50M reads, perf stat -r 5):
+
+  |     | wall time | peak RSS |
+  |----:|----------:|---------:|
+  | -t 1 | 10.05 s   | 2.99 GB  |
+  | -t 4 | 6.58 s    | 3.03 GB  |
+  | -t 8 | **5.91 s** | **3.03 GB** |
+
+  At `-t 8`, `--low-mem-ssd` is now essentially as fast as the regular
+  parallel path (6.15 s at the same input) but at **~4× lower peak RAM**
+  (3.0 GB vs 12.6 GB). The previous "low-mem mode is for the memory-tight
+  scenario, accept the speed cost" trade-off is mostly gone.
+
+### Notes
+- Output line order between `-t 1` and `-t 8` may differ on tie-broken
+  reads (sort is unstable across thread counts), but the multiset is
+  identical and the sort key remains monotonic — same correctness
+  semantics as the regular `-t > 1` paths.
+
+---
+
 ## [Unreleased]
 
 ### Performance

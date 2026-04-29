@@ -448,116 +448,310 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	}
 
 	string2chrInfoT chrInfo;
-	pair<string2chrInfoT::iterator,bool> insResult =
-		chrInfo.insert(make_pair(string(""), chrInfoT()));
-	string2chrInfoT::iterator thisChrIt = insResult.first;
+	lowMemNode* nodes = NULL;
+	int nodeCount = 1;  // index 0 reserved as end-of-list sentinel
 
-	int nodeCap = 1024;
-	int nodeCount = 1; // index 0 reserved as end-of-list sentinel
-	lowMemNode* nodes = (lowMemNode*) malloc(nodeCap * sizeof(lowMemNode));
-	if(!nodes)
+	// Pre-pass: emit any leading BED header lines (#, track, browser) to stdout
+	// and advance bodyStart past them. Headers are leading-only by convention
+	// (matches the regular --threads path); mid-file headers would now be
+	// treated as data and trip the parser.
+	size_t bodyStart = 0;
+	while(bodyStart < mmapSize)
 	{
-		cerr << "Error: out of memory allocating low-memory offset table" << endl;
-		return 1;
+		char* lineStart = mmapBase + bodyStart;
+		char* nl = (char*) memchr(lineStart, '\n', mmapSize - bodyStart);
+		size_t lineLen = (size_t)((nl ? nl : mmapBase + mmapSize) - lineStart);
+		bool isHeader = (lineLen > 0 && lineStart[0] == '#') ||
+		                (lineLen >= 6 && memcmp(lineStart, "track ",   6) == 0) ||
+		                (lineLen >= 8 && memcmp(lineStart, "browser ", 8) == 0);
+		if(!isHeader) break;
+		fwrite_unlocked(lineStart, 1, lineLen, stdout);
+		fputc_unlocked('\n', stdout);
+		bodyStart = (nl ? (size_t)(nl - mmapBase) + 1 : mmapSize);
 	}
 
-	// Pass 1: index all lines by chromosome.
-	char* mmapCur = mmapBase;
-	char* mmapLim = mmapBase + mmapSize;
-	while(mmapCur < mmapLim)
+	// Decide whether to use the parallel chunk parser. Below ~256 KB body the
+	// scheduling overhead exceeds the parsing savings, so stay serial.
+	int N = numThreads;
+	if(N < 1) N = 1;
 	{
-		char* linePtr = mmapCur;
-		char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
-		if(nl)
+		size_t bytesPerChunk = 256 * 1024;
+		size_t bodySize = mmapSize - bodyStart;
+		int byBytes = (int)((bodySize + bytesPerChunk - 1) / bytesPerChunk);
+		if(byBytes < 1) byBytes = 1;
+		if(N > byBytes) N = byBytes;
+	}
+
+	if(N > 1)
+	{
+		// ---- Pass 1, parallel ----
+		// Newline-aligned chunk boundaries within [bodyStart, mmapSize).
+		std::vector<size_t> chunkStart(N + 1);
+		chunkStart[0] = bodyStart;
+		chunkStart[N] = mmapSize;
+		for(int i = 1; i < N; i++)
 		{
-			if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
-			*nl = '\0';
-			mmapCur = nl + 1;
-		}
-		else
-		{
-			mmapCur = mmapLim;
+			size_t guess = bodyStart + ((mmapSize - bodyStart) / (size_t)N) * (size_t)i;
+			while(guess < mmapSize && mmapBase[guess] != '\n') guess++;
+			if(guess < mmapSize) guess++;
+			chunkStart[i] = guess;
 		}
 
-		// Pass through BED header lines (track/browser/# comments) immediately.
-		if(linePtr[0] == '#' ||
-		   strncmp(linePtr, "track ", 6) == 0 ||
-		   strncmp(linePtr, "browser ", 8) == 0)
-		{
-			fputs_unlocked(linePtr, stdout);
-			fputc_unlocked('\n', stdout);
-			continue;
-		}
+		// Pass 1a: count newlines per chunk in parallel so we can size nodes[] exactly.
+		std::vector<int> chunkCount(N, 0);
+		std::vector<int> indices(N);
+		for(int i = 0; i < N; i++) indices[i] = i;
+		std::for_each(std::execution::par, indices.begin(), indices.end(),
+			[&](int i) {
+				size_t a = chunkStart[i], b = chunkStart[i + 1];
+				int c = 0;
+				const char* p = mmapBase + a;
+				const char* pe = mmapBase + b;
+				while(p < pe)
+				{
+					const char* q = (const char*) memchr(p, '\n', (size_t)(pe - p));
+					if(!q) break;
+					c++;
+					p = q + 1;
+				}
+				chunkCount[i] = c;
+			});
+		if(mmapSize > bodyStart && mmapBase[mmapSize - 1] != '\n')
+			chunkCount[N - 1]++;
 
-		const char* chrPtr;
-		int chrLen;
-		int beg = 0;
-		int end = 0;
-		int numArgsRead;
-		char strandChar = '+';
-		char weight[chrNameBufSize];
-		weight[0] = '0'; weight[1] = '\0';
-		const char* tailPtr = "";
-		char chrBuf[chrNameBufSize];
+		// Prefix-sum -> per-chunk base offset in nodes[]. Slot 0 is the sentinel.
+		std::vector<int> chunkBase(N + 1);
+		chunkBase[0] = 0;
+		for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
+		int totalNodes = chunkBase[N];
 
-		if(fRal)
+		nodes = (lowMemNode*) malloc(((size_t)totalNodes + 1) * sizeof(lowMemNode));
+		if(!nodes)
 		{
-			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-			                           &beg, &end, weight, chrNameBufSize,
-			                           &strandChar);
-			chrPtr = chrBuf;
-			chrLen = (int)strlen(chrBuf);
-		}
-		else
-		{
-			numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
-		}
-
-		if(numArgsRead < 3)
-		{
-			cerr << "Error in parsing line: " << linePtr << endl
-				<< "Perhaps this line is malformed?" << endl;
-			free(nodes);
-			return 1;
-		}
-		if(beg < 0)
-		{
-			cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
-			free(nodes);
+			cerr << "Error: out of memory allocating " << totalNodes
+			     << "-entry low-memory offset table" << endl;
 			return 1;
 		}
 
-		if((int)thisChrIt->first.size() != chrLen ||
-		   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
-		{
-			// tryEmplaceByPtr avoids constructing a std::string when the chrom
-			// already exists; we only allocate one if we actually insert.
-			auto ins = chrInfo.tryEmplaceByPtr(chrPtr, chrLen);
-			thisChrIt = ins.first;
-		}
+		// Per-chunk per-chrom partials, indexed by global node index.
+		struct LowMemChunkPartial { int head; int tail; };
+		using LowMemChunkMap = ChrNameMap<LowMemChunkPartial>;
+		std::vector<LowMemChunkMap> chunkChr(N);
 
-		if(nodeCount == nodeCap)
+		// Pass 1b: parse chunks in parallel into their slice of nodes[].
+		std::for_each(std::execution::par, indices.begin(), indices.end(),
+			[&](int i) {
+				char* end = mmapBase + chunkStart[i + 1];
+				char* mmapCur = mmapBase + chunkStart[i];
+				int idx = chunkBase[i] + 1;
+				LowMemChunkMap& chrMap = chunkChr[i];
+				auto thisIt = chrMap.end();
+
+				while(mmapCur < end)
+				{
+					char* linePtr = mmapCur;
+					char* nl = (char*) memchr(mmapCur, '\n', (size_t)(end - mmapCur));
+					if(nl)
+					{
+						if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+						*nl = '\0';
+						mmapCur = nl + 1;
+					}
+					else
+					{
+						mmapCur = end;
+					}
+
+					int beg = 0, lineEnd = 0;
+					const char* chrPtr;
+					int chrLen;
+					char strandChar = '+';
+					char weight[chrNameBufSize];
+					weight[0] = '0'; weight[1] = '\0';
+					const char* tailPtr = "";
+					char chrBuf[chrNameBufSize];
+					int numArgsRead;
+
+					if(fRal)
+					{
+						numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+						                           &beg, &lineEnd, weight, chrNameBufSize,
+						                           &strandChar);
+						chrPtr = chrBuf;
+						chrLen = (int)strlen(chrBuf);
+					}
+					else
+					{
+						numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen,
+						                            &beg, &lineEnd, &tailPtr);
+					}
+					if(numArgsRead < 3)
+					{
+						cerr << "Error in parsing line: " << linePtr << endl;
+						exit(1);
+					}
+					if(beg < 0)
+					{
+						cerr << "Error: negative coordinates in the bed file\n"
+						     << linePtr << endl;
+						exit(1);
+					}
+
+					nodes[idx].off = (uint32_t)(linePtr - mmapBase);
+					nodes[idx].beg = beg;
+					nodes[idx].end = lineEnd;
+
+					if(thisIt != chrMap.end() &&
+					   (int)thisIt->first.size() == chrLen &&
+					   memcmp(thisIt->first.data(), chrPtr, chrLen) == 0)
+					{
+						nodes[idx].next = thisIt->second.head;
+						thisIt->second.head = idx;
+					}
+					else
+					{
+						auto ins = chrMap.tryEmplaceByPtr(chrPtr, chrLen);
+						thisIt = ins.first;
+						if(ins.second)
+						{
+							nodes[idx].next = 0;
+							thisIt->second.head = idx;
+							thisIt->second.tail = idx;
+						}
+						else
+						{
+							nodes[idx].next = thisIt->second.head;
+							thisIt->second.head = idx;
+						}
+					}
+					idx++;
+				}
+			});
+
+		// Merge per-chunk partials into the global chrInfo. For each chunk t,
+		// for each chromosome it touched, prepend its list to the global list:
+		// patch chunk's tail.next -> previous global head, then head = chunk's head.
+		for(int t = 0; t < N; t++)
 		{
-			nodeCap = (int)(nodeCap * 2);
-			lowMemNode* tmp = (lowMemNode*) realloc(nodes, nodeCap * sizeof(lowMemNode));
-			if(!tmp)
+			for(auto& kv : chunkChr[t])
 			{
-				cerr << "Error: out of memory growing low-memory offset table" << endl;
+				const std::string& name = kv.first;
+				const LowMemChunkPartial& partial = kv.second;
+				auto ins = chrInfo.tryEmplaceByPtr(name.data(), (int)name.size());
+				chrInfoT& info = ins.first->second;
+				if(ins.second || info.lastRead == 0)
+					info.lastRead = partial.head;
+				else
+				{
+					nodes[partial.tail].next = info.lastRead;
+					info.lastRead = partial.head;
+				}
+			}
+		}
+
+		nodeCount = totalNodes + 1;
+	}
+	else
+	{
+		// ---- Pass 1, serial (existing realloc-grow path) ----
+		auto seedIns = chrInfo.insert(make_pair(string(""), chrInfoT()));
+		auto thisChrIt = seedIns.first;
+
+		int nodeCap = 1024;
+		nodes = (lowMemNode*) malloc(nodeCap * sizeof(lowMemNode));
+		if(!nodes)
+		{
+			cerr << "Error: out of memory allocating low-memory offset table" << endl;
+			return 1;
+		}
+
+		char* mmapCur = mmapBase + bodyStart;
+		char* mmapLim = mmapBase + mmapSize;
+		while(mmapCur < mmapLim)
+		{
+			char* linePtr = mmapCur;
+			char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
+			if(nl)
+			{
+				if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+				*nl = '\0';
+				mmapCur = nl + 1;
+			}
+			else
+			{
+				mmapCur = mmapLim;
+			}
+
+			const char* chrPtr;
+			int chrLen;
+			int beg = 0;
+			int end = 0;
+			char strandChar = '+';
+			char weight[chrNameBufSize];
+			weight[0] = '0'; weight[1] = '\0';
+			const char* tailPtr = "";
+			char chrBuf[chrNameBufSize];
+			int numArgsRead;
+
+			if(fRal)
+			{
+				numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
+				                           &beg, &end, weight, chrNameBufSize,
+				                           &strandChar);
+				chrPtr = chrBuf;
+				chrLen = (int)strlen(chrBuf);
+			}
+			else
+			{
+				numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
+			}
+
+			if(numArgsRead < 3)
+			{
+				cerr << "Error in parsing line: " << linePtr << endl
+					<< "Perhaps this line is malformed?" << endl;
 				free(nodes);
 				return 1;
 			}
-			nodes = tmp;
+			if(beg < 0)
+			{
+				cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
+				free(nodes);
+				return 1;
+			}
+
+			if((int)thisChrIt->first.size() != chrLen ||
+			   memcmp(thisChrIt->first.data(), chrPtr, chrLen) != 0)
+			{
+				// tryEmplaceByPtr avoids constructing a std::string when the chrom
+				// already exists; we only allocate one if we actually insert.
+				auto ins = chrInfo.tryEmplaceByPtr(chrPtr, chrLen);
+				thisChrIt = ins.first;
+			}
+
+			if(nodeCount == nodeCap)
+			{
+				nodeCap = (int)(nodeCap * 2);
+				lowMemNode* tmp = (lowMemNode*) realloc(nodes, nodeCap * sizeof(lowMemNode));
+				if(!tmp)
+				{
+					cerr << "Error: out of memory growing low-memory offset table" << endl;
+					free(nodes);
+					return 1;
+				}
+				nodes = tmp;
+			}
+
+			nodes[nodeCount].off = (uint32_t)(linePtr - mmapBase);
+			nodes[nodeCount].next = thisChrIt->second.lastRead;
+			nodes[nodeCount].beg = beg;
+			nodes[nodeCount].end = end;
+			thisChrIt->second.lastRead = nodeCount;
+			nodeCount++;
 		}
 
-		nodes[nodeCount].off = (uint32_t)(linePtr - mmapBase);
-		nodes[nodeCount].next = thisChrIt->second.lastRead;
-		nodes[nodeCount].beg = beg;
-		nodes[nodeCount].end = end;
-		thisChrIt->second.lastRead = nodeCount;
-		nodeCount++;
+		chrInfo.erase("");
 	}
-
-	chrInfo.erase("");
 	vector<string> chroms;
 	chroms.reserve(chrInfo.size());
 	for(string2chrInfoT::iterator it = chrInfo.begin(); it != chrInfo.end(); it++)
