@@ -432,7 +432,7 @@ static bool naturalChrLess(const std::string& a, const std::string& b)
 // depends on the largest chromosome chunk, not the whole file.
 static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
                           bool fRal, int fCollapse, char sortMode, int numThreads,
-                          bool naturalSort)
+                          bool naturalSort, size_t maxMemBytes)
 {
 	time_t tstart, tend;
 	time(&tstart);
@@ -773,9 +773,17 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	// Pass 2: for each chromosome, sort by configured key and print. Most modes
 	// don't re-parse — beg/end live in nodes[]. Only --sort 5 (needs strand)
 	// and --collapse (needs weight) read one extra field per line.
+	//
+	// At -t > 1 the per-chrom work runs in parallel via std::for_each(par, ...);
+	// each chromosome writes to an open_memstream buffer and waits at a
+	// producer-consumer barrier for its alphabetical turn before flushing to
+	// stdout. --max-mem caps the total bytes a worker can hold mid-flight.
 	const bool needStrand = (sortMode == '5') && !fCollapse;
-	for(size_t ci = 0; ci < chroms.size(); ci++)
-	{
+
+	// Per-chrom worker. Returns 0 on success, 1 on parse error.
+	struct SortRecSB { int beg; int end; uint32_t off; };
+	static_assert(sizeof(SortRecSB) == 12, "SortRecSB should pack to 12 bytes");
+	auto processChrom = [&](int ci, FILE* out) -> int {
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 
 		// Collect node indices for this chromosome (linked-list walk).
@@ -783,9 +791,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
 			nodeIdx.push_back(cur);
 
-		// --collapse path: parse the weight per line, sort by beg, group, sum.
-		// Stores (beg, weight) pairs (8 bytes each, vs the prior 24-byte
-		// lowMemRec). Sorts directly on the pair vector.
 		if(fCollapse)
 		{
 			vector<pair<int, float>> wp;
@@ -811,28 +816,21 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				if(n < 3)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
-					free(nodes); return 1;
+					return 1;
 				}
 				char* endptr;
 				float w = strtof(weight, &endptr);
 				if(endptr == weight)
 				{
 					cerr << "Malformed weight " << weight << endl;
-					free(nodes); return 1;
+					return 1;
 				}
 				wp.emplace_back(nodes[idx].beg, w);
 			}
-			if(numThreads == 1)
-				std::sort(wp.begin(), wp.end(),
-				          [](const pair<int, float>& a, const pair<int, float>& b) {
-				              return a.first < b.first;
-				          });
-			else
-				std::sort(std::execution::par, wp.begin(), wp.end(),
-				          [](const pair<int, float>& a, const pair<int, float>& b) {
-				              return a.first < b.first;
-				          });
-
+			std::sort(wp.begin(), wp.end(),
+			          [](const pair<int, float>& a, const pair<int, float>& b) {
+			              return a.first < b.first;
+			          });
 			size_t i = 0;
 			while(i < wp.size())
 			{
@@ -843,13 +841,12 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					sum += wp[i].second;
 					i++;
 				}
-				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
+				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n",
+				        chroms[ci].c_str(), pos, pos+1, sum);
 			}
-			continue;
+			return 0;
 		}
 
-		// --sort 5 path: read strand per line, sort by strand-aware 5'-end.
-		// Sorts (chosenPos, idx) pairs to keep strand co-located with idx.
 		if(needStrand)
 		{
 			vector<pair<int, int>> kp;  // (chosenPos, nodeIdx)
@@ -874,31 +871,22 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				if(n < 5)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
-					free(nodes); return 1;
+					return 1;
 				}
 				int pos = (strandChar == '-') ? nodes[idx].end : nodes[idx].beg;
 				kp.emplace_back(pos, idx);
 			}
-			if(numThreads == 1)
-				std::sort(kp.begin(), kp.end());
-			else
-				std::sort(std::execution::par, kp.begin(), kp.end());
+			std::sort(kp.begin(), kp.end());
 			for(auto& p : kp)
 			{
-				fputs_unlocked(mmapBase + nodes[p.second].off, stdout);
-				fputc_unlocked('\n', stdout);
+				fputs_unlocked(mmapBase + nodes[p.second].off, out);
+				fputc_unlocked('\n', out);
 			}
-			continue;
+			return 0;
 		}
 
 		// --sort s and --sort b: copy {beg, end, off} into a contiguous
-		// 12-byte sort-rec. We could sort node indices directly but that
-		// would scatter accesses across the entire 800 MB nodes[] array
-		// during the ~log(N) comparisons per element — a bad fit for L2.
-		// 12 B/elem is still half the prior 24-byte lowMemRec, and the
-		// contiguous layout makes the sort itself cache-friendly.
-		struct SortRecSB { int beg; int end; uint32_t off; };
-		static_assert(sizeof(SortRecSB) == 12, "SortRecSB should pack to 12 bytes");
+		// 12-byte sort-rec for cache-friendly sort, then emit by .off.
 		vector<SortRecSB> sr;
 		sr.reserve(nodeIdx.size());
 		for(int idx : nodeIdx)
@@ -912,16 +900,100 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			}
 			return a.beg < b.beg;
 		};
-		if(numThreads == 1)
-			std::sort(sr.begin(), sr.end(), cmpSB);
-		else
-			std::sort(std::execution::par, sr.begin(), sr.end(), cmpSB);
+		std::sort(sr.begin(), sr.end(), cmpSB);
 
 		for(const auto& r : sr)
 		{
-			fputs_unlocked(mmapBase + r.off, stdout);
-			fputc_unlocked('\n', stdout);
+			fputs_unlocked(mmapBase + r.off, out);
+			fputc_unlocked('\n', out);
 		}
+		return 0;
+	};
+
+	if(numThreads <= 1)
+	{
+		// Serial: print directly to stdout.
+		for(size_t ci = 0; ci < chroms.size(); ci++)
+		{
+			if(processChrom((int)ci, stdout) != 0)
+			{
+				free(nodes);
+				return 1;
+			}
+		}
+	}
+	else
+	{
+		// Parallel across chromosomes. Each worker writes its chromosome
+		// to an open_memstream buffer; producer-consumer barrier flushes
+		// in alphabetical order. Optional --max-mem gate caps concurrent
+		// per-chromosome buffers (rough estimate: 12 B sort-rec + ~50 B
+		// of output per read = ~62 B per read).
+		std::vector<int> chromIdxs(chroms.size());
+		for(size_t i = 0; i < chroms.size(); i++) chromIdxs[i] = (int)i;
+
+		std::mutex printMtx;
+		std::condition_variable printCv;
+		int nextChromToPrint = 0;
+
+		std::mutex memMtx;
+		std::condition_variable memCv;
+		size_t budgetRemaining = maxMemBytes;
+
+		std::for_each(std::execution::par, chromIdxs.begin(), chromIdxs.end(),
+			[&](int ci) {
+				// Estimate this chrom's peak working set: count its nodes and
+				// budget ~62 B per read (12 B sort-rec + ~50 B output buffer).
+				string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+				size_t chromCount = 0;
+				for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
+					chromCount++;
+				size_t cost = chromCount * 62;
+				size_t effCost = (maxMemBytes > 0) ? std::min(cost, maxMemBytes) : 0;
+
+				if(effCost > 0)
+				{
+					std::unique_lock<std::mutex> lk(memMtx);
+					memCv.wait(lk, [&]{ return budgetRemaining >= effCost; });
+					budgetRemaining -= effCost;
+				}
+
+				char* memBuf = NULL;
+				size_t memBufSz = 0;
+				FILE* sink = open_memstream(&memBuf, &memBufSz);
+				if(!sink)
+				{
+					cerr << "open_memstream failed for chrom " << chroms[ci] << endl;
+					exit(1);
+				}
+				int rc = processChrom(ci, sink);
+				fclose(sink);
+
+				if(effCost > 0)
+				{
+					{
+						std::lock_guard<std::mutex> lk(memMtx);
+						budgetRemaining += effCost;
+					}
+					memCv.notify_all();
+				}
+
+				if(rc != 0)
+				{
+					free(memBuf);
+					exit(1);
+				}
+
+				// Wait for our turn to flush, then write to stdout.
+				{
+					std::unique_lock<std::mutex> lk(printMtx);
+					printCv.wait(lk, [&]{ return nextChromToPrint == ci; });
+					fwrite_unlocked(memBuf, 1, memBufSz, stdout);
+					free(memBuf);
+					nextChromToPrint++;
+				}
+				printCv.notify_all();
+			});
 	}
 
 	free(nodes);
@@ -2059,7 +2131,7 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 		return lowMemSortMmap(mmapBase, mmapSize, fRal, fCollapse, sortMode,
-		                      numThreads, naturalSort);
+		                      numThreads, naturalSort, maxMemBytes);
 	}
 
 	time_t tstart, tend;

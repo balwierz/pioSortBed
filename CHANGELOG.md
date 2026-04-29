@@ -151,6 +151,47 @@ for a 28% wall-time hit. Pick a budget that fits your RAM minus
 
 ---
 
+## [2.2.4] — 2026-04-29
+
+### Performance
+- **`--low-mem-ssd` pass 2 now runs in parallel across chromosomes.** With
+  parallel pass 1 already in v2.2.3, this completes the parallelisation:
+  per-chromosome work runs through `std::for_each(std::execution::par, ...)`,
+  each chromosome writes to an `open_memstream` buffer, and a producer-
+  consumer barrier flushes buffers to stdout in alphabetical order.
+  `--max-mem=N[GMK]` caps concurrent per-chromosome buffers (rough cost
+  estimate: ~62 B per read = 12 B sort-rec + ~50 B output buffer).
+
+### `--low-mem-ssd` is now the recommended path
+
+50M reads, -t 8, 10-chrom benchmark fixture (median of 3):
+
+| Mode | Wall time | Peak RSS |
+|------|----------:|---------:|
+| regular `-t 8` | 6.47 s | 12.6 GB |
+| `--low-mem-ssd -t 8` | **3.63 s** | **5.4 GB** |
+| `--low-mem-ssd -t 8 --max-mem=2G` | 4.35 s | 5.0 GB |
+
+`--low-mem-ssd` is now **1.78× faster AND 2.3× lower peak RSS** than the
+regular path. Strict win on both axes for mmap input. Per-thread state
+is bounded by output-buffer cost (~250 MB max for chr1) instead of the
+regular path's per-chromosome `chromTable` slabs (up to 1 GB each).
+
+The regular path remains the fallback for stdin/gzip input, where mmap
+isn't available. For everyday file-input usage you almost always want
+`--low-mem-ssd` now.
+
+### Notes
+- Output line order between `-t 1` and `-t 8` may differ on tie-broken
+  reads (parallel sort is unstable across thread counts), but the
+  multiset and sort key are identical — same semantics as the regular
+  `-t > 1` paths.
+- `--max-mem=4G` is essentially no-op on this fixture because the
+  natural peak is already 5.4 GB; pick a tighter budget to actually
+  trade speed for memory.
+
+---
+
 ## [Unreleased]
 
 ### Performance
