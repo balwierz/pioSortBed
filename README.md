@@ -97,6 +97,14 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 
 Wall time and peak RSS (resident set size) measured with GNU time. Times in seconds or milliseconds; memory in MB or GB.
 
+> **Caveat on the `pio low-mem` numbers below:** the current measurements were
+> taken with the default thread count, which is `all cores` (= 22 threads on
+> the benchmark CPU), while the `pio 1t` / `pio 8t` and `sort 1t` / `sort 8t`
+> columns use explicit `-t 1` / `-t 8` / `--parallel=1` / `--parallel=8`. So
+> `pio low-mem` has a thread-count advantage in the head-to-head against
+> `sort 8t` and `pio 8t`. A future benchmark round will report `pio low-mem`
+> at `-t 1` and `-t 8` explicitly so the comparison is apples-to-apples.
+
 
 ### Wall Time
 

@@ -252,6 +252,12 @@ for n in "${SIZES[@]}"; do
     # --- pioSortBed low-memory SSD mode (default thread count = all cores).
     # At huge sizes, cap concurrent per-chromosome buffers via --max-mem so
     # default-thread-count parallelism can't blow past available RAM. ---
+    # TODO(next round): pio-lm is currently measured at the default thread
+    # count (= all cores, e.g. 22 on this box) while pio-1t/pio-8t and
+    # sort-1t/sort-8t use explicit -t 1 / -t 8 / --parallel=1 / --parallel=8.
+    # That's an apples-to-oranges comparison. Next benchmark round, run
+    # pio-lm at -t 1 and -t 8 explicitly (two columns, same as the regular
+    # pio path) so the table is internally consistent.
     if (( BENCH_BIG )); then
         bench_one "pio-lm" "$PIO" --low-mem-ssd --max-mem=4G "$BENCH_FILE"
     else
