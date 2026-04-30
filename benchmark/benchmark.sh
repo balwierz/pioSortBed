@@ -272,27 +272,20 @@ for n in "${SIZES[@]}"; do
     fi
 
     # --- pioSortBed low-memory SSD mode at -t 1, -t 4 and -t 8 (apples-to-
-    # apples with pio-1t/pio-4t/pio-8t and sort-1t/sort-4t/sort-8t). At -t 1
-    # only one chromTable is in flight, so --max-mem isn't needed. At -t 4/8
-    # with huge inputs we cap concurrent per-chromosome buffers so the producer
-    # queue can't blow past available RAM. ---
+    # apples with pio-1t/pio-4t/pio-8t and sort-1t/sort-4t/sort-8t).
+    # No --max-mem here: the maxmem_sweep benchmark (see plot_maxmem.gp)
+    # showed uncapped is fastest at 200M and peaks at ~18.4 GB for -t 8 /
+    # ~15.7 GB for -t 4, both well under the 30 GB box. The gate's lock/wait
+    # adds ~15% overhead at any budget large enough to matter. ---
     bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE"
     pio_lm1_ms=$RESULT_MS; pio_lm1_kb=$RESULT_KB
     (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm1_out.txt"
 
-    if (( BENCH_BIG )); then
-        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 --max-mem=4G "$BENCH_FILE"
-    else
-        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE"
-    fi
+    bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE"
     pio_lm4_ms=$RESULT_MS; pio_lm4_kb=$RESULT_KB
     (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm4_out.txt"
 
-    if (( BENCH_BIG )); then
-        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE"
-    else
-        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE"
-    fi
+    bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE"
     pio_lm8_ms=$RESULT_MS; pio_lm8_kb=$RESULT_KB
     (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm8_out.txt"
 
@@ -432,13 +425,8 @@ for n in "${SIZES[@]}"; do
         bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
     fi
     bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE";  pio_lm1_ms=$RESULT_MS
-    if (( BENCH_BIG )); then
-        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 --max-mem=4G "$BENCH_FILE";  pio_lm4_ms=$RESULT_MS
-        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
-    else
-        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE";  pio_lm4_ms=$RESULT_MS
-        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
-    fi
+    bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE";  pio_lm4_ms=$RESULT_MS
+    bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
 
     sort1_ms=NA; sort4_ms=NA; sort8_ms=NA; bt_ms=NA; bo_ms=NA
     if (( HAS_SORT )); then

@@ -192,7 +192,7 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
 | 100M  | 7.2 GB  | —        | —           | **5.7 GB** | 7.8 GB    | 9.0 GB    | 8.5 GB   | 13.0 GB  | 15.4 GB | —        | 5.2 GB   |
 | 200M  | 13.6 GB | —        | —           | **11.5 GB**| 15.2 GB   | 18.4 GB   | 15.4 GB  | 15.4 GB  | 15.4 GB | —        | 10.4 GB  |
 
-> `pio low-mem 4t` and `pio low-mem 8t` at 100M+ use `--max-mem=4G` to cap concurrent per-chromosome buffers.
+> The 100M / 200M `pio low-mem 4t` / `pio low-mem 8t` data above was collected with `--max-mem=4G`; uncapped (the new default in `benchmark.sh`) is ~15% faster — see the `--max-mem` sweep below for the trade-off.
 
 **Key observations:**
 - **`pioSortBed --low-mem-ssd -t 8` is the recommended fast path for files.**
@@ -215,6 +215,53 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
   `chromTable` slabs. The `--max-mem=N[GMK]` flag (v3.0.4+) lets you cap the
   peak. For large inputs `--low-mem-ssd -t 4` or `-t 8` is strictly better on
   both axes; classic `-t N` is mainly useful below ~50M.
+
+### `--max-mem` budget sweep (`pio-lm -t 4 @ 200M`)
+
+`--max-mem` caps concurrent per-chromosome `chromTable` allocations. To map
+out how it interacts with the `--low-mem-ssd -t 4` path, here's a sweep on
+the 200M-row fixture varying the budget from 256 MB to 16 GB plus an
+"uncapped" reference (no flag):
+
+![--max-mem budget sweep](benchmark/maxmem_sweep.png)
+
+| `--max-mem` | Wall time | Peak RSS |
+|------------:|----------:|---------:|
+| 256M | 38.67 s | 14.86 GB |
+| 512M | 38.10 s | 14.84 GB |
+| 1G   | 39.08 s | 14.86 GB |
+| 2G   | 38.54 s | 14.86 GB |
+| **4G**   | **23.82 s** | 15.13 GB |
+| 6G   | 23.90 s | 15.73 GB |
+| 8G   | 23.88 s | 15.69 GB |
+| 12G  | 24.00 s | 15.62 GB |
+| 16G  | 24.08 s | 15.71 GB |
+| **uncapped** | **20.16 s** | 15.71 GB |
+
+Three regimes:
+
+1. **Tight budget (≤2 GB): ~38 s / 14.9 GB.** Per-chromosome cost on this
+   fixture is ~1.5 GB; below that, the budget gate `effCost = min(per_chrom,
+   max_mem)` admits only one chromosome at a time and the `-t 4` worker pool
+   sits mostly idle. Memory savings are surprisingly small (~0.6 GB vs the
+   plateau) because the dominant ~15 GB is the mmap'd input + `lowMemNode`
+   table + per-chrom output buffers — none of which `--max-mem` controls.
+2. **Mid budget (4 – 16 GB): ~24 s / 15.5–16.1 GB.** All four worker
+   threads can now run simultaneously. The mutex/condvar gate still
+   serialises slightly, but the cost is small.
+3. **Uncapped: 20.16 s / 15.71 GB — fastest.** When `--max-mem` isn't set,
+   the gate short-circuits entirely (`maxMemBytes == 0 → effCost = 0`,
+   skipping the lock/wait). 16% faster than the 4G plateau, no extra memory
+   cost.
+
+**Implication**: `--max-mem` is a safety cap, not a memory optimiser. Set
+it only to *prevent* OOM on a host where the chromTable backlog could
+otherwise blow past available RAM. On a 30 GB host with this 200M-row
+fixture, the uncapped peak (15.7 GB at -t 4, 18.4 GB at -t 8) is well
+within the headroom, so `benchmark.sh` runs the headline cases uncapped.
+
+To reproduce the sweep: `bash benchmark/bench_max_mem.sh`. Data lives in
+`benchmark/maxmem_sweep.csv`; plot in `benchmark/plot_maxmem.gp`.
 
 ### Performance Summary
 
