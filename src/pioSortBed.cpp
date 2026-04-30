@@ -154,17 +154,19 @@ const int kWeightBufSize = 256;
 // trade-off vs. the --low-mem-ssd path. Override via --max-mem=N[GMK].
 static constexpr size_t kDefaultBucketChromBudget = 4ULL * 1024 * 1024 * 1024;
 
-// Hybrid sort strategy cutoff (within the classic path): files with fewer
-// than this many reads use index-array std::sort (O(n log n)). Larger files
-// use bucket/counting sort (O(n + m) where m = max chromosome coordinate).
-// Bucket sort allocates a chromTable[maxChrLen] array (up to 4 GB) on each
-// thread, so it's RAM-hungry; the classic path is mostly used for small
-// inputs anyway since --low-mem-ssd is faster and lighter at scale.
+// --bucket-cutoff is opt-in. Default = -1 means "bucket sort disabled,
+// always use index-array std::sort (O(n log n))" within the classic path.
+// Users explicitly enable bucket sort by passing the flag:
+//   --bucket-cutoff 0    => always bucket sort (any input size)
+//   --bucket-cutoff N    => bucket sort when totalReads >= N
 //
-// The 200M default is conservative — std::sort beats bucket on the headline
-// 200M-row fixture at -t 1 even though bucket has better asymptotic
-// complexity. --bucket-cutoff at runtime lets users force either.
-const int defaultBucketCutoff = 200000000;
+// Bucket sort wins asymptotically (O(n + m)) at huge sizes when m (max
+// chromosome coordinate) is small relative to n*log(n), but allocates
+// per-thread chromTable slabs sized to m and is RAM-hungry. On human-
+// scale data (m ~ 250 Mbp) the crossover is well past the practical
+// classic-path range, and --low-mem-ssd is faster and lighter at every
+// size from ~5M up. Hence: not a default.
+const int defaultBucketCutoff = -1;
 
 
 // Arena allocator for line/weight strings.
@@ -2237,8 +2239,11 @@ int main(int argc, char *argv[])
 		"low-memory two-pass file mode (SSD-friendly): keeps line offsets in RAM and "
 		"sorts one chromosome at a time; slower than default but uses less peak RAM");
 	app.add_option("--bucket-cutoff", bucketCutoff,
-		"use bucket sort for files with at least this many reads; "
-		"smaller files use std::sort (0 = always bucket sort)")
+		"opt in to bucket sort (within the classic path) when input has "
+		"at least this many reads. 0 = always bucket sort. Default: "
+		"-1 (bucket sort disabled, classic path always uses std::sort). "
+		"Only meaningful when --low-mem-ssd is NOT set; the recommended "
+		"path (--low-mem-ssd -t N) is faster and lighter regardless.")
 		->default_val(defaultBucketCutoff);
 	app.add_option("-t,--threads", numThreads,
 		"number of threads for the classic sort path "
@@ -2511,7 +2516,10 @@ int main(int argc, char *argv[])
 		chrInfo.find(chroms[ci])->second.idx = ci;
 
 	size_t totalReads = readCount - 1;
-	bool useBucketSort = (bucketCutoff == 0) || (totalReads >= (size_t)bucketCutoff);
+	// Bucket sort is opt-in. -1 (default) => never bucket. 0 => always.
+	// N >= 1 => bucket when totalReads >= N.
+	bool useBucketSort = (bucketCutoff >= 0) &&
+	                     (bucketCutoff == 0 || totalReads >= (size_t)bucketCutoff);
 	if(verbose)
 	{
 		cerr << "We have " << totalReads << " regions, "

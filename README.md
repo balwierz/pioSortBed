@@ -22,15 +22,20 @@ pioSortBed has two sort paths:
   mmap), not with chromosome length.
 
 - **Classic path (the default when `--low-mem-ssd` isn't set)** holds the
-  whole input in a `seqread[]` array and uses an internal hybrid:
-  - `std::sort` on an index array (O(n log n)) below `--bucket-cutoff`
-    reads (default 200 M).
-  - Bucket / counting sort (O(n + m), where *m* = max chromosome
-    coordinate) at and above the cutoff. Multi-threaded bucket sort
-    allocates a per-chromosome `chromTable` slab on each worker — fast
-    but RAM-hungry, and the slabs scale with `m`, not `n`. `--max-mem`
-    (default 4 GB) caps a single chromosome's slab and rejects oversized
-    ones with a clear error.
+  whole input in a `seqread[]` array and uses index-array `std::sort`
+  (O(n log n)). At `-t 1` it's a hand-tuned comparator; `-t > 1` uses
+  `std::sort(std::execution::par, ...)` over TBB.
+
+  *Optional, opt-in only:* `--bucket-cutoff N` switches to bucket /
+  counting sort (O(n + m), where *m* = max chromosome coordinate) when
+  the input has ≥ N reads. `--bucket-cutoff 0` forces bucket sort at any
+  size. Multi-threaded bucket sort allocates per-chromosome `chromTable`
+  slabs on each worker (fast but RAM-hungry — slabs scale with *m*, not
+  *n*); `--max-mem` (default 4 GB) caps a single chromosome's slab and
+  rejects oversized ones with a clear error. **Bucket sort is no longer
+  enabled by default**: on human-scale data the asymptotic edge doesn't
+  win until well past the practical classic-path range, and at any size
+  where it might matter `--low-mem-ssd -t N` is faster *and* lighter.
 
   The classic path is mainly useful at small sizes (< ~1 M reads), where
   the two-pass overhead of `--low-mem-ssd` dominates. Above that,
@@ -80,7 +85,7 @@ pioSortBed [options] -   # read from standard input
 | `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
 | `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin or gzip). |
-| `--bucket-cutoff N` | Use bucket sort for files with ≥N reads (default: 200M; 0 = always bucket sort) |
+| `--bucket-cutoff N` | Opt in to bucket sort (within the classic path) at ≥N reads. `0` = always bucket sort. Default: `-1` (bucket sort disabled). Only meaningful when `--low-mem-ssd` is *not* set. |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
 | `--max-mem=N[GMK]` | Memory budget for the parallel bucket-sort path (e.g. `4G`, `500M`). Caps concurrent per-chromosome `chromTable` allocations so peak RAM stays within budget. Default: no cap. |
 | `-h` / `--help` | Show help message |
@@ -296,14 +301,17 @@ lower peak RSS — see the [`--max-mem` sweep section](#--max-mem-budget-sweep-p
 above).
 
 **Classic path** (default, no `--low-mem-ssd`):
-- Below `--bucket-cutoff` reads (default 200 M): index-array `std::sort`,
-  O(n log n). `-t 1` uses an inlined comparator; `-t > 1` uses
-  `std::sort(std::execution::par, ...)` over TBB.
-- At and above the cutoff: bucket/counting sort, O(n + m) where m = max
-  chromosome coordinate. Single-thread reuses one `chromTable` across
-  chromosomes; multi-thread allocates a per-thread per-chromosome
-  `chromTable` slab and flushes through a producer-consumer barrier in
-  alphabetical order. `--max-mem N[GMK]` caps single-chromosome slab size.
+- Always index-array `std::sort` (O(n log n)). `-t 1` uses an inlined
+  comparator; `-t > 1` uses `std::sort(std::execution::par, ...)` over TBB.
+- *Opt-in:* `--bucket-cutoff N` switches to bucket / counting sort
+  (O(n + m), where m = max chromosome coordinate) at ≥ N reads.
+  `--bucket-cutoff 0` forces it at any size. Single-thread reuses one
+  `chromTable` across chromosomes; multi-thread allocates a per-thread
+  per-chromosome `chromTable` slab and flushes through a producer-
+  consumer barrier in alphabetical order. `--max-mem N[GMK]` caps
+  single-chromosome slab size. Bucket sort is *not* enabled by default
+  — on human-scale data the asymptotic edge doesn't win until well past
+  where the classic path is realistically used.
 - Use cases: small inputs (< ~1 M reads, where the two-pass overhead of
   `--low-mem-ssd` dominates), and benchmarking.
 
@@ -368,7 +376,7 @@ state (also visible via `pioSortBed --help`):
 | Read count                 | uint32_t indices ⇒ ≤ 4.29 B reads (all sort paths) |
 | Per-chromosome bucket-sort RAM | Default 4 GB; overridden by `--max-mem N[GMK]` |
 | BED score field length (col 5) | 255 bytes; over-long values rejected with a clear error |
-| Hybrid sort cutoff (classic vs. bucket) | Default 200 M reads; overridden by `--bucket-cutoff N` |
+| Bucket sort opt-in (within classic path) | Off by default; enable with `--bucket-cutoff N` (≥ N reads) or `--bucket-cutoff 0` (any size) |
 
 Above 2.15 Gbp per single coordinate, you'd need to widen `int beg, int end`
 in `seqread` / `lowMemNode` to `int64_t` and rebuild. Above 4.29 B reads,

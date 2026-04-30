@@ -4,6 +4,17 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.10] — 2026-04-30
+
+### Changed
+- **Bucket sort is no longer enabled by default.** `--bucket-cutoff` is now
+  opt-in: default is `-1` (bucket sort disabled, classic path always uses
+  index-array `std::sort`). Users explicitly enable it with
+  `--bucket-cutoff 0` (always) or `--bucket-cutoff N` (at ≥ N reads).
+  The `--low-mem-ssd -t N` path is faster and lighter than bucket sort at
+  every size from ~5 M reads up; the classic + bucket combination is now
+  preserved only for benchmarking and edge-case use.
+
 ## [3.0.9] — 2026-04-30
 
 ### Changed
