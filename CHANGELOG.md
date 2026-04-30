@@ -14,12 +14,25 @@ the project uses [semantic versioning](https://semver.org).
   the doubling. Pre-sizing to `chromCount × avgLineBytes × 1.05` eliminates
   the doublings on the parallel path.
   - Single-thread (`-t 1`): keeps a 64 KB scratch reused across chromosomes,
-    `fwrite_unlocked`'d to stdout when full. Peak RAM unchanged; ~3% faster.
+    `fwrite_unlocked`'d to stdout when full.
   - Parallel (`-t > 1`): pre-sized per-chromosome buffer, queued through the
-    existing producer-consumer barrier. **20M reads measured: 2.32 s / 2.31 GB
-    → 1.84 s / 1.85 GB — 21% faster, 20% less RAM.**
+    existing producer-consumer barrier.
 - `processChrom` now takes a `ChromBuf&` instead of a `FILE*`; collapse mode
   uses `vsnprintf` into a 512-B stack buffer + `memcpy` instead of `fprintf`.
+
+### Full-sweep refresh (v3.0.0 -> v3.0.2 cumulative gains for `--low-mem-ssd`)
+
+After the 16-byte node table (v3.0.1) and the chunked emit (v3.0.2):
+
+| Reads | `pio-lm -t 8` v3.0.0 | v3.0.2 | wall delta | RSS delta |
+|------:|---------------------:|-------:|-----------:|----------:|
+|   20M |    2.50 s / 2.55 GB | **1.94 s / 1.86 GB** |   -22% | -27% |
+|   50M |    5.88 s / 5.86 GB | **4.30 s / 4.64 GB** |   -27% | -21% |
+|  100M |  10.16 s / 10.84 GB | **7.64 s / 9.14 GB** |   -25% | -16% |
+|  200M |  35.16 s / 20.98 GB | **23.56 s / 17.66 GB** | -33% | -16% |
+
+At 200M reads `pio-lm -t 8` is now **4.5× faster than GNU sort 8t**, **6.6×
+faster than bedops**, and **13.9× faster than GNU sort 1t**.
 
 ## [3.0.1] — 2026-04-30
 
