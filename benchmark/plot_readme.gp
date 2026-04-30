@@ -1,8 +1,8 @@
 set datafile separator ','
-# Treat 0 values as "missing" so configurations skipped at huge sizes (e.g.
-# pioSortBed -t 8 and bedtools at 100M+ where they'd OOM on this fixture)
-# don't drop to log(0) = -inf.
-set datafile missing '0'
+# Configurations skipped at huge sizes (e.g. pioSortBed -t 8 and bedtools
+# at 100M+, where they'd OOM on this fixture) are recorded as 'NA' in the
+# CSV. Tell gnuplot so those points don't render at all.
+set datafile missing 'NA'
 set xtics nomirror font ',18'
 set ytics nomirror font ',18'
 set key top left font ',20' spacing 1.3
