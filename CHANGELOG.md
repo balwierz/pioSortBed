@@ -4,6 +4,38 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.12] — 2026-04-30
+
+### Removed
+- The "sorts at ~disk IO throughput limits" claim from `--help`. It hasn't
+  been remotely true since the LSD radix sort and `--low-mem-ssd` work in
+  v3.0.x; modern pioSortBed is CPU-bound on the parsing + sort, not I/O.
+
+### Changed (docs only)
+- `--help` text now mentions `-t 1` for single-threaded and `--low-mem-ssd`
+  as the recommended fast path for files ≥ 1 M reads, instead of the old
+  one-thread-by-default phrasing.
+- README `--low-mem-ssd` option description updated: no longer claims it's
+  "slower than default" (it isn't, at scale) or "requires file input"
+  (stdin and gzip work since v3.0.7 — slurped into a buffer up front).
+- README `--max-mem` description rewritten: covers both sort paths,
+  notes the implicit 4 GB single-chromosome rejection in the bucket-sort
+  path, points at the sweep section.
+- Manual compilation example bumped from `VERSION_STRING="2.1.0"` to a
+  current version.
+- Footnote on the wall-time table notes that pio classic `-t N` numbers
+  at 50 M+ were collected on v3.0.8 when bucket sort was the default;
+  v3.0.10+ defaults to `std::sort` at every size (bucket-sort is opt-in).
+- `--help` text for `--max-mem` rewritten to reflect that it caps per-
+  chromosome scratch on both sort paths (with implicit 4 GB rejection
+  in bucket-sort) and is intended to PREVENT OOM, not optimise memory.
+
+### Removed (dead code)
+- The `Error: --low-mem-ssd requires file input` branch in main(). Since
+  v3.0.7 the stdin/gzip slurp presents the input as if mmap'd, so the
+  `if(!useMmap)` guard is unreachable. Replaced with a comment explaining
+  why the call is unconditional.
+
 ## [3.0.11] — 2026-04-30
 
 ### Changed

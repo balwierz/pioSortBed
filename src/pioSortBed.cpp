@@ -2257,7 +2257,8 @@ int main(int argc, char *argv[])
 	CLI::App app{"Ultra fast bed file sorter\nPiotr Balwierz, 2012-2026\n\n"
 		"Results are equivalent to \"LC_ALL=C sort -k1,1 -k2,2n file.bed\"\n"
 		"or \"sort -k1,1 -k2,2n -k3,3n file.bed\" if --sort=b enabled.\n"
-		"Uses one thread by default and sorts at ~disk IO throughput limits.\n\n"
+		"Defaults to all cores; pass -t 1 for single-threaded.\n"
+		"For files > ~1 M reads, --low-mem-ssd is the recommended fast path.\n\n"
 		"Input file should contain a new line character in the end of the last line.\n"
 		"Gzip-compressed input (.gz) is transparently decompressed via gzip.\n"
 		"BED header lines (track/browser/#) are passed through unchanged.\n\n"
@@ -2314,10 +2315,11 @@ int main(int argc, char *argv[])
 		"sort chromosomes in natural order (chr2 < chr10) instead of "
 		"lexicographic order (chr10 < chr2)");
 	app.add_option("--max-mem", maxMemStr,
-		"memory budget for the parallel bucket-sort path "
-		"(e.g. 4G, 500M, 2048K, or bare bytes). Caps concurrent per-chromosome "
-		"chromTable allocations so peak RAM stays within budget. "
-		"Default: no cap (each thread allocates its own chromTable).");
+		"memory cap on per-chromosome scratch (e.g. 4G, 500M, 2048K, "
+		"or bare bytes). Without this, bucket-sort rejects any single "
+		"chromosome whose chromTable would exceed 4 GB and --low-mem-ssd "
+		"runs uncapped. Set this only to PREVENT OOM, not to optimise "
+		"memory.");
 	app.add_flag("-v,--verbose", verbose,
 		"print parsing / sorting timing and per-chromosome length info to stderr "
 		"(default: silent)");
@@ -2497,12 +2499,8 @@ int main(int argc, char *argv[])
 
 	if(lowMemSSD)
 	{
-		if(!useMmap)
-		{
-			cerr << "Error: --low-mem-ssd requires file input (not stdin or gzip)" << endl;
-			if(isGzip && fh) pclose(fh);
-			return 1;
-		}
+		// All input paths land here with useMmap=true (file: native mmap;
+		// stdin/gzip: slurped into a buffer and presented as if mmap'd).
 		return lowMemSortMmap(mmapBase, mmapSize, fRal, fCollapse, sortMode,
 		                      numThreads, naturalSort, maxMemBytes, verbose);
 	}

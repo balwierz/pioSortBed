@@ -63,7 +63,7 @@ make install    # optional: installs to /usr/local/bin (override PREFIX=...)
 Manual compilation:
 ```bash
 g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
-    -static-libstdc++ -static-libgcc -ltbb -DVERSION_STRING=\"2.1.0\"
+    -static-libstdc++ -static-libgcc -ltbb -DVERSION_STRING=\"3.0.11\"
 ```
 
 > Parallelism uses C++17 `std::execution::par` algorithms backed by oneTBB,
@@ -84,10 +84,10 @@ pioSortBed [options] -   # read from standard input
 | `-n` / `--natural-sort` | Natural chromosome order: `chr2 < chr10` (default: lexicographic) |
 | `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
-| `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin or gzip). |
+| `--low-mem-ssd` | Two-pass mode (SSD-friendly). **Recommended fast path for any file ≥ ~1 M reads** — beats the classic path on both wall time and peak RSS at scale. Stdin and `.gz` inputs are slurped into memory first; file input is mmap'd directly. |
 | `--bucket-cutoff N` | Opt in to bucket sort (within the classic path) at ≥N reads. `0` = always bucket sort. Default: `-1` (bucket sort disabled). Only meaningful when `--low-mem-ssd` is *not* set. |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
-| `--max-mem=N[GMK]` | Memory budget for the parallel bucket-sort path (e.g. `4G`, `500M`). Caps concurrent per-chromosome `chromTable` allocations so peak RAM stays within budget. Default: no cap. |
+| `--max-mem=N[GMK]` | Memory cap on per-chromosome scratch (e.g. `4G`, `500M`). Without it, bucket-sort rejects any single chromosome whose `chromTable` would exceed 4 GB and `--low-mem-ssd` runs uncapped — usually what you want. Set this only to *prevent* OOM, not to optimise memory. See the [`--max-mem` sweep below](#--max-mem-budget-sweep-pio-lm--t-4--200m). |
 | `-h` / `--help` | Show help message |
 
 BED header lines (`track`, `browser`, `#` comments) are passed through unchanged to output. Gzip-compressed input (`.gz` extension) is transparently decompressed.
@@ -193,10 +193,13 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
   the whole range and stays competitive with GNU sort 8t up through 2M.
 - **`bedops sort-bed`** remains the closest single-threaded competitor and uses
   the least memory of any tool tested at small sizes.
-- The regular `pioSortBed -t 4 / -t 8` parallel bucket-sort path is fast at 50M
-  (6.0 s at -t 8) but its per-thread `chromTable` slabs scale linearly with
-  the largest chromosome. For large inputs, `--low-mem-ssd -t 8` strictly
-  dominates.
+- The classic path's `pio -t N` numbers above for 50M reads were collected
+  on v3.0.8 when bucket sort was the default at ≥ 50M reads. From v3.0.10
+  onwards bucket sort is opt-in only (`--bucket-cutoff N`); the default
+  classic path uses index-array `std::sort` at every size. The difference
+  matters mainly at 50M+ where bucket sort's `chromTable` parallelism
+  helps `-t 8` (6.0 s here was bucket sort), but `--low-mem-ssd -t 8` is
+  faster than either at this size — see the column right next to it.
 
 ### Peak Memory (RSS)
 
@@ -240,10 +243,11 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
   10.4 GB. `bedtools` and `pio -t 4 / -t 8` would have needed >32 GB.
 - **`bedops sort-bed`** uses the least memory throughout — a sensible choice
   on RAM-constrained systems where wall time isn't critical.
-- **`pioSortBed -t N`** (classic) trades RAM for speed via per-thread
-  `chromTable` slabs. The `--max-mem=N[GMK]` flag (v3.0.4+) lets you cap the
-  peak. For large inputs `--low-mem-ssd -t 4` or `-t 8` is strictly better on
-  both axes; classic `-t N` is mainly useful below ~50M.
+- **`pioSortBed -t N` (classic)** in the table above used bucket sort at
+  ≥ 50 M reads (the default until v3.0.10). From v3.0.10 onwards bucket
+  sort is opt-in (`--bucket-cutoff N`) and the classic path defaults to
+  `std::sort` at every size. For large inputs `--low-mem-ssd -t 4` or
+  `-t 8` is strictly better on both axes anyway.
 
 ### `--max-mem` budget sweep (`pio-lm -t 4 @ 200M`)
 
