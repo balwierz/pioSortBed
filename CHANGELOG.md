@@ -4,6 +4,42 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.4] — 2026-04-30
+
+### Removed
+- **`chrLenLimit` compile-time constant (formerly 1 Gbp) and the
+  `chrTooLongMsg` recompile-the-program error string.** The check moved
+  from "max coordinate across all chromosomes" to "would *this one*
+  chromosome's bucket-sort slab fit in budget?" — see below.
+
+### Changed
+- **Bucket-sort path now sizes its own threshold dynamically.** Per-
+  chromosome chromTable allocations are gated on memory, not coordinate
+  magnitude:
+  - **Default budget**: 4 GB per single chromosome (matches the old
+    1 Gbp × 4 B/slot ceiling so existing genomes are unaffected).
+  - **With `--max-mem=N`**: the budget becomes N. Both single-allocation
+    rejection and the existing concurrent-allocation gate use the same
+    value, so `--max-mem=8G` lets you sort plant/amphibian-scale
+    chromosomes that the old fixed 1 Gbp cap rejected.
+  - **`--low-mem-ssd` is unaffected**: it doesn't allocate per-position
+    slabs, so chromosome length doesn't matter to it.
+- The error message now names the offending chromosome, prints the actual
+  required GB and the active budget, and points at `--low-mem-ssd` /
+  `--max-mem` as the two ways forward (was: a fixed "recompile with a
+  bigger constant" message).
+- `--help` text rewritten to describe the dynamic budget rather than the
+  compile-time constant; also lists the per-path read-count caps from
+  v3.0.3 (INT_MAX classic / UINT32_MAX-1 low-mem).
+
+### Behavioural compatibility note
+- `--max-mem` previously caused only a concurrent-allocation cap (a
+  single chrom could exceed it and run alone, clamping its draw to the
+  whole budget). It now also rejects single chroms exceeding the
+  budget. Users on `--max-mem` who want the previous permissive
+  behaviour can either omit `--max-mem` (4 GB default) or raise it to
+  the largest single chrom they expect.
+
 ## [3.0.3] — 2026-04-30
 
 ### Changed

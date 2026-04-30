@@ -133,14 +133,14 @@ public:
 typedef ChrNameMap<chrInfoT> string2chrInfoT;
 
 const int lineBufSize = 1024;		// buffer for the read file lines (stdin path only; mmap has no line length limit)
-const int chrLenLimit = 1000000000;	// 1 Gbp. we don't believe there are longer chromosomes;
-									// Just a safety check, not to allocate TBytes of ram
-									// Increase if you know what you are doing.
-									// And change the text chrTooLongMsg below.
-									// Corresponds to 1000M * 4B = 4GB on a 64bit machine
-const char chrTooLongMsg[] = "That is more than 3 times the length of human chr1! If you are sure this is correct recompile the program with an increased chrLenLimit value";
 const int chrNameBufSize = 256;		// buffer for chromosome names like "chr1_random"
 									// (also used for the BED weight field's stack buffer)
+
+// Default per-allocation budget for the bucket-sort path's chromTable when
+// `--max-mem` isn't set. 4 GB matches the previous fixed chrLenLimit of
+// 1 Gbp × 4 B/slot — past this the bucket-sort allocation becomes a poor
+// trade-off vs. the --low-mem-ssd path. Override via --max-mem=N[GMK].
+static constexpr size_t kDefaultBucketChromBudget = 4ULL * 1024 * 1024 * 1024;
 
 // Hybrid sort strategy cutoff: files with fewer than this many reads use
 // classic O(n log n) comparison sort (std::sort on an index array).
@@ -2127,9 +2127,10 @@ int main(int argc, char *argv[])
 		"Compilation-time limits:\n"
 		"  Line length limit: " + to_string(lineBufSize) + " (stdin only; no limit for file input)\n"
 		"  Chromosome name limit: " + to_string(chrNameBufSize) + "\n"
-		"  Chromosome length limit: " + to_string(chrLenLimit/1000000) + "Mbp\n"
-		"  Chromosome/contig number limit: unlimited\n"
-		"  Read number limit: unlimited (but the whole file is held in RAM)\n"};
+		"  Bucket-sort path: rejects a chromosome whose chromTable would exceed\n"
+		"    --max-mem (default " + to_string(kDefaultBucketChromBudget >> 30) + " GB); use --low-mem-ssd otherwise.\n"
+		"  Read number limit: " + to_string((unsigned long long)INT32_MAX) + " (classic/bucket path),\n"
+		"    " + to_string((unsigned long long)UINT32_MAX - 1) + " (--low-mem-ssd path).\n"};
 	app.set_version_flag("-V,--version", VERSION_STRING);
 
 	string inputFile;
@@ -2366,12 +2367,6 @@ int main(int argc, char *argv[])
 	}
 	cerr << "We have " << readCount-1 << " regions.\n"
 		<< nChrom << " chromosomes\nSorting..." << endl;
-	if(maxChrLen > chrLenLimit)
-	{
-		cerr << "Error: There is a region starting at " << maxChrLen << "." << endl
-			<<  chrTooLongMsg << endl;
-		exit(1);
-	}
 	time(&tstart);
 
 	if(naturalSort)
@@ -2484,6 +2479,21 @@ int main(int argc, char *argv[])
 
 		if(numThreads <= 1)
 		{
+			// One chromTable shared across all chroms, sized to the largest.
+			// Reject before allocating if the slab would exceed the budget
+			// (--max-mem if set, else 4 GB). --low-mem-ssd handles arbitrary
+			// chromosome lengths since it never builds a per-position slab.
+			size_t slabBytes = ((size_t)maxChrLen + 1) * sizeof(int);
+			if(sortMode == 'b') slabBytes *= 2;
+			size_t bucketBudget = (maxMemBytes > 0) ? maxMemBytes : kDefaultBucketChromBudget;
+			if(slabBytes > bucketBudget)
+			{
+				cerr << "Error: largest chromosome has positions up to " << maxChrLen
+				     << ", which would require " << (slabBytes >> 30) << " GB for the "
+				     << "bucket-sort slab (budget: " << (bucketBudget >> 30) << " GB). "
+				     << "Re-run with --low-mem-ssd, or raise --max-mem." << endl;
+				exit(1);
+			}
 			int* chromTable = (int*) calloc((size_t)maxChrLen + 1, sizeof(int));
 			int* numReadsBeg = (sortMode == 'b')
 				? (int*) calloc((size_t)maxChrLen + 1, sizeof(int))
@@ -2532,6 +2542,21 @@ int main(int argc, char *argv[])
 					// Cost = chromTable + (numReadsBeg if --sort b).
 					size_t cost = (size_t)(thisChrLen + 1) * sizeof(int);
 					if(sortMode == 'b') cost *= 2;
+
+					// Reject before allocating if a single chrom's slab exceeds
+					// the budget. --max-mem if set is the budget; otherwise
+					// fall back to the 4 GB default. --low-mem-ssd handles
+					// arbitrary chromosome lengths.
+					size_t bucketBudget = (maxMemBytes > 0) ? maxMemBytes : kDefaultBucketChromBudget;
+					if(cost > bucketBudget)
+					{
+						cerr << "Error: chromosome " << chrom << " has positions up to "
+						     << thisChrLen << ", which would require " << (cost >> 30)
+						     << " GB for the bucket-sort slab (budget: "
+						     << (bucketBudget >> 30) << " GB). Re-run with --low-mem-ssd, "
+						     << "or raise --max-mem." << endl;
+						exit(1);
+					}
 					size_t effCost = (maxMemBytes > 0)
 						? std::min(cost, maxMemBytes)  // a chrom bigger than the
 						                               // whole budget runs alone
