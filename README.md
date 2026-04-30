@@ -101,25 +101,27 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ### Wall Time
 
-![Wall time comparison](benchmark/benchmark_time.png)
+![Wall time comparison (log-log)](benchmark/benchmark_time.png)
 
-![Wall time comparison (linear scale)](benchmark/benchmark_time_linear.png)
+![Wall time comparison (both axes linear)](benchmark/benchmark_time_linear.png)
 
-#### Legend (point style & color):
+#### Legend (colour & line style):
 
-| Tool                | Color      | Point Style | Description |
-|---------------------|------------|-------------|-------------|
-| **pioSortBed 1t**   | <span style="color:#e41a1c">████</span> | ●           | Single-thread (default) |
-| **pioSortBed 8t**   | <span style="color:#377eb8">████</span> | ■           | 8 threads |
-| **pioSortBed low-mem 1t** | <span style="color:#f781bf">████</span> | ◆     | Low-memory SSD mode (single-thread) |
-| **pioSortBed low-mem 8t** | <span style="color:#c51b7d">████</span> | ◇     | Low-memory SSD mode (8 threads, recommended fast path) |
-| **GNU sort 1t**     | <span style="color:#4daf4a">████</span> | ▲           | Single-thread |
-| **GNU sort 8t**     | <span style="color:#ff7f00">████</span> | ▼           | 8 threads |
-| **bedtools**        | <span style="color:#984ea3">████</span> | ✚           | bedtools sort |
-| **bedops**          | <span style="color:#a65628">████</span> | ✦           | bedops sort-bed |
+Same colour per tool; thread count distinguished by line style (`-t 1` solid, `-t 8` dotted). pioSortBed classic and pioSortBed low-mem are different *algorithms* and get different colours.
 
-| Reads | pio 1t ● | pio 8t ■  | pio low-mem 1t ◆ | pio low-mem 8t ◇ | sort 1t ▲  | sort 8t ▼  | bedtools ✚ | bedops ✦   |
-|------:|---------:|----------:|-----------------:|-----------------:|-----------:|-----------:|-----------:|-----------:|
+| Tool                | Colour     | Marker | Line   | Description |
+|---------------------|------------|--------|--------|-------------|
+| **pioSortBed 1t**       | <span style="color:#e41a1c">████</span> | ● | solid  | Classic path, single-thread |
+| **pioSortBed 8t**       | <span style="color:#e41a1c">████</span> | ● | dotted | Classic path, 8 threads |
+| **pioSortBed low-mem 1t** | <span style="color:#c51b7d">████</span> | ◆ | solid  | Low-memory SSD mode, single-thread |
+| **pioSortBed low-mem 8t** | <span style="color:#c51b7d">████</span> | ◆ | dotted | Low-memory SSD mode, 8 threads (recommended fast path) |
+| **GNU sort 1t**         | <span style="color:#4daf4a">████</span> | ▲ | solid  | Single-thread |
+| **GNU sort 8t**         | <span style="color:#4daf4a">████</span> | ▲ | dotted | 8 threads |
+| **bedtools**            | <span style="color:#984ea3">████</span> | ✚ | solid  | bedtools sort |
+| **bedops**              | <span style="color:#a65628">████</span> | ✦ | solid  | bedops sort-bed |
+
+| Reads | pio 1t ● | pio 8t ● | pio low-mem 1t ◆ | pio low-mem 8t ◆ | sort 1t ▲  | sort 8t ▲  | bedtools ✚ | bedops ✦   |
+|------:|---------:|---------:|-----------------:|-----------------:|-----------:|-----------:|-----------:|-----------:|
 | 10k   | 0 ms     | 0 ms      | 0 ms             | 0 ms             | 10 ms      | 0 ms       | 10 ms      | 0 ms       |
 | 20k   | 0 ms     | 0 ms      | 10 ms            | 10 ms            | 10 ms      | 10 ms      | 20 ms      | 10 ms      |
 | 50k   | 10 ms    | 10 ms     | 20 ms            | 10 ms            | 30 ms      | 30 ms      | 40 ms      | 30 ms      |
@@ -160,11 +162,11 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ### Peak Memory (RSS)
 
-![Peak memory usage](benchmark/benchmark_memory.png)
+![Peak memory usage (log-log)](benchmark/benchmark_memory.png)
 
-![Peak memory usage (linear scale)](benchmark/benchmark_memory_linear.png)
+![Peak memory usage (both axes linear)](benchmark/benchmark_memory_linear.png)
 
-| Reads | pio 1t ●  | pio 8t ■    | pio low-mem 1t ◆ | pio low-mem 8t ◇ | sort 1t ▲ | sort 8t ▼ | bedtools ✚ | bedops ✦   |
+| Reads | pio 1t ●  | pio 8t ●    | pio low-mem 1t ◆ | pio low-mem 8t ◆ | sort 1t ▲ | sort 8t ▲ | bedtools ✚ | bedops ✦   |
 |------:|----------:|------------:|-----------------:|-----------------:|----------:|----------:|-----------:|-----------:|
 | 10k   | 6.6 MB    | 6.7 MB      | 6.7 MB           | 7.6 MB           | 3.3 MB    | 3.2 MB    | 8.8 MB     | 2.0 MB     |
 | 20k   | 7.7 MB    | 7.1 MB      | 7.3 MB           | 8.5 MB           | 3.2 MB    | 3.3 MB    | 12.4 MB    | 2.5 MB     |
