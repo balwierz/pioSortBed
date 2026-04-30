@@ -31,6 +31,16 @@
 
 using namespace std;
 
+// ============================================================================
+// CORE TYPES & ALLOCATOR
+// ----------------------------------------------------------------------------
+// seqread:    one parsed input line (24 B; lives in reads[]).
+// chrInfoT:   per-chromosome bookkeeping (linked-list head, max coordinate).
+// ChrNameMap: small flat-vector map keyed by chromosome name.
+// Arena:      bump allocator for line tails / weight strings on stdin/gzip.
+// Constants:  weight-field cap, bucket-sort default budget, hybrid cutoff.
+// ============================================================================
+
 // Field layout minimizes padding: pointer first, then ints, then char.
 // 24 bytes per read on 64-bit (8 + 4 + 4 + 4 + 1 + 3 padding).
 //
@@ -205,6 +215,16 @@ struct Arena
 	}
 };
 
+
+// ============================================================================
+// PARSERS — FIELDS, BED / RAL LINES, COLLAPSE-MODE WEIGHTS
+// ----------------------------------------------------------------------------
+// Field-level (skipField/parseUInt/copyField) and line-level
+// (parseBedLine3/parseBedLineFull/parseRalLine) primitives, all `inline` for
+// the hot path. Plus parseWeight/sumWeights* which the bucket-sort and
+// classic-sort emit paths use to consume `--collapse` weight strings.
+// Hand-written; faster than sscanf.
+// ============================================================================
 
 // Hand-written field parsers (faster than sscanf).
 static inline bool skipField(const char** pp)
@@ -410,6 +430,20 @@ static inline float sumWeightsList(seqread* reads, uint32_t* chromTable, int pos
 	}
 	return sum;
 }
+
+// ============================================================================
+// LOW-MEMORY SSD PATH (--low-mem-ssd)
+// ----------------------------------------------------------------------------
+// Two-pass file-only sort. Pass 1: parse mmap once, build a 16 B-per-line
+// node table with per-chromosome linked lists threaded through it. Pass 2:
+// for each chromosome, walk its list, sort the small per-chrom vector, emit
+// the lines via fwrite directly from mmap pointers. Pass 2 runs chromosomes
+// in parallel; output is serialised through a producer-consumer barrier.
+//
+// Owns: lowMemNode (the per-line index entry), naturalChrLess (the
+// chromosome ordering helper), ChromBuf (the per-chrom output buffer),
+// lowMemSortMmap (the whole pipeline).
+// ============================================================================
 
 // One node per line in --low-mem-ssd's pass-1 index.
 //
@@ -1183,6 +1217,21 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	return 0;
 }
 
+// ============================================================================
+// CLASSIC SORT PATH (default + bucket sort)
+// ----------------------------------------------------------------------------
+// Pipeline:
+//   parse: parseLines<UseMmap> (serial / stdin)  OR  parseChunkMmap (parallel
+//          via parseMmapDispatch / parseMmapSerial)
+//   sort:  sortIndicesDispatch -> sortIndices<SortMode> -> radixSort64 or
+//          std::sort with ReadCmp<SortMode>
+//   emit:  per-chrom processChromBucketTpl<FullLine> for the bucket path,
+//          or a flat scan over the sorted index for the classic path
+//
+// This section also owns the small write helpers (writeUInt, writeBedLine)
+// used by both sort and bucket emit paths.
+// ============================================================================
+
 // Fast integer-to-buffer writer. Returns number of chars written.
 static inline int writeUInt(char* buf, int val)
 {
@@ -1210,22 +1259,6 @@ static inline void writeBedLine(const char* chr, int beg, int end,
 	fputc_unlocked('\n', out);
 }
 
-// Print one read. fullLine==true means reads[idx].line holds the entire input
-// line (RAL or mmap path) — a single fputs+\n is enough. fullLine==false means
-// .line is just the tail (stdin/gzip BED path), so reconstruct chr/beg/end.
-static inline void printRead(const seqread* reads, int idx, const char* chr,
-                             bool fullLine, FILE* out)
-{
-	if(fullLine)
-	{
-		fputs_unlocked(reads[idx].line, out);
-		fputc_unlocked('\n', out);
-	}
-	else
-	{
-		writeBedLine(chr, reads[idx].beg, reads[idx].end, reads[idx].line, out);
-	}
-}
 
 // Comparator that orders read indices by (chrIdx, sort-key). The SortMode
 // template parameter selects the secondary key:
@@ -1471,30 +1504,11 @@ static void sortIndicesDispatch(uint32_t* order, size_t n, seqread* reads, char 
 // chromTable and (for --sort b) numReadsBeg must be sized at least thisChrLen+1
 // and zero-initialized; on return all touched slots are 0 again so the buffers
 // can be reused for another chromosome.
-// Parse a memory-size string like "4G", "500M", "1024K", or a bare byte count.
-// Returns 0 on empty/malformed input. Suffixes use binary multipliers (1024).
-static size_t parseMemSize(const std::string& s)
-{
-	if(s.empty()) return 0;
-	size_t mult = 1;
-	std::string num = s;
-	char back = s.back();
-	if(back == 'G' || back == 'g') { mult = 1ULL << 30; num.pop_back(); }
-	else if(back == 'M' || back == 'm') { mult = 1ULL << 20; num.pop_back(); }
-	else if(back == 'K' || back == 'k') { mult = 1ULL << 10; num.pop_back(); }
-	if(num.empty()) return 0;
-	try
-	{
-		long long v = std::stoll(num);
-		if(v < 0) return 0;
-		return (size_t)v * mult;
-	}
-	catch(...) { return 0; }
-}
 
-// Templated on FullLine so gcc constant-folds the printRead branch in the
-// per-read inner loop; otherwise we'd pay an extra well-predicted-but-real
-// fetch/decode branch per emitted line at -t 1 on multi-million-read files.
+// Templated on FullLine so gcc constant-folds the "full mmap line vs
+// reconstruct from beg/end + tail" branch in the per-read emit loop;
+// otherwise we'd pay an extra well-predicted-but-real fetch/decode branch
+// per emitted line at -t 1 on multi-million-read files.
 template<bool FullLine>
 static __attribute__((always_inline)) inline void processChromBucketTpl(
     const char* chrName, int thisChrLen, uint32_t firstRead,
@@ -2136,6 +2150,35 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 
 	outReadCount = totalReads;
 	return reads;
+}
+
+// ============================================================================
+// CLI / MAIN
+// ----------------------------------------------------------------------------
+// CLI11 option parsing, input dispatch (file mmap / stdin slurp / gzip
+// slurp), and routing to lowMemSortMmap or the classic + bucket sort path.
+// Owns parseMemSize (for --max-mem) and the slurpStream helper.
+// ============================================================================
+
+// Parse a memory-size string like "4G", "500M", "1024K", or a bare byte count.
+// Returns 0 on empty/malformed input. Suffixes use binary multipliers (1024).
+static size_t parseMemSize(const std::string& s)
+{
+	if(s.empty()) return 0;
+	size_t mult = 1;
+	std::string num = s;
+	char back = s.back();
+	if(back == 'G' || back == 'g') { mult = 1ULL << 30; num.pop_back(); }
+	else if(back == 'M' || back == 'm') { mult = 1ULL << 20; num.pop_back(); }
+	else if(back == 'K' || back == 'k') { mult = 1ULL << 10; num.pop_back(); }
+	if(num.empty()) return 0;
+	try
+	{
+		long long v = std::stoll(num);
+		if(v < 0) return 0;
+		return (size_t)v * mult;
+	}
+	catch(...) { return 0; }
 }
 
 int main(int argc, char *argv[])
