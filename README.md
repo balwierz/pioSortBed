@@ -10,15 +10,39 @@ but significantly faster on large datasets. Supports BED3, BED6, and extended BE
 
 ## Algorithm
 
-pioSortBed uses a hybrid sort strategy:
-- **Files with < 50M reads** (configurable via `--bucket-cutoff`): classic **O(n log n)** comparison sort (`std::sort` on an index array). Single-threaded by default; parallel via TBB-backed `std::sort(std::execution::par, ...)` at `--threads > 1`.
-- **Files with ≥ 50M reads**: bucket sort (counting sort), which avoids coordinate comparisons entirely — reads are placed directly into position-indexed buckets. This gives **O(n + m)** complexity, where *n* is the number of regions and *m* is the maximum chromosome length.
+pioSortBed has two sort paths:
 
-Both phases parallelize:
-- **Parsing** (mmap path): file is split into newline-aligned chunks parsed concurrently into per-chunk per-chromosome partial linked lists, merged in a final serial pass. Header lines are emitted to stdout in a leading pre-pass before chunking.
-- **Bucket sort** (multi-thread): chromosomes processed concurrently, each thread allocating its own per-chromosome `chromTable` sized exactly to that chromosome's max coordinate. Output goes through a producer-consumer barrier so per-chromosome buffers are flushed to stdout in alphabetical order as soon as their turn comes up — capping live output buffers to roughly the worker count.
+- **`--low-mem-ssd` — recommended for any file ≥ ~1 M reads.** A two-pass
+  algorithm. Pass 1 walks the mmap'd input once and builds a 16-byte-per-
+  read index table with per-chromosome linked lists. Pass 2 processes each
+  chromosome independently: small per-chrom `std::sort`, then emit lines
+  via mmap pointers (no copy). Both passes parallelise; chromosomes flow
+  through a producer-consumer barrier so output is in alphabetical order.
+  Peak RAM scales with read count (~16 B per read for the index, plus the
+  mmap), not with chromosome length.
 
-> Bucket sort has overhead proportional to chromosome length, and the parallel bucket-sort path also pays for per-thread `chromTable` slabs and queued output buffers. Use `--threads 1` if RAM is tight; the single-threaded path keeps a flat ~4 GB ceiling at 50M reads.
+- **Classic path (the default when `--low-mem-ssd` isn't set)** holds the
+  whole input in a `seqread[]` array and uses an internal hybrid:
+  - `std::sort` on an index array (O(n log n)) below `--bucket-cutoff`
+    reads (default 50 M).
+  - Bucket / counting sort (O(n + m), where *m* = max chromosome
+    coordinate) at and above the cutoff. Multi-threaded bucket sort
+    allocates a per-chromosome `chromTable` slab on each worker — fast
+    but RAM-hungry, and the slabs scale with `m`, not `n`. `--max-mem`
+    (default 4 GB) caps a single chromosome's slab and rejects oversized
+    ones with a clear error.
+
+  The classic path is mainly useful at small sizes (< ~1 M reads), where
+  the two-pass overhead of `--low-mem-ssd` dominates. Above that,
+  `--low-mem-ssd -t 4` or `-t 8` is faster on both wall time *and* peak
+  RSS — see the benchmark plots below.
+
+**Parsing** (both paths, file input): the mmap is split into newline-
+aligned chunks parsed concurrently; per-chunk per-chromosome partials
+merge in a final serial step. `-t 1` short-circuits to a realloc-grow
+serial parser. Stdin / `.gz` input is slurped into a single buffer up
+front so it can use the same parser as the file path (zero per-line
+allocation).
 
 ## Installation
 
@@ -265,25 +289,35 @@ To reproduce the sweep: `bash benchmark/bench_max_mem.sh`. Data lives in
 
 ### Performance Summary
 
-**pioSortBed strategy:**
-- **Files < 50M reads** (configurable `--bucket-cutoff`): Classic **O(n log n)** comparison sort on an index array
-  - Single-threaded `std::sort` with inlined comparator at `-t 1`
-  - Parallel `std::sort(std::execution::par, ...)` (TBB) at `-t > 1`
-- **Files ≥ 50M reads**: Bucket/counting sort — O(n + m) complexity where m = max chromosome length
-  - Single-thread: one shared `chromTable[maxChrLen+1]` reused across chromosomes
-  - Multi-thread (v2.1.0): chromosomes processed concurrently, each thread allocates its own `chromTable[thisChrLen+1]`. Per-chrom output is buffered through `open_memstream` and flushed under a producer-consumer barrier so output is written in alphabetical order
-- **Parallel parsing** (mmap path): file split into newline-aligned chunks parsed in parallel; per-chunk per-chromosome partials merged at the end
-- **Low-memory mode** (`--low-mem-ssd`): Two-pass algorithm for RAM-constrained environments
-  - Pass 1: Scan file once, store line offsets per chromosome (minimal RAM)
-  - Pass 2: Process one chromosome at a time, sorting and printing in isolation
-  - Trade-off: slower than default mode, but peak RAM ∝ largest chromosome (not whole file)
-  - Best for large genomic files on small-RAM systems
+**Recommended path:** `pioSortBed --low-mem-ssd -t N input.bed > sorted.bed`,
+with `N` = 4 or 8 on a typical desktop (8 if you have ≥ 16 GB RAM and the
+hardware to back it up; 4 if you'd rather trade ~25 % wall time for ~17 %
+lower peak RSS — see the [`--max-mem` sweep section](#--max-mem-budget-sweep-pio-lm--t-4--200m)
+above).
 
-To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot for plots).
+**Classic path** (default, no `--low-mem-ssd`):
+- Below `--bucket-cutoff` reads (default 50 M): index-array `std::sort`,
+  O(n log n). `-t 1` uses an inlined comparator; `-t > 1` uses
+  `std::sort(std::execution::par, ...)` over TBB.
+- At and above the cutoff: bucket/counting sort, O(n + m) where m = max
+  chromosome coordinate. Single-thread reuses one `chromTable` across
+  chromosomes; multi-thread allocates a per-thread per-chromosome
+  `chromTable` slab and flushes through a producer-consumer barrier in
+  alphabetical order. `--max-mem N[GMK]` caps single-chromosome slab size.
+- Use cases: small inputs (< ~1 M reads, where the two-pass overhead of
+  `--low-mem-ssd` dominates), and benchmarking.
+
+**Parsing** (both paths, mmap or stdin slurp): file split into newline-
+aligned chunks parsed in parallel; per-chunk per-chromosome partials
+merged at the end. `-t 1` falls through to a realloc-grow serial parser.
+
+To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot
+for plots; `TMPDIR=/var/tmp` recommended for the 100 M+ sizes — GNU sort
+spill files plus the 8.6 GB 200 M-row fixture exceed a 16 GB tmpfs).
 
 ### Real-data Benchmark: NA12878 WGS (chr20, 120M reads)
 
-Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned to GRCh38 (GIAB/NHGRI). 120,499,538 reads, 7.9 GB BED file. All tools use the bucket-sort path (>50M reads).
+Benchmark on real Illumina WGS reads: NA12878 (HG001) 300x HiSeq, chr20, aligned to GRCh38 (GIAB/NHGRI). 120,499,538 reads, 7.9 GB BED file.
 
 | Tool | Wall time | Peak RSS |
 |------|-----------|----------|
