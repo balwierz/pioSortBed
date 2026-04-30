@@ -38,22 +38,23 @@ set yrange [*:*]
 set xlabel 'Number of reads' font ',22'
 
 # --- Wall time (log-log) ---
+# CSV stores wall time in ms; we plot seconds to keep the y-axis legible.
 set output 'benchmark_time.png'
 set title "Wall time (log-log)" font ',24'
-set ylabel 'Wall time (ms)' font ',22'
+set ylabel 'Wall time (s)' font ',22'
 
 plot 'benchmark_readme.csv' \
-    using 1:2  with linespoints ls 1  title 'pioSortBed 1t', \
-    '' using 1:3  with linespoints ls 2  title 'pioSortBed 4t', \
-    '' using 1:4  with linespoints ls 3  title 'pioSortBed 8t', \
-    '' using 1:5  with linespoints ls 4  title 'pioSortBed low-mem 1t', \
-    '' using 1:6  with linespoints ls 5  title 'pioSortBed low-mem 4t', \
-    '' using 1:7  with linespoints ls 6  title 'pioSortBed low-mem 8t', \
-    '' using 1:8  with linespoints ls 7  title 'GNU sort 1t', \
-    '' using 1:9  with linespoints ls 8  title 'GNU sort 4t', \
-    '' using 1:10 with linespoints ls 9  title 'GNU sort 8t', \
-    '' using 1:11 with linespoints ls 10 title 'bedtools sort', \
-    '' using 1:12 with linespoints ls 11 title 'bedops sort-bed'
+    using 1:($2/1000.0)  with linespoints ls 1  title 'pioSortBed 1t', \
+    '' using 1:($3/1000.0)  with linespoints ls 2  title 'pioSortBed 4t', \
+    '' using 1:($4/1000.0)  with linespoints ls 3  title 'pioSortBed 8t', \
+    '' using 1:($5/1000.0)  with linespoints ls 4  title 'pioSortBed low-mem 1t', \
+    '' using 1:($6/1000.0)  with linespoints ls 5  title 'pioSortBed low-mem 4t', \
+    '' using 1:($7/1000.0)  with linespoints ls 6  title 'pioSortBed low-mem 8t', \
+    '' using 1:($8/1000.0)  with linespoints ls 7  title 'GNU sort 1t', \
+    '' using 1:($9/1000.0)  with linespoints ls 8  title 'GNU sort 4t', \
+    '' using 1:($10/1000.0) with linespoints ls 9  title 'GNU sort 8t', \
+    '' using 1:($11/1000.0) with linespoints ls 10 title 'bedtools sort', \
+    '' using 1:($12/1000.0) with linespoints ls 11 title 'bedops sort-bed'
 
 # --- Peak memory (log-log) ---
 set output 'benchmark_memory.png'
@@ -91,20 +92,20 @@ set key top left
 # --- Wall time (log-x, linear-y) ---
 set output 'benchmark_time_linear.png'
 set title "Wall time (log-x, linear-y)" font ',24'
-set ylabel 'Wall time (ms)' font ',22'
+set ylabel 'Wall time (s)' font ',22'
 
 plot 'benchmark_readme.csv' \
-    using 1:2  with linespoints ls 1  title 'pioSortBed 1t', \
-    '' using 1:3  with linespoints ls 2  title 'pioSortBed 4t', \
-    '' using 1:4  with linespoints ls 3  title 'pioSortBed 8t', \
-    '' using 1:5  with linespoints ls 4  title 'pioSortBed low-mem 1t', \
-    '' using 1:6  with linespoints ls 5  title 'pioSortBed low-mem 4t', \
-    '' using 1:7  with linespoints ls 6  title 'pioSortBed low-mem 8t', \
-    '' using 1:8  with linespoints ls 7  title 'GNU sort 1t', \
-    '' using 1:9  with linespoints ls 8  title 'GNU sort 4t', \
-    '' using 1:10 with linespoints ls 9  title 'GNU sort 8t', \
-    '' using 1:11 with linespoints ls 10 title 'bedtools sort', \
-    '' using 1:12 with linespoints ls 11 title 'bedops sort-bed'
+    using 1:($2/1000.0)  with linespoints ls 1  title 'pioSortBed 1t', \
+    '' using 1:($3/1000.0)  with linespoints ls 2  title 'pioSortBed 4t', \
+    '' using 1:($4/1000.0)  with linespoints ls 3  title 'pioSortBed 8t', \
+    '' using 1:($5/1000.0)  with linespoints ls 4  title 'pioSortBed low-mem 1t', \
+    '' using 1:($6/1000.0)  with linespoints ls 5  title 'pioSortBed low-mem 4t', \
+    '' using 1:($7/1000.0)  with linespoints ls 6  title 'pioSortBed low-mem 8t', \
+    '' using 1:($8/1000.0)  with linespoints ls 7  title 'GNU sort 1t', \
+    '' using 1:($9/1000.0)  with linespoints ls 8  title 'GNU sort 4t', \
+    '' using 1:($10/1000.0) with linespoints ls 9  title 'GNU sort 8t', \
+    '' using 1:($11/1000.0) with linespoints ls 10 title 'bedtools sort', \
+    '' using 1:($12/1000.0) with linespoints ls 11 title 'bedops sort-bed'
 
 # --- Peak memory (log-x, linear-y) ---
 set output 'benchmark_memory_linear.png'
