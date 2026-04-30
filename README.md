@@ -319,16 +319,28 @@ To reproduce: `bash benchmark/benchmark_na12878.sh` (streams ~12 GB from NCBI FT
 
 > Same caveat as the chr20 table above: the `pioSortBed low-mem` row used the default thread count, not `-t 8`. Both real-data tables will be re-run with explicit `-t 1` / `-t 8` low-mem rows on the next benchmark cycle.
 
-## Compile-time Limits
+## Limits
 
-These constants can be changed and the program recompiled if needed:
+The v3.0.x cleanup pass made every previously-baked-in limit either dynamic
+at runtime, error-on-overflow, or driven by an existing CLI flag. Current
+state (also visible via `pioSortBed --help`):
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `lineBufSize` | 1024 bytes | Maximum BED line length (stdin only; no limit for file input) |
-| `chrNameBufSize` | 256 bytes | Maximum chromosome name length |
-| `chrLenLimit` | 1 Gbp | Maximum chromosome/contig length |
-| `defaultBucketCutoff` | 50M | Hybrid sort threshold (overridden by `--bucket-cutoff`) |
+| Limit | Behaviour |
+|-------|-----------|
+| Line length (stdin / gzip) | None — `getline()` heap buffer grows as needed |
+| Line length (file mmap)    | None — `memchr` boundary, only bounded by file size |
+| Chromosome name length     | None — stored as pointer+length into the line |
+| Chromosome coordinate (`beg`, `end`) | Signed 32-bit ⇒ ≤ 2.15 Gbp per single coordinate |
+| Read count                 | uint32_t indices ⇒ ≤ 4.29 B reads (all sort paths) |
+| Per-chromosome bucket-sort RAM | Default 4 GB; overridden by `--max-mem N[GMK]` |
+| BED score field length (col 5) | 255 bytes; over-long values rejected with a clear error |
+| Hybrid sort cutoff (classic vs. bucket) | Default 50 M reads; overridden by `--bucket-cutoff N` |
+
+Above 2.15 Gbp per single coordinate, you'd need to widen `int beg, int end`
+in `seqread` / `lowMemNode` to `int64_t` and rebuild. Above 4.29 B reads,
+the index types in `seqread::next` / `lowMemNode::next` / `chrInfoT::lastRead`
+need widening too. Both are deliberate refactors, not flag flips — but no
+real-world genomic dataset has approached either limit.
 
 ## Author
 
