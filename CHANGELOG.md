@@ -4,6 +4,23 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.2] — 2026-04-30
+
+### Changed
+- **`--low-mem-ssd` pass 2 now writes through a pre-sized `ChromBuf`** instead
+  of a glibc `open_memstream`. The memstream's exponential-doubling realloc
+  was holding both old and new buffers transiently at every growth step,
+  so peak RSS was inflating ~2× the chromosome's final output size during
+  the doubling. Pre-sizing to `chromCount × avgLineBytes × 1.05` eliminates
+  the doublings on the parallel path.
+  - Single-thread (`-t 1`): keeps a 64 KB scratch reused across chromosomes,
+    `fwrite_unlocked`'d to stdout when full. Peak RAM unchanged; ~3% faster.
+  - Parallel (`-t > 1`): pre-sized per-chromosome buffer, queued through the
+    existing producer-consumer barrier. **20M reads measured: 2.32 s / 2.31 GB
+    → 1.84 s / 1.85 GB — 21% faster, 20% less RAM.**
+- `processChrom` now takes a `ChromBuf&` instead of a `FILE*`; collapse mode
+  uses `vsnprintf` into a 512-B stack buffer + `memcpy` instead of `fprintf`.
+
 ## [3.0.1] — 2026-04-30
 
 ### Changed

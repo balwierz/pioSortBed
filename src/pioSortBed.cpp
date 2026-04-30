@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <cstdarg>
 #include <cstring>
 #include <cctype>
 #include <string>
@@ -427,6 +428,91 @@ static bool naturalChrLess(const std::string& a, const std::string& b)
 	return (unsigned char)*pa < (unsigned char)*pb;
 }
 
+// Per-chromosome output buffer used by --low-mem-ssd's pass 2.
+//
+// Two modes:
+//   flushTo == NULL  — accumulate everything into `buf`. Used by the multi-
+//                      thread path so the producer-consumer barrier can flush
+//                      whole chromosomes to stdout in alphabetical order.
+//                      Pre-size the buffer (see avgLineBytes estimate at the
+//                      call site) to skip the early doublings.
+//   flushTo != NULL  — small reusable scratch buffer; when it fills we
+//                      fwrite_unlocked to flushTo and reset pos. Used by the
+//                      single-thread path to bound peak RAM at ~64 KB instead
+//                      of ~per-chromosome.
+//
+// Replaces the previous `open_memstream` approach: skips the stdio FILE state
+// machine and (in the buffered case) avoids the realloc churn that the
+// memstream's exponential doubling caused on multi-GB chromosomes.
+struct ChromBuf
+{
+	char* buf = nullptr;
+	size_t pos = 0;
+	size_t cap = 0;
+	FILE* flushTo = nullptr;
+
+	void grow_or_flush(size_t need)
+	{
+		if(flushTo)
+		{
+			if(pos > 0)
+			{
+				fwrite_unlocked(buf, 1, pos, flushTo);
+				pos = 0;
+			}
+			if(need <= cap) return;
+		}
+		size_t newCap = cap ? cap : 65536;
+		while(newCap < pos + need) newCap *= 2;
+		char* nb = (char*) realloc(buf, newCap);
+		if(!nb) { perror("realloc ChromBuf"); exit(1); }
+		buf = nb;
+		cap = newCap;
+	}
+
+	inline void writeLineFromMmap(const char* line)
+	{
+		size_t len = strlen(line);
+		if(pos + len + 1 > cap) grow_or_flush(len + 1);
+		memcpy(buf + pos, line, len);
+		buf[pos + len] = '\n';
+		pos += len + 1;
+	}
+
+	void writeFmt(const char* fmt, ...)
+	{
+		char tmp[512];
+		va_list ap;
+		va_start(ap, fmt);
+		int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+		va_end(ap);
+		if(n < 0) return;
+		if((size_t)n < sizeof(tmp))
+		{
+			if(pos + (size_t)n > cap) grow_or_flush((size_t)n);
+			memcpy(buf + pos, tmp, (size_t)n);
+			pos += (size_t)n;
+			return;
+		}
+		// Output exceeded 512 chars (rare). Format a second time directly into buf.
+		if(pos + (size_t)n + 1 > cap) grow_or_flush((size_t)n + 1);
+		va_start(ap, fmt);
+		int n2 = vsnprintf(buf + pos, cap - pos, fmt, ap);
+		va_end(ap);
+		if(n2 < 0) return;
+		pos += (size_t)n2;
+	}
+
+	void finalize()
+	{
+		if(flushTo && pos > 0)
+		{
+			fwrite_unlocked(buf, 1, pos, flushTo);
+			pos = 0;
+		}
+	}
+};
+
 // Low-memory file mode (SSD-friendly):
 // Pass 1: walk mmap once, build per-chromosome linked lists of line offsets.
 // Pass 2: process one chromosome at a time (parse, sort, print), so peak RAM
@@ -779,7 +865,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	// 24 B (16 B + 8 padding to size_t alignment) but is required for
 	// files >= 4 GB.
 	struct SortRecSB { int beg; int end; size_t off; };
-	auto processChrom = [&](int ci, FILE* out) -> int {
+	auto processChrom = [&](int ci, ChromBuf& cb) -> int {
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 
 		// Collect node indices for this chromosome (linked-list walk).
@@ -837,8 +923,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					sum += wp[i].second;
 					i++;
 				}
-				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n",
-				        chroms[ci].c_str(), pos, pos+1, sum);
+				cb.writeFmt("%s\t%d\t%d\t.\t%g\t+\n",
+				            chroms[ci].c_str(), pos, pos+1, sum);
 			}
 			return 0;
 		}
@@ -874,10 +960,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			}
 			std::sort(kp.begin(), kp.end());
 			for(auto& p : kp)
-			{
-				fputs_unlocked(mmapBase + nodes[p.second].off, out);
-				fputc_unlocked('\n', out);
-			}
+				cb.writeLineFromMmap(mmapBase + nodes[p.second].off);
 			return 0;
 		}
 
@@ -920,29 +1003,44 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		std::sort(sr.begin(), sr.end(), cmpSB);
 
 		for(const auto& r : sr)
-		{
-			fputs_unlocked(mmapBase + r.off, out);
-			fputc_unlocked('\n', out);
-		}
+			cb.writeLineFromMmap(mmapBase + r.off);
 		return 0;
 	};
 
+	// Average BED line length (used to pre-size per-chrom output buffers in
+	// the parallel path so the buffer doesn't need to double its way up to
+	// the chromosome's final size). nodeCount - 1 is the actual line count
+	// (index 0 is reserved as the end-of-list sentinel).
+	size_t avgLineBytes = (nodeCount > 1)
+		? (mmapSize - bodyStart) / (size_t)(nodeCount - 1) + 1
+		: 64;
+
 	if(numThreads <= 1)
 	{
-		// Serial: print directly to stdout.
+		// Serial: ChromBuf with flushTo=stdout, 64 KB scratch reused across
+		// chromosomes. fwrite_unlocked goes to stdout when the buffer fills,
+		// keeping peak RAM bounded.
+		ChromBuf cb;
+		cb.cap = 64 * 1024;
+		cb.buf = (char*) malloc(cb.cap);
+		if(!cb.buf) { perror("malloc"); free(nodes); return 1; }
+		cb.flushTo = stdout;
 		for(size_t ci = 0; ci < chroms.size(); ci++)
 		{
-			if(processChrom((int)ci, stdout) != 0)
+			if(processChrom((int)ci, cb) != 0)
 			{
+				free(cb.buf);
 				free(nodes);
 				return 1;
 			}
+			cb.finalize();
 		}
+		free(cb.buf);
 	}
 	else
 	{
 		// Parallel across chromosomes. Each worker writes its chromosome
-		// to an open_memstream buffer; producer-consumer barrier flushes
+		// into a pre-sized ChromBuf; producer-consumer barrier flushes
 		// in alphabetical order. Optional --max-mem gate caps concurrent
 		// per-chromosome buffers (rough estimate: 12 B sort-rec + ~50 B
 		// of output per read = ~62 B per read).
@@ -975,16 +1073,22 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					budgetRemaining -= effCost;
 				}
 
-				char* memBuf = NULL;
-				size_t memBufSz = 0;
-				FILE* sink = open_memstream(&memBuf, &memBufSz);
-				if(!sink)
+				ChromBuf cb;
+				cb.flushTo = nullptr;
+				// Pre-size to ~exactly the expected output size for this
+				// chromosome (sort modes preserve line bytes verbatim, so
+				// output ≈ chromCount × avgLineBytes). 5% slack absorbs
+				// fluctuations; collapse mode may overshoot slightly but
+				// the buffer just over-allocates harmlessly.
+				cb.cap = std::max((size_t)4096, chromCount * avgLineBytes + chromCount * avgLineBytes / 20);
+				cb.buf = (char*) malloc(cb.cap);
+				if(!cb.buf)
 				{
-					cerr << "open_memstream failed for chrom " << chroms[ci] << endl;
+					cerr << "malloc " << cb.cap << " bytes for chrom "
+					     << chroms[ci] << " failed" << endl;
 					exit(1);
 				}
-				int rc = processChrom(ci, sink);
-				fclose(sink);
+				int rc = processChrom(ci, cb);
 
 				if(effCost > 0)
 				{
@@ -997,7 +1101,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 
 				if(rc != 0)
 				{
-					free(memBuf);
+					free(cb.buf);
 					exit(1);
 				}
 
@@ -1005,8 +1109,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				{
 					std::unique_lock<std::mutex> lk(printMtx);
 					printCv.wait(lk, [&]{ return nextChromToPrint == ci; });
-					fwrite_unlocked(memBuf, 1, memBufSz, stdout);
-					free(memBuf);
+					fwrite_unlocked(cb.buf, 1, cb.pos, stdout);
+					free(cb.buf);
 					nextChromToPrint++;
 				}
 				printCv.notify_all();
