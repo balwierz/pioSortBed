@@ -1463,10 +1463,12 @@ template<char SortMode>
 static void sortIndices(uint32_t* order, size_t n, seqread* reads, int numThreads)
 {
 	// Radix path: large enough, sortMode supports a single 32-bit position key.
-	// --sort b needs a tertiary key (end), which doesn't pack into 64 bits at
-	// the BED coordinate range — falls through to std::sort. Same key-packing
-	// works for both single-thread and multi-thread; radixSort64 internally
-	// dispatches to a serial or parallel histogram + scatter pipeline.
+	// --sort b's three keys (chrIdx, beg, end) don't fit in 64 bits without
+	// lossy squeezing, so it never reaches this template instantiation — the
+	// dispatcher in main() routes --sort b to sortIndicesPerChromB instead.
+	// Same key-packing works for both single-thread and multi-thread;
+	// radixSort64 internally dispatches to a serial or parallel histogram +
+	// scatter pipeline.
 	if constexpr(SortMode == 's' || SortMode == '5')
 	{
 		const size_t threshold = (numThreads > 1) ? RADIX_SORT_THRESHOLD_PAR : RADIX_SORT_THRESHOLD;
@@ -1502,6 +1504,65 @@ static void sortIndicesDispatch(uint32_t* order, size_t n, seqread* reads, char 
 		case 'b': sortIndices<'b'>(order, n, reads, numThreads); break;
 		case '5': sortIndices<'5'>(order, n, reads, numThreads); break;
 		default:  sortIndices<'s'>(order, n, reads, numThreads); break;
+	}
+}
+
+// Per-chromosome radix sort for --sort b. The classic-path order[] array is
+// already laid out in chromosome order (caller populates one chrom at a
+// time), so we can sort each chrom's slice independently. Within a single
+// chromosome the key is (beg << 32) | end — fits in 64 bits cleanly, no
+// chrIdx packing needed. Below RADIX_SORT_THRESHOLD per chrom we fall
+// through to std::sort with the comparator.
+//
+// Chromosomes are processed in parallel via std::for_each(par) at -t > 1;
+// each worker runs serial radix on its assigned chromosome. This avoids
+// the per-pass synchronisation cost of parallel-radix-within-one-chrom and
+// scales to all available worker threads when there are many chromosomes.
+static void sortIndicesPerChromB(uint32_t* order,
+                                 const std::vector<size_t>& chromStart,
+                                 seqread* reads, int numThreads)
+{
+	size_t numChroms = chromStart.size() - 1;
+
+	auto sortChrom = [&](size_t ci) {
+		size_t start = chromStart[ci];
+		size_t n = chromStart[ci + 1] - start;
+		if(n < 2) return;
+
+		if(n < RADIX_SORT_THRESHOLD)
+		{
+			ReadCmp<'b'> cmp{reads};
+			std::sort(order + start, order + start + n, cmp);
+			return;
+		}
+
+		// Build 64-bit keys (beg, end) for this chrom's slice.
+		uint64_t* keys = (uint64_t*) malloc(n * sizeof(uint64_t));
+		if(!keys)
+		{
+			cerr << "Error: out of memory for radix keys (" << n << " entries)" << endl;
+			exit(1);
+		}
+		for(size_t i = 0; i < n; i++)
+		{
+			uint32_t idx = order[start + i];
+			keys[i] = ((uint64_t)(uint32_t)reads[idx].beg << 32) |
+			          (uint64_t)(uint32_t)reads[idx].end;
+		}
+		// Serial radix per chrom (parallelism is across chroms, not within).
+		radixSort64(keys, order + start, n, 1);
+		free(keys);
+	};
+
+	if(numThreads <= 1 || numChroms < 2)
+	{
+		for(size_t ci = 0; ci < numChroms; ci++) sortChrom(ci);
+	}
+	else
+	{
+		std::vector<size_t> chromIdxs(numChroms);
+		for(size_t i = 0; i < numChroms; i++) chromIdxs[i] = i;
+		std::for_each(std::execution::par, chromIdxs.begin(), chromIdxs.end(), sortChrom);
 	}
 }
 
@@ -2542,9 +2603,13 @@ int main(int argc, char *argv[])
 		 *************************************************************/
 
 		uint32_t* order = (uint32_t*) malloc(totalReads * sizeof(uint32_t));
+		// chromStart[ci] = start offset in order[] for chromosome ci. Used by
+		// the --sort b per-chrom radix path; harmless overhead otherwise.
+		std::vector<size_t> chromStart(chroms.size() + 1, 0);
 		size_t oi = 0;
 		for(uint32_t ci = 0; ci < (uint32_t)chroms.size(); ci++)
 		{
+			chromStart[ci] = oi;
 			string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 			uint32_t curr = cit->second.lastRead;
 			while(curr)
@@ -2555,11 +2620,17 @@ int main(int argc, char *argv[])
 				curr = nxt;
 			}
 		}
+		chromStart[chroms.size()] = oi;
 
-		// Both 1-thread and N-thread paths go through sortIndicesDispatch which
-		// picks the templated comparator at compile time and chooses serial vs
-		// std::execution::par based on numThreads.
-		sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
+		// --sort s and --sort 5 use a global radix sort over packed
+		// (chrIdx, pos) 64-bit keys. --sort b's three keys (chrIdx, beg, end)
+		// don't fit in 64 bits without lossy squeezing, so it goes through
+		// the per-chrom radix path which sorts each chromosome's slice of
+		// order[] independently with a (beg, end) 64-bit key.
+		if(sortMode == 'b')
+			sortIndicesPerChromB(order, chromStart, reads, numThreads);
+		else
+			sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
 
 		if(fCollapse)
 		{

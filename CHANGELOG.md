@@ -4,6 +4,25 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.11] — 2026-04-30
+
+### Changed
+- **`--sort b` in the classic path now uses per-chromosome LSD radix sort
+  instead of comparator-based `std::sort`.** The packed (chrIdx, beg, end)
+  key is 96 bits — too wide for `radixSort64` — but within a single
+  chromosome it's just (beg, end) which fits cleanly in 64 bits. The
+  dispatcher tracks chromosome boundaries when populating `order[]`, then
+  for `--sort b` calls `sortIndicesPerChromB`, which sorts each chrom's
+  slice with the existing `radixSort64`. Chromosomes are processed in
+  parallel via `std::for_each(par)` at `-t > 1`; serial radix per chrom.
+  - Below `RADIX_SORT_THRESHOLD` (100 k) per chrom: falls through to
+    `std::sort` with the existing `ReadCmp<'b'>` comparator.
+- Measured at 10M reads, `--sort b`:
+  - `-t 1`: 3.94 s → **2.30 s (-42%)**
+  - `-t 8`: 1.77 s → **1.70 s (-4%)**
+- Output verified byte-identical to the `std::sort`-based path on the same
+  fixture.
+
 ## [3.0.10] — 2026-04-30
 
 ### Changed
