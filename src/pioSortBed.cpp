@@ -154,13 +154,17 @@ const int kWeightBufSize = 256;
 // trade-off vs. the --low-mem-ssd path. Override via --max-mem=N[GMK].
 static constexpr size_t kDefaultBucketChromBudget = 4ULL * 1024 * 1024 * 1024;
 
-// Hybrid sort strategy cutoff: files with fewer than this many reads use
-// classic O(n log n) comparison sort (std::sort on an index array).
-// Larger files use bucket/counting sort which is O(n + m) where m = max
-// chromosome length.  Bucket sort allocates a chromTable[maxChrLen] array
-// (up to 4 GB), so the classic path saves memory for smaller files while
-// bucket sort wins on throughput for large genomic datasets.
-const int defaultBucketCutoff = 50000000;
+// Hybrid sort strategy cutoff (within the classic path): files with fewer
+// than this many reads use index-array std::sort (O(n log n)). Larger files
+// use bucket/counting sort (O(n + m) where m = max chromosome coordinate).
+// Bucket sort allocates a chromTable[maxChrLen] array (up to 4 GB) on each
+// thread, so it's RAM-hungry; the classic path is mostly used for small
+// inputs anyway since --low-mem-ssd is faster and lighter at scale.
+//
+// The 200M default is conservative — std::sort beats bucket on the headline
+// 200M-row fixture at -t 1 even though bucket has better asymptotic
+// complexity. --bucket-cutoff at runtime lets users force either.
+const int defaultBucketCutoff = 200000000;
 
 
 // Arena allocator for line/weight strings.

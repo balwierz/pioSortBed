@@ -24,7 +24,7 @@ pioSortBed has two sort paths:
 - **Classic path (the default when `--low-mem-ssd` isn't set)** holds the
   whole input in a `seqread[]` array and uses an internal hybrid:
   - `std::sort` on an index array (O(n log n)) below `--bucket-cutoff`
-    reads (default 50 M).
+    reads (default 200 M).
   - Bucket / counting sort (O(n + m), where *m* = max chromosome
     coordinate) at and above the cutoff. Multi-threaded bucket sort
     allocates a per-chromosome `chromTable` slab on each worker — fast
@@ -80,7 +80,7 @@ pioSortBed [options] -   # read from standard input
 | `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
 | `--low-mem-ssd` | Low-memory two-pass file mode (SSD-friendly). Slower than default, but lower peak RAM. Requires file input (not stdin or gzip). |
-| `--bucket-cutoff N` | Use bucket sort for files with ≥N reads (default: 50M; 0 = always bucket sort) |
+| `--bucket-cutoff N` | Use bucket sort for files with ≥N reads (default: 200M; 0 = always bucket sort) |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
 | `--max-mem=N[GMK]` | Memory budget for the parallel bucket-sort path (e.g. `4G`, `500M`). Caps concurrent per-chromosome `chromTable` allocations so peak RAM stays within budget. Default: no cap. |
 | `-h` / `--help` | Show help message |
@@ -296,7 +296,7 @@ lower peak RSS — see the [`--max-mem` sweep section](#--max-mem-budget-sweep-p
 above).
 
 **Classic path** (default, no `--low-mem-ssd`):
-- Below `--bucket-cutoff` reads (default 50 M): index-array `std::sort`,
+- Below `--bucket-cutoff` reads (default 200 M): index-array `std::sort`,
   O(n log n). `-t 1` uses an inlined comparator; `-t > 1` uses
   `std::sort(std::execution::par, ...)` over TBB.
 - At and above the cutoff: bucket/counting sort, O(n + m) where m = max
@@ -368,7 +368,7 @@ state (also visible via `pioSortBed --help`):
 | Read count                 | uint32_t indices ⇒ ≤ 4.29 B reads (all sort paths) |
 | Per-chromosome bucket-sort RAM | Default 4 GB; overridden by `--max-mem N[GMK]` |
 | BED score field length (col 5) | 255 bytes; over-long values rejected with a clear error |
-| Hybrid sort cutoff (classic vs. bucket) | Default 50 M reads; overridden by `--bucket-cutoff N` |
+| Hybrid sort cutoff (classic vs. bucket) | Default 200 M reads; overridden by `--bucket-cutoff N` |
 
 Above 2.15 Gbp per single coordinate, you'd need to widen `int beg, int end`
 in `seqread` / `lowMemNode` to `int64_t` and rebuild. Above 4.29 B reads,

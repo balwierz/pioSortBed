@@ -4,6 +4,18 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.9] — 2026-04-30
+
+### Changed
+- **`defaultBucketCutoff` raised from 50 M to 200 M reads.** The classic
+  path now uses `std::sort` for inputs up to 200 M reads, switching to
+  bucket sort only above that. Empirically, the 50 M crossover was
+  pessimistic at -t 1 (bucket pays a per-chromosome scan proportional to
+  max coordinate that overwhelms its asymptotic edge until well past
+  50 M). At -t 4 / -t 8 bucket still wins at 50 M, but those are not
+  the recommended path anymore — `--low-mem-ssd -t N` beats both at
+  every size from ~5 M up. `--bucket-cutoff N` at runtime overrides.
+
 ## [3.0.8] — 2026-04-30
 
 ### Changed
