@@ -4,6 +4,22 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.1] — 2026-04-30
+
+### Changed
+- **`--low-mem-ssd` node table shrunk from 24 B to 16 B per read** by dropping
+  the cached `end` field. The default `--sort s` and `--collapse` modes never
+  needed it; `--sort 5` already re-parses for strand and pulls `end` out of
+  that same call for free; `--sort b` now re-parses `end` from the line
+  (one tab-scan + atoi per read in pass 2 — cheap).
+  - 50M reads: ~0.4 GB saved on the node table (1.2 GB → 0.8 GB)
+  - 200M reads: ~1.6 GB saved (4.8 GB → 3.2 GB)
+  - As a bonus, the smaller cache footprint speeds pass 2 up: 20M-read
+    `--low-mem-ssd -t 1` measured at 5.46 s / 1.18 GB (was 6.39 s / 1.30 GB
+    in v3.0.0) — ~15% faster, ~9% lower peak RSS at the same input.
+
+---
+
 ## [2.2.0] — 2026-04-29
 
 ### Added

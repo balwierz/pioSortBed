@@ -379,19 +379,21 @@ static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
 //   off  — byte offset of the line's start within the mmap (size_t so files
 //          can exceed 4 GB; ~100M+ reads).
 //   next — index of the next node in this chromosome's linked list (0 = end).
-//   beg, end — pre-parsed BED start/end coordinates. Storing them here lets
-//          pass 2 sort and emit without re-parsing the line; the only modes
-//          that still need a re-read are --sort 5 (strand) and --collapse
-//          (weight), each of which consults a single field.
+//   beg  — pre-parsed BED start coordinate. The default --sort s mode and
+//          --collapse only need beg, so caching it lets those modes sort
+//          and emit without re-parsing the line. --sort b re-parses end
+//          on demand (cheap: one tab-scan + atoi per read in pass 2).
+//          --sort 5 already re-parses for strand, and pulls end out of
+//          that same parse for free.
 //
-// 24 bytes / node (size_t alignment forces 4 B padding after the trailing
-// int). 50M reads cost ~1.2 GB of node table; 200M reads cost ~4.8 GB.
+// 16 bytes / node — exactly aligned, no padding. 50M reads cost ~0.8 GB of
+// node table; 200M reads cost ~3.2 GB (down from ~4.8 GB before end was
+// dropped).
 struct lowMemNode
 {
 	size_t off;
 	int next;
 	int beg;
-	int end;
 };
 
 // Natural (version-sort) comparison for chromosome names.
@@ -586,9 +588,9 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 						exit(1);
 					}
 
+					(void)lineEnd;  // parsed for validation only; end isn't cached
 					nodes[idx].off = (size_t)(linePtr - mmapBase);
 					nodes[idx].beg = beg;
-					nodes[idx].end = lineEnd;
 
 					if(thisIt != chrMap.end() &&
 					   (int)thisIt->first.size() == chrLen &&
@@ -731,10 +733,10 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				nodes = tmp;
 			}
 
+			(void)end;  // parsed for validation only; end isn't cached in lowMemNode
 			nodes[nodeCount].off = (size_t)(linePtr - mmapBase);
 			nodes[nodeCount].next = thisChrIt->second.lastRead;
 			nodes[nodeCount].beg = beg;
-			nodes[nodeCount].end = end;
 			thisChrIt->second.lastRead = nodeCount;
 			nodeCount++;
 		}
@@ -759,9 +761,11 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	// Pass 2 accesses lines in chromosome-sorted order (not file order).
 	madvise(mmapBase, mmapSize, MADV_RANDOM);
 
-	// Pass 2: for each chromosome, sort by configured key and print. Most modes
-	// don't re-parse — beg/end live in nodes[]. Only --sort 5 (needs strand)
-	// and --collapse (needs weight) read one extra field per line.
+	// Pass 2: for each chromosome, sort by configured key and print. The
+	// default --sort s and --collapse modes don't re-parse — only beg lives
+	// in nodes[] and that's all they need. --sort b re-parses end on demand.
+	// --sort 5 (needs strand) and --collapse (needs weight) read one extra
+	// field per line, and --sort 5 reuses that parse to pull end out for free.
 	//
 	// At -t > 1 the per-chrom work runs in parallel via std::for_each(par, ...);
 	// each chromosome writes to an open_memstream buffer and waits at a
@@ -865,7 +869,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					cerr << "Error in parsing line: " << linePtr << endl;
 					return 1;
 				}
-				int pos = (strandChar == '-') ? nodes[idx].end : nodes[idx].beg;
+				int pos = (strandChar == '-') ? dummy_end : nodes[idx].beg;
 				kp.emplace_back(pos, idx);
 			}
 			std::sort(kp.begin(), kp.end());
@@ -877,12 +881,33 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			return 0;
 		}
 
-		// --sort s and --sort b: copy {beg, end, off} into a contiguous
-		// 12-byte sort-rec for cache-friendly sort, then emit by .off.
+		// --sort s and --sort b: copy into a contiguous sort-rec for
+		// cache-friendly sort, then emit by .off. --sort s leaves .end
+		// uninitialised (cmpSB doesn't read it). --sort b re-parses end
+		// from the line for the secondary sort key.
 		vector<SortRecSB> sr;
 		sr.reserve(nodeIdx.size());
-		for(int idx : nodeIdx)
-			sr.push_back({nodes[idx].beg, nodes[idx].end, nodes[idx].off});
+		if(sortMode == 'b')
+		{
+			for(int idx : nodeIdx)
+			{
+				const char* linePtr = mmapBase + nodes[idx].off;
+				const char* dchrPtr; int dchrLen;
+				int dbeg = 0, lineEnd = 0;
+				const char* dtailPtr = "";
+				if(parseBedLine3(linePtr, &dchrPtr, &dchrLen, &dbeg, &lineEnd, &dtailPtr) < 3)
+				{
+					cerr << "Error in parsing line: " << linePtr << endl;
+					return 1;
+				}
+				sr.push_back({nodes[idx].beg, lineEnd, nodes[idx].off});
+			}
+		}
+		else
+		{
+			for(int idx : nodeIdx)
+				sr.push_back({nodes[idx].beg, 0, nodes[idx].off});
+		}
 
 		auto cmpSB = [sortMode](const SortRecSB& a, const SortRecSB& b) {
 			if(sortMode == 'b')
