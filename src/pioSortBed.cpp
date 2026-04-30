@@ -132,9 +132,11 @@ public:
 
 typedef ChrNameMap<chrInfoT> string2chrInfoT;
 
-const int lineBufSize = 1024;		// buffer for the read file lines (stdin path only; mmap has no line length limit)
-const int chrNameBufSize = 256;		// buffer for chromosome names like "chr1_random"
-									// (also used for the BED weight field's stack buffer)
+// Stack buffer used for the BED weight / RAL weight field (field 4 in BED,
+// field 5 in RAL). Real weights are short numeric strings; 256 B is generous.
+// On overflow, copyField returns 0 and the parser errors with a clear message
+// rather than silently truncating.
+const int kWeightBufSize = 256;
 
 // Default per-allocation budget for the bucket-sort path's chromTable when
 // `--max-mem` isn't set. 4 GB matches the previous fixed chrLenLimit of
@@ -224,13 +226,24 @@ static inline int parseUInt(const char** pp)
 	return val;
 }
 
+// Copy a field into dst (NUL-terminated). Returns the number of bytes
+// written, or -1 if the field would not fit in dstMax (caller errors).
+// Always advances *pp past the trailing separator (or to EOL/EOF).
 static inline int copyField(const char** pp, char* dst, int dstMax)
 {
 	const char* p = *pp;
 	int n = 0;
 	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n')
 	{
-		if (n < dstMax - 1) dst[n++] = *p;
+		if (n >= dstMax - 1) {
+			// Overflow: skip the rest of the field so *pp lands on the
+			// separator, but signal failure to the caller.
+			while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
+			if (*p == '\t' || *p == ' ') p++;
+			*pp = p;
+			return -1;
+		}
+		dst[n++] = *p;
 		p++;
 	}
 	dst[n] = '\0';
@@ -264,7 +277,8 @@ static inline int parseBedLine3(const char* buf,
 	return 3;
 }
 
-// Full BED parser: chr, beg, end, weight (field 4), strand (field 5).
+// Full BED parser: chr (col 1), beg (col 2), end (col 3), weight (col 5,
+// the score), strand (col 6). Col 4 (name) is skipped — never stored.
 static inline int parseBedLineFull(const char* buf,
                                    const char** chrPtr, int* chrLen,
                                    int* beg, int* end,
@@ -292,24 +306,33 @@ static inline int parseBedLineFull(const char* buf,
 	if (*p != '\t' && *p != ' ') return 3;
 	p++;
 
-	// field 3: id — skip it
+	// col 4 (name) — skip it
 	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
 	if (*p != '\t' && *p != ' ') return 3;
 	p++;
 
-	// field 4: weight
+	// col 5 (score, used as weight by --collapse): stack buffer, over-long
+	// values rejected by copyField (BED scores are spec'd 0..1000 = at most
+	// 4 chars; 255 B is a generous ceiling for non-spec extensions).
 	int n = copyField(&p, weightBuf, weightMax);
 	if (n == 0) return 3;
+	if (n < 0) {
+		fprintf(stderr, "Error: BED score field (column 5) exceeds %d bytes in: %s\n",
+		        weightMax - 1, buf);
+		exit(1);
+	}
 
-	// field 5: strand — copyField already consumed the tab before this field
+	// col 6 (strand) — copyField already consumed the tab before this field
 	if (!*p || *p == '\r' || *p == '\n') return 4;
 	*strandChar = *p;
 	return 5;
 }
 
-// RAL line parser.
+// RAL line parser. Records chr as pointer+length into the line buffer
+// (caller owns the buffer; no copy / no fixed length limit) — same pattern
+// parseBedLine3/parseBedLineFull use for chr.
 static int parseRalLine(const char* buf,
-                        char* chr, int chrMax,
+                        const char** chrPtr, int* chrLen,
                         int* beg, int* end,
                         char* weightBuf, int weightMax,
                         char* strandChar)
@@ -318,8 +341,13 @@ static int parseRalLine(const char* buf,
 
 	if (!skipField(&p)) return 0;
 
-	int n = copyField(&p, chr, chrMax);
-	if (n == 0) return 0;
+	// Field 2 (chr) — record pointer+length; no copying, no limit.
+	*chrPtr = p;
+	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
+	*chrLen = (int)(p - *chrPtr);
+	if (*chrLen == 0) return 0;
+	if (*p != '\t' && *p != ' ') return 0;
+	p++;
 
 	*strandChar = *p;
 	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
@@ -337,8 +365,13 @@ static int parseRalLine(const char* buf,
 
 	if (*p != '\t' && *p != ' ') return 3;
 	p++;
-	n = copyField(&p, weightBuf, weightMax);
+	int n = copyField(&p, weightBuf, weightMax);
 	if (n == 0) return 3;
+	if (n < 0) {
+		fprintf(stderr, "Error: RAL weight field exceeds %d bytes in: %s\n",
+		        weightMax - 1, buf);
+		exit(1);
+	}
 
 	return 5;
 }
@@ -658,19 +691,16 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					const char* chrPtr;
 					int chrLen;
 					char strandChar = '+';
-					char weight[chrNameBufSize];
+					char weight[kWeightBufSize];
 					weight[0] = '0'; weight[1] = '\0';
 					const char* tailPtr = "";
-					char chrBuf[chrNameBufSize];
 					int numArgsRead;
 
 					if(fRal)
 					{
-						numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-						                           &beg, &lineEnd, weight, chrNameBufSize,
+						numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
+						                           &beg, &lineEnd, weight, kWeightBufSize,
 						                           &strandChar);
-						chrPtr = chrBuf;
-						chrLen = (int)strlen(chrBuf);
 					}
 					else
 					{
@@ -779,19 +809,16 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			int beg = 0;
 			int end = 0;
 			char strandChar = '+';
-			char weight[chrNameBufSize];
+			char weight[kWeightBufSize];
 			weight[0] = '0'; weight[1] = '\0';
 			const char* tailPtr = "";
-			char chrBuf[chrNameBufSize];
 			int numArgsRead;
 
 			if(fRal)
 			{
-				numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-				                           &beg, &end, weight, chrNameBufSize,
+				numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
+				                           &beg, &end, weight, kWeightBufSize,
 				                           &strandChar);
-				chrPtr = chrBuf;
-				chrLen = (int)strlen(chrBuf);
 			}
 			else
 			{
@@ -908,20 +935,19 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			{
 				uint32_t idx = nodeIdx[i];
 				const char* linePtr = mmapBase + nodes[idx].off;
-				char weight[chrNameBufSize];
+				char weight[kWeightBufSize];
 				weight[0] = '0'; weight[1] = '\0';
 				int dummy_beg = 0, dummy_end = 0;
 				char dummy_str = '+';
 				const char* chrPtr; int chrLen;
 				const char* tailPtr = "";
-				char chrBuf[chrNameBufSize];
 				int n;
 				if(fRal)
-					n = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-					                 &dummy_beg, &dummy_end, weight, chrNameBufSize, &dummy_str);
+					n = parseRalLine(linePtr, &chrPtr, &chrLen,
+					                 &dummy_beg, &dummy_end, weight, kWeightBufSize, &dummy_str);
 				else
 					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
-					                     weight, chrNameBufSize, &dummy_str, &tailPtr);
+					                     weight, kWeightBufSize, &dummy_str, &tailPtr);
 				if(n < 3)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
@@ -966,17 +992,16 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				const char* linePtr = mmapBase + nodes[idx].off;
 				char strandChar = '+';
 				int dummy_beg = 0, dummy_end = 0;
-				char weight[chrNameBufSize]; weight[0] = '0'; weight[1] = '\0';
+				char weight[kWeightBufSize]; weight[0] = '0'; weight[1] = '\0';
 				const char* chrPtr; int chrLen;
 				const char* tailPtr = "";
-				char chrBuf[chrNameBufSize];
 				int n;
 				if(fRal)
-					n = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-					                 &dummy_beg, &dummy_end, weight, chrNameBufSize, &strandChar);
+					n = parseRalLine(linePtr, &chrPtr, &chrLen,
+					                 &dummy_beg, &dummy_end, weight, kWeightBufSize, &strandChar);
 				else
 					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
-					                     weight, chrNameBufSize, &strandChar, &tailPtr);
+					                     weight, kWeightBufSize, &strandChar, &tailPtr);
 				if(n < 5)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
@@ -1583,7 +1608,11 @@ static void parseLines(
 {
 	char* mmapCur = mmapBase;
 	char* mmapLim = mmapBase + mmapSize;
-	char stdinBuf[lineBufSize];
+	// getline() reuses and grows this buffer across calls, so there's no
+	// fixed line-length limit on the stdin/gzip path. Only allocated when
+	// UseMmap is false; freed at end of function.
+	char* lineBuf = NULL;
+	size_t lineBufCap = 0;
 	const bool needExtra = fRal || fCollapse || (sortMode == '5');
 
 	while(1)
@@ -1608,13 +1637,14 @@ static void parseLines(
 		}
 		else
 		{
-			if(!fgets_unlocked(stdinBuf, lineBufSize, fh)) break;
-			linePtr = stdinBuf;
-			size_t len = strlen(linePtr);
-			if (len >= 2 && linePtr[len-2] == '\r' && linePtr[len-1] == '\n')
-				{ linePtr[len-2] = '\0'; }
-			else if (len >= 1 && linePtr[len-1] == '\n')
-				{ linePtr[len-1] = '\0'; }
+			ssize_t glen = getline(&lineBuf, &lineBufCap, fh);
+			if(glen == -1) break;  // EOF or error
+			linePtr = lineBuf;
+			// Strip trailing \r\n or \n (getline keeps the newline if present).
+			if(glen >= 2 && lineBuf[glen-2] == '\r' && lineBuf[glen-1] == '\n')
+				lineBuf[glen-2] = '\0';
+			else if(glen >= 1 && lineBuf[glen-1] == '\n')
+				lineBuf[glen-1] = '\0';
 		}
 
 		// Pass through BED header lines (track/browser/# comments) directly.
@@ -1651,9 +1681,8 @@ static void parseLines(
 		int beg = 0;
 		int end = 0;
 		char strandChar = '+';
-		char weight[chrNameBufSize];
+		char weight[kWeightBufSize];
 		weight[0] = '0'; weight[1] = '\0';
-		char chrBuf[chrNameBufSize]; // only used by RAL parser
 		const char* chrPtr;
 		int chrLen;
 		const char* tailPtr = "";
@@ -1661,16 +1690,14 @@ static void parseLines(
 
 		if(fRal)
 		{
-			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-			                           &beg, &end, weight, chrNameBufSize,
+			numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
+			                           &beg, &end, weight, kWeightBufSize,
 			                           &strandChar);
-			chrPtr = chrBuf;
-			chrLen = (int)strlen(chrBuf);
 		}
 		else if(needExtra)
 		{
 			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
-			                              &beg, &end, weight, chrNameBufSize,
+			                              &beg, &end, weight, kWeightBufSize,
 			                              &strandChar, &tailPtr);
 		}
 		else
@@ -1749,6 +1776,7 @@ static void parseLines(
 		}
 		readCount ++;
 	}
+	free(lineBuf);
 }
 
 // ============================================================================
@@ -1818,9 +1846,8 @@ static void parseChunkMmap(char* start, char* end,
 
 		int beg = 0, lineEnd = 0;
 		char strandChar = '+';
-		char weight[chrNameBufSize];
+		char weight[kWeightBufSize];
 		weight[0] = '0'; weight[1] = '\0';
-		char chrBuf[chrNameBufSize];
 		const char* chrPtr;
 		int chrLen;
 		const char* tailPtr = "";
@@ -1828,16 +1855,14 @@ static void parseChunkMmap(char* start, char* end,
 
 		if(fRal)
 		{
-			numArgsRead = parseRalLine(linePtr, chrBuf, chrNameBufSize,
-			                           &beg, &lineEnd, weight, chrNameBufSize,
+			numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
+			                           &beg, &lineEnd, weight, kWeightBufSize,
 			                           &strandChar);
-			chrPtr = chrBuf;
-			chrLen = (int)strlen(chrBuf);
 		}
 		else if(needExtra)
 		{
 			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
-			                               &beg, &lineEnd, weight, chrNameBufSize,
+			                               &beg, &lineEnd, weight, kWeightBufSize,
 			                               &strandChar, &tailPtr);
 		}
 		else
@@ -2125,8 +2150,9 @@ int main(int argc, char *argv[])
 		"Gzip-compressed input (.gz) is transparently decompressed via gzip.\n"
 		"BED header lines (track/browser/#) are passed through unchanged.\n\n"
 		"Compilation-time limits:\n"
-		"  Line length limit: " + to_string(lineBufSize) + " (stdin only; no limit for file input)\n"
-		"  Chromosome name limit: " + to_string(chrNameBufSize) + "\n"
+		"  Line length: no fixed limit (stdin/gzip uses getline; mmap uses memchr).\n"
+		"  Chromosome name: no fixed limit (stored as pointer+length).\n"
+		"  Weight field (BED col 4 / RAL): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
 		"  Bucket-sort path: rejects a chromosome whose chromTable would exceed\n"
 		"    --max-mem (default " + to_string(kDefaultBucketChromBudget >> 30) + " GB); use --low-mem-ssd otherwise.\n"
 		"  Read number limit: " + to_string((unsigned long long)INT32_MAX) + " (classic/bucket path),\n"

@@ -4,6 +4,53 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.5] — 2026-04-30
+
+### Removed
+- **`lineBufSize` compile-time constant** (formerly 1024 bytes). The
+  stdin / gzip path used a fixed-size stack buffer for `fgets_unlocked`,
+  which silently truncated lines longer than 1024 bytes (`fgets` would
+  return the first 1023 bytes, the parser would emit a malformed read,
+  and the next `fgets` would resume mid-field as if it were a fresh
+  line — no error, just corrupt output).
+- **`chrNameBufSize` (256-byte chr-name buffer in `parseRalLine`).** RAL
+  inputs with a chr name >255 bytes were silently truncated by
+  `copyField`, which could collapse two distinct chromosomes into the
+  same "lookup key" and merge their reads. BED inputs were already fine
+  (chr is recorded as pointer+length into the line, no copy, no limit).
+
+### Changed
+- **stdin / gzip parser uses `getline()`** with a heap buffer that grows
+  as needed; reused across calls and freed at end of `parseLines`. No
+  fixed line-length limit on either input path now (mmap was already
+  unlimited via `memchr`).
+- **`parseRalLine` now records chr as `(chrPtr, chrLen)` into the line
+  buffer** instead of copying into a caller-provided fixed buffer —
+  matches the pattern `parseBedLine3` / `parseBedLineFull` already used
+  for BED. All five callsites updated; the per-iteration
+  `char chrBuf[256]` declarations are gone.
+- **`copyField` now returns -1 on overflow** instead of silently
+  truncating. `parseBedLineFull` and `parseRalLine` propagate that as a
+  clear error message naming the offending field, the cap, and the
+  input line.
+- The 256-byte stack buffer is kept for the BED *score* field (col 5)
+  and the RAL weight field, renamed to `kWeightBufSize` for clarity.
+  Real scores are 0..1000 (≤4 chars) so 255 B is a generous ceiling
+  for non-spec extensions.
+- `--help` updated:
+  - "Line length: no fixed limit (stdin/gzip uses getline; mmap uses memchr)."
+  - "Chromosome name: no fixed limit (stored as pointer+length)."
+  - "Weight field: 255 B; over-long values are rejected with an error."
+
+### Verified
+- 5000-char `name` field on stdin: round-trips through both stdin and
+  mmap paths.
+- 504-char chr name: sorted correctly via both BED and `--low-mem-ssd`
+  paths.
+- 300-char score field: rejected with `"Error: BED score field
+  (column 5) exceeds 255 bytes in: ..."` and exit 1, instead of silent
+  truncation.
+
 ## [3.0.4] — 2026-04-30
 
 ### Removed
