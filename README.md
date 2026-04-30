@@ -135,7 +135,7 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 ![Wall time comparison (log-log)](benchmark/benchmark_time.png)
 
-![Wall time comparison (both axes linear)](benchmark/benchmark_time_linear.png)
+![Wall time comparison (log-x, linear-y)](benchmark/benchmark_time_linear.png)
 
 #### Legend (colour & line style):
 
@@ -205,7 +205,7 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
 
 ![Peak memory usage (log-log)](benchmark/benchmark_memory.png)
 
-![Peak memory usage (both axes linear)](benchmark/benchmark_memory_linear.png)
+![Peak memory usage (log-x, linear-y)](benchmark/benchmark_memory_linear.png)
 
 | Reads | pio 1t  | pio 4t   | pio 8t      | pio lm 1t  | pio lm 4t | pio lm 8t | sort 1t  | sort 4t  | sort 8t | bedtools | bedops   |
 |------:|--------:|---------:|------------:|-----------:|----------:|----------:|---------:|---------:|--------:|---------:|---------:|

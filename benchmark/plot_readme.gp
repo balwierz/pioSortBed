@@ -74,19 +74,23 @@ plot 'benchmark_readme.csv' \
     '' using 1:23 with linespoints ls 11 title 'bedops sort-bed'
 
 # ============================================================================
-# Linear-linear plots (both axes linear)
+# Log-x / linear-y plots
+# ----------------------------------------------------------------------------
+# Read counts span 4 decades (10k - 200M) so they need a log x-axis to be
+# legible. The y-axis is linear so absolute differences read correctly:
+# tools that look "close" on log-y can be 10x apart in real wall time.
 # ============================================================================
-unset logscale x
+# x-axis log scale already set above; y is what changes
 unset logscale y
 set format x '%.0s%c'
 set format y '%.0s%c'
-set xrange [0:*]
+set xrange [1e4:]
 set yrange [0:*]
 set key top left
 
-# --- Wall time (linear) ---
+# --- Wall time (log-x, linear-y) ---
 set output 'benchmark_time_linear.png'
-set title "Wall time (linear)" font ',24'
+set title "Wall time (log-x, linear-y)" font ',24'
 set ylabel 'Wall time (ms)' font ',22'
 
 plot 'benchmark_readme.csv' \
@@ -102,9 +106,9 @@ plot 'benchmark_readme.csv' \
     '' using 1:11 with linespoints ls 10 title 'bedtools sort', \
     '' using 1:12 with linespoints ls 11 title 'bedops sort-bed'
 
-# --- Peak memory (linear) ---
+# --- Peak memory (log-x, linear-y) ---
 set output 'benchmark_memory_linear.png'
-set title "Peak memory (RSS, linear)" font ',24'
+set title "Peak memory (RSS, log-x, linear-y)" font ',24'
 set ylabel 'Peak RSS (MB)' font ',22'
 
 plot 'benchmark_readme.csv' \
