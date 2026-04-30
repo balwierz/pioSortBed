@@ -90,7 +90,9 @@ Per chromosome, scatter reads into `chromTable[chosenPosition]` (a sparse array 
 
 ## Memory profile
 
-See the README's "Peak Memory (RSS)" section for measurements at 12 sizes (10k–50M) across all configurations. Quick reference at 50M reads:
+See the README's "Peak Memory (RSS)" section for measurements at 14 sizes (10k–200M) across all configurations. Quick reference at 50M reads:
 
-- `-t 1` (any sort mode): ~4.1 GB peak (mostly mmap input + reads array; classic sort doesn't allocate per-chromosome scratch).
-- `-t 8` (bucket sort): ~12.6 GB peak — per-thread `chromTable` slabs sized to each chromosome's max coord, plus queued per-chromosome output buffers. Use `--max-mem=4G` to cap this at ~8.6 GB (~32% reduction) for ~28% wall-time cost, or `--low-mem-ssd` for a flat ~3.0 GB ceiling at the cost of being a bit slower than `-t 8` overall.
+- `-t 1` (classic, any sort mode): ~4.1 GB peak (mostly mmap input + reads array; classic sort doesn't allocate per-chromosome scratch).
+- `-t 8` (classic, bucket sort): ~12.6 GB peak — per-thread `chromTable` slabs sized to each chromosome's max coord, plus queued per-chromosome output buffers. Use `--max-mem=4G` to cap the table allocations.
+- `--low-mem-ssd -t 1`: ~3.3 GB peak — lowest-RAM pioSortBed mode. Two-pass file-only path with a 24-byte node table per read instead of per-chromosome scratch.
+- `--low-mem-ssd -t 8`: ~5.7 GB peak. Both passes parallel; cheaper than classic `-t 8` on both wall time AND memory at 50M+. Recommended fast path. Add `--max-mem=4G` at 100M+ inputs so the per-chromosome buffer queue can't blow past available RAM.

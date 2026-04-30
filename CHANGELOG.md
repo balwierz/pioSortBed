@@ -249,6 +249,16 @@ faster than bedops**, and **14.5× faster than GNU sort 1t** at 200M.
   parallelism. Without the cap, peak RSS at -t 0 (22 cores) on this fixture
   would push past 30 GB and risk OOM.
 
+> **Post-3.0.0 doc update (2026-04-30):** the `pio-lm` row above was
+> measured with the default thread count (= all cores, 22 on the bench box),
+> while the rest of the table compared `-t 1` and `-t 8` configs. The
+> README and `benchmark/benchmark_readme.csv` were since re-measured with
+> explicit `-t 1` and `-t 8` low-mem variants for an apples-to-apples
+> comparison. The 22-thread `pio-lm` numbers above are kept here as
+> historical record; the README values supersede them. Headlines after
+> the re-measurement: `pio-lm -t 8` at 200M is **35.16 s** (3.0× GNU sort
+> 8t, 4.4× bedops, 9.3× GNU sort 1t).
+
 ---
 
 ## [Unreleased]
