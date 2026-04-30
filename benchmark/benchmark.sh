@@ -178,7 +178,7 @@ SORT_BUF="80%"
 
 # CSV output for plotting
 CSV_FILE="$SCRIPT_DIR/benchmark_results.csv"
-echo "reads,pio1_ms,pio1_kb,pio8_ms,pio8_kb,pio_lm_ms,pio_lm_kb,sort1_ms,sort1_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
+echo "reads,pio1_ms,pio1_kb,pio8_ms,pio8_kb,pio_lm1_ms,pio_lm1_kb,pio_lm8_ms,pio_lm8_kb,sort1_ms,sort1_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
 
 SEP="%-10s"
 HDR_TIME="  %14s"
@@ -190,7 +190,8 @@ ROW_MEM="  %10s"
 printf "$SEP" "Reads"
 printf "$HDR_TIME$HDR_MEM" "pio-1t" "RSS"
 printf "$HDR_TIME$HDR_MEM" "pio-8t" "RSS"
-printf "$HDR_TIME$HDR_MEM" "pio-lm" "RSS"
+printf "$HDR_TIME$HDR_MEM" "pio-lm-1t" "RSS"
+printf "$HDR_TIME$HDR_MEM" "pio-lm-8t" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-1t" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-8t" "RSS"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "bedtools" "RSS"
@@ -201,7 +202,8 @@ echo ""
 printf "$SEP" "-----"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
-printf "$HDR_TIME$HDR_MEM" "------" "---"
+printf "$HDR_TIME$HDR_MEM" "---------" "---"
+printf "$HDR_TIME$HDR_MEM" "---------" "---"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "--------" "---"
@@ -249,22 +251,22 @@ for n in "${SIZES[@]}"; do
         cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
     fi
 
-    # --- pioSortBed low-memory SSD mode (default thread count = all cores).
-    # At huge sizes, cap concurrent per-chromosome buffers via --max-mem so
-    # default-thread-count parallelism can't blow past available RAM. ---
-    # TODO(next round): pio-lm is currently measured at the default thread
-    # count (= all cores, e.g. 22 on this box) while pio-1t/pio-8t and
-    # sort-1t/sort-8t use explicit -t 1 / -t 8 / --parallel=1 / --parallel=8.
-    # That's an apples-to-oranges comparison. Next benchmark round, run
-    # pio-lm at -t 1 and -t 8 explicitly (two columns, same as the regular
-    # pio path) so the table is internally consistent.
+    # --- pioSortBed low-memory SSD mode at -t 1 and -t 8 (apples-to-apples
+    # with pio-1t/pio-8t and sort-1t/sort-8t). At -t 1 only one chromTable is
+    # in flight, so --max-mem isn't needed. At -t 8 with huge inputs we cap
+    # concurrent per-chromosome buffers so the producer queue can't blow past
+    # available RAM. ---
+    bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE"
+    pio_lm1_ms=$RESULT_MS; pio_lm1_kb=$RESULT_KB
+    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm1_out.txt"
+
     if (( BENCH_BIG )); then
-        bench_one "pio-lm" "$PIO" --low-mem-ssd --max-mem=4G "$BENCH_FILE"
+        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE"
     else
-        bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
+        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE"
     fi
-    pio_lm_ms=$RESULT_MS; pio_lm_kb=$RESULT_KB
-    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm_out.txt"
+    pio_lm8_ms=$RESULT_MS; pio_lm8_kb=$RESULT_KB
+    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm8_out.txt"
 
     # --- GNU sort single-threaded ---
     sort1_ms=0; sort1_kb=0
@@ -300,7 +302,7 @@ for n in "${SIZES[@]}"; do
     match="-"
     if (( VERIFY )); then
         match="OK"
-        for tool in pio1 pio8 pio_lm bt bo; do
+        for tool in pio1 pio8 pio_lm1 pio_lm8 bt bo; do
             outfile="$TMPDIR/${tool}_out.txt"
             [[ -f "$outfile" ]] || continue
             awk -F'\t' '{print $1"\t"$2}' "$outfile" > "$TMPDIR/${tool}_keys.txt"
@@ -320,7 +322,8 @@ for n in "${SIZES[@]}"; do
     printf "$SEP" "$(fmt_reads $n)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio1_ms)" "$(fmt_size $pio1_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio8_ms)" "$(fmt_size $pio8_kb)"
-    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm_ms)" "$(fmt_size $pio_lm_kb)"
+    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm1_ms)" "$(fmt_size $pio_lm1_kb)"
+    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm8_ms)" "$(fmt_size $pio_lm8_kb)"
     if (( HAS_SORT )); then
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort1_ms)" "$(fmt_size $sort1_kb)"
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort8_ms)" "$(fmt_size $sort8_kb)"
@@ -335,7 +338,7 @@ for n in "${SIZES[@]}"; do
     echo ""
 
     # Write CSV row
-    echo "$n,$pio1_ms,$pio1_kb,$pio8_ms,$pio8_kb,$pio_lm_ms,$pio_lm_kb,$sort1_ms,$sort1_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
+    echo "$n,$pio1_ms,$pio1_kb,$pio8_ms,$pio8_kb,$pio_lm1_ms,$pio_lm1_kb,$pio_lm8_ms,$pio_lm8_kb,$sort1_ms,$sort1_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
 
     # Clean up large files between runs
     rm -f "$BENCH_FILE" "$TMPDIR"/*.txt
@@ -352,14 +355,16 @@ echo "(values >1x mean pioSortBed-8t is faster)"
 echo ""
 
 printf "%-10s  %8s" "Reads" "vs pio1"
-printf "  %8s" "vs pio-lm"
+printf "  %12s" "vs pio-lm-1t"
+printf "  %12s" "vs pio-lm-8t"
 (( HAS_SORT ))     && printf "  %8s" "vs sort1"
 (( HAS_SORT ))     && printf "  %8s" "vs sort8"
 (( HAS_BEDTOOLS )) && printf "  %8s" "vs bt"
 (( HAS_BEDOPS ))   && printf "  %8s" "vs bo"
 echo ""
 printf "%-10s  %8s" "-----" "-------"
-printf "  %8s" "---------"
+printf "  %12s" "------------"
+printf "  %12s" "------------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_BEDTOOLS )) && printf "  %8s" "-----"
@@ -383,10 +388,11 @@ for n in "${SIZES[@]}"; do
     if (( ! BENCH_BIG )); then
         bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
     fi
+    bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE";  pio_lm1_ms=$RESULT_MS
     if (( BENCH_BIG )); then
-        bench_one "pio-lm" "$PIO" --low-mem-ssd --max-mem=4G "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
+        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
     else
-        bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
+        bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
     fi
 
     sort1_ms=0; sort8_ms=0; bt_ms=0; bo_ms=0
@@ -408,14 +414,16 @@ for n in "${SIZES[@]}"; do
     printf "%-10s" "$(fmt_reads $n)"
     if (( pio8_ms > 0 )); then
         printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $pio1_ms / $pio8_ms }")"
-        printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $pio_lm_ms / $pio8_ms }")"
+        printf "  %12s" "$(awk "BEGIN { printf \"%.2fx\", $pio_lm1_ms / $pio8_ms }")"
+        printf "  %12s" "$(awk "BEGIN { printf \"%.2fx\", $pio_lm8_ms / $pio8_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort1_ms / $pio8_ms }")"
         (( HAS_SORT ))     && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $sort8_ms / $pio8_ms }")"
         (( HAS_BEDTOOLS )) && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bt_ms / $pio8_ms }")"
         (( HAS_BEDOPS ))   && printf "  %8s" "$(awk "BEGIN { printf \"%.2fx\", $bo_ms / $pio8_ms }")"
     else
         printf "  %8s" "inf"
-        printf "  %8s" "inf"
+        printf "  %12s" "inf"
+        printf "  %12s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_BEDTOOLS )) && printf "  %8s" "inf"
@@ -455,18 +463,18 @@ echo ""
 # Convert results CSV to README plot format and regenerate PNGs via plot_readme.gp
 # ---------------------------------------------------------------------------
 
-# benchmark_results.csv: 15 cols, time-ms and memory-kb interleaved per tool.
-# benchmark_readme.csv:  15 cols, reads + 7 ms cols + 7 mb cols. Used by plot_readme.gp.
+# benchmark_results.csv: 17 cols, time-ms and memory-kb interleaved per tool.
+# benchmark_readme.csv:  17 cols, reads + 8 ms cols + 8 mb cols. Used by plot_readme.gp.
 README_CSV="$SCRIPT_DIR/benchmark_readme.csv"
 awk -F',' 'BEGIN{OFS=","}
 NR==1 {
-    print "reads,pio1_ms,pio8_ms,piolm_ms,sort1_ms,sort8_ms,bt_ms,bo_ms,pio1_mb,pio8_mb,piolm_mb,sort1_mb,sort8_mb,bt_mb,bo_mb"
+    print "reads,pio1_ms,pio8_ms,piolm1_ms,piolm8_ms,sort1_ms,sort8_ms,bt_ms,bo_ms,pio1_mb,pio8_mb,piolm1_mb,piolm8_mb,sort1_mb,sort8_mb,bt_mb,bo_mb"
     next
 }
 {
-    printf "%s,%d,%d,%d,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
-        $1, $2,$4,$6,$8,$10,$12,$14,
-        $3/1024,$5/1024,$7/1024,$9/1024,$11/1024,$13/1024,$15/1024
+    printf "%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+        $1, $2,$4,$6,$8,$10,$12,$14,$16,
+        $3/1024,$5/1024,$7/1024,$9/1024,$11/1024,$13/1024,$15/1024,$17/1024
 }' "$CSV_FILE" > "$README_CSV"
 echo "Wrote $README_CSV"
 

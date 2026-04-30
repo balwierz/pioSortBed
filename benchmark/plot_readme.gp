@@ -13,11 +13,12 @@ set xrange [1e4:]
 
 set style line 1 lc rgb '#e41a1c' lw 4 pt 7  ps 2 # pioSortBed 1t (red, circle)
 set style line 2 lc rgb '#377eb8' lw 4 pt 5  ps 2 # pioSortBed 8t (blue, square)
-set style line 3 lc rgb '#f781bf' lw 4 pt 13 ps 2 # pioSortBed low-mem (pink, diamond)
-set style line 4 lc rgb '#4daf4a' lw 4 pt 9  ps 2 # GNU sort 1t (green, triangle up)
-set style line 5 lc rgb '#ff7f00' lw 4 pt 11 ps 2 # GNU sort 8t (orange, triangle down)
-set style line 6 lc rgb '#984ea3' lw 4 pt 3  ps 2 # bedtools (purple, plus)
-set style line 7 lc rgb '#a65628' lw 4 pt 8  ps 2 # bedops (brown, star)
+set style line 3 lc rgb '#f781bf' lw 4 pt 13 ps 2 # pioSortBed low-mem 1t (light pink, diamond)
+set style line 4 lc rgb '#c51b7d' lw 4 pt 12 ps 2 # pioSortBed low-mem 8t (dark magenta, open diamond)
+set style line 5 lc rgb '#4daf4a' lw 4 pt 9  ps 2 # GNU sort 1t (green, triangle up)
+set style line 6 lc rgb '#ff7f00' lw 4 pt 11 ps 2 # GNU sort 8t (orange, triangle down)
+set style line 7 lc rgb '#984ea3' lw 4 pt 3  ps 2 # bedtools (purple, plus)
+set style line 8 lc rgb '#a65628' lw 4 pt 8  ps 2 # bedops (brown, star)
 
 # --- Wall time plot (log scale) ---
 set terminal pngcairo size 1800,1200 enhanced font 'Arial,18'
@@ -31,11 +32,12 @@ set format y '%.2g'
 plot 'benchmark_readme.csv' \
     using 1:2 with linespoints ls 1 title 'pioSortBed 1t', \
     '' using 1:3 with linespoints ls 2 title 'pioSortBed 8t', \
-    '' using 1:4 with linespoints ls 3 title 'pioSortBed low-mem SSD', \
-    '' using 1:5 with linespoints ls 4 title 'GNU sort 1t', \
-    '' using 1:6 with linespoints ls 5 title 'GNU sort 8t', \
-    '' using 1:7 with linespoints ls 6 title 'bedtools sort', \
-    '' using 1:8 with linespoints ls 7 title 'bedops sort-bed'
+    '' using 1:4 with linespoints ls 3 title 'pioSortBed low-mem 1t', \
+    '' using 1:5 with linespoints ls 4 title 'pioSortBed low-mem 8t', \
+    '' using 1:6 with linespoints ls 5 title 'GNU sort 1t', \
+    '' using 1:7 with linespoints ls 6 title 'GNU sort 8t', \
+    '' using 1:8 with linespoints ls 7 title 'bedtools sort', \
+    '' using 1:9 with linespoints ls 8 title 'bedops sort-bed'
 
 # --- Peak memory plot (log scale) ---
 set output 'benchmark_memory.png'
@@ -45,13 +47,14 @@ set logscale y 10
 set format y '%.2g'
 
 plot 'benchmark_readme.csv' \
-    using 1:9  with linespoints ls 1 title 'pioSortBed 1t', \
-    '' using 1:10 with linespoints ls 2 title 'pioSortBed 8t', \
-    '' using 1:11 with linespoints ls 3 title 'pioSortBed low-mem SSD', \
-    '' using 1:12 with linespoints ls 4 title 'GNU sort 1t', \
-    '' using 1:13 with linespoints ls 5 title 'GNU sort 8t', \
-    '' using 1:14 with linespoints ls 6 title 'bedtools sort', \
-    '' using 1:15 with linespoints ls 7 title 'bedops sort-bed'
+    using 1:10 with linespoints ls 1 title 'pioSortBed 1t', \
+    '' using 1:11 with linespoints ls 2 title 'pioSortBed 8t', \
+    '' using 1:12 with linespoints ls 3 title 'pioSortBed low-mem 1t', \
+    '' using 1:13 with linespoints ls 4 title 'pioSortBed low-mem 8t', \
+    '' using 1:14 with linespoints ls 5 title 'GNU sort 1t', \
+    '' using 1:15 with linespoints ls 6 title 'GNU sort 8t', \
+    '' using 1:16 with linespoints ls 7 title 'bedtools sort', \
+    '' using 1:17 with linespoints ls 8 title 'bedops sort-bed'
 
 # --- Wall time plot (linear scale) ---
 set output 'benchmark_time_linear.png'
@@ -64,11 +67,12 @@ set yrange [0:]
 plot 'benchmark_readme.csv' \
     using 1:2 with linespoints ls 1 title 'pioSortBed 1t', \
     '' using 1:3 with linespoints ls 2 title 'pioSortBed 8t', \
-    '' using 1:4 with linespoints ls 3 title 'pioSortBed low-mem SSD', \
-    '' using 1:5 with linespoints ls 4 title 'GNU sort 1t', \
-    '' using 1:6 with linespoints ls 5 title 'GNU sort 8t', \
-    '' using 1:7 with linespoints ls 6 title 'bedtools sort', \
-    '' using 1:8 with linespoints ls 7 title 'bedops sort-bed'
+    '' using 1:4 with linespoints ls 3 title 'pioSortBed low-mem 1t', \
+    '' using 1:5 with linespoints ls 4 title 'pioSortBed low-mem 8t', \
+    '' using 1:6 with linespoints ls 5 title 'GNU sort 1t', \
+    '' using 1:7 with linespoints ls 6 title 'GNU sort 8t', \
+    '' using 1:8 with linespoints ls 7 title 'bedtools sort', \
+    '' using 1:9 with linespoints ls 8 title 'bedops sort-bed'
 
 # --- Peak memory plot (linear scale) ---
 set output 'benchmark_memory_linear.png'
@@ -79,10 +83,11 @@ set format y '%.0f'
 set yrange [0:]
 
 plot 'benchmark_readme.csv' \
-    using 1:9  with linespoints ls 1 title 'pioSortBed 1t', \
-    '' using 1:10 with linespoints ls 2 title 'pioSortBed 8t', \
-    '' using 1:11 with linespoints ls 3 title 'pioSortBed low-mem SSD', \
-    '' using 1:12 with linespoints ls 4 title 'GNU sort 1t', \
-    '' using 1:13 with linespoints ls 5 title 'GNU sort 8t', \
-    '' using 1:14 with linespoints ls 6 title 'bedtools sort', \
-    '' using 1:15 with linespoints ls 7 title 'bedops sort-bed'
+    using 1:10 with linespoints ls 1 title 'pioSortBed 1t', \
+    '' using 1:11 with linespoints ls 2 title 'pioSortBed 8t', \
+    '' using 1:12 with linespoints ls 3 title 'pioSortBed low-mem 1t', \
+    '' using 1:13 with linespoints ls 4 title 'pioSortBed low-mem 8t', \
+    '' using 1:14 with linespoints ls 5 title 'GNU sort 1t', \
+    '' using 1:15 with linespoints ls 6 title 'GNU sort 8t', \
+    '' using 1:16 with linespoints ls 7 title 'bedtools sort', \
+    '' using 1:17 with linespoints ls 8 title 'bedops sort-bed'
