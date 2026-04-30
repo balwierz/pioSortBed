@@ -4,6 +4,33 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.3] — 2026-04-30
+
+### Changed
+- **Type cleanup for read indices and counts**:
+  - `seqread::next` / `seqread::chrIdx` (union): `int` -> `uint32_t`. They're
+    pure indices into `reads[]` (0 = end-of-list sentinel), so signed makes
+    no sense; this also makes the radix-sort key packing
+    `(chrIdx << 32) | beg` unambiguous about the top bit.
+  - `chrInfoT::lastRead`, `chrInfoT::idx`: `int` -> `uint32_t`.
+  - `lowMemNode::next`: `int` -> `uint32_t`.
+  - `ChunkChrPartial::head/tail`, `LowMemChunkPartial::head/tail`,
+    `ChunkResult::firstIdx/count`: `int` -> `uint32_t`.
+  - `totalReads`, `totalNodes`, `readCount`, `nodeCount`, `currMaxReads`,
+    `nodeCap`: `int` -> `size_t`. These get multiplied by `sizeof(struct)`
+    and passed to `malloc`; `size_t` is the natural type.
+- Memory layout unchanged: `seqread` stays 24 B, `lowMemNode` stays 16 B,
+  `ChunkChrPartial` and `ChunkResult` stay the same size.
+- New early-exit checks at parse-time when read counts approach the path-
+  specific cap:
+  - Classic / bucket-sort paths: cap at INT_MAX (~2.15 B reads). The
+    `int* order` array and `int n` parameter on `sortIndicesDispatch` /
+    `radixSort64` set this bound. Above it, the parser errors with a clear
+    message and points at `--low-mem-ssd`.
+  - `--low-mem-ssd` path: cap at UINT32_MAX-1 (~4.29 B reads) — its only
+    constraint is the 32-bit per-line `next` field; no global int* index
+    array is built.
+
 ## [3.0.2] — 2026-04-30
 
 ### Changed

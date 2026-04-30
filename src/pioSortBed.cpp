@@ -36,24 +36,27 @@ using namespace std;
 //
 // The `next` field (linked lists during parsing) and `chrIdx` field (classic
 // sort path integer chromosome index) share the same 4 bytes via a union —
-// the two sort paths never need both simultaneously.
+// the two sort paths never need both simultaneously. Both are unsigned 32-bit:
+// `next` is an index into reads[], 0 = end-of-list sentinel; `chrIdx` is a
+// sequential chromosome index assigned after parsing.
 class seqread
 {
 	public:
 	char* line; // keeps the full line; in case of collapse option just the weight as string.
 	int beg;
 	int end;
-	union { int next; int chrIdx; };
+	union { uint32_t next; uint32_t chrIdx; };
 	char str;
 };
 
 class chrInfoT
 {
 	public:
-	int len;		// max value of the bucket-sort key seen on this chromosome:
-					//   beg for --sort s/b, or strand-aware 5'-end for --sort 5
-	int lastRead;	// head of the linked list of read indices for this chromosome
-	int idx;		// sequential chromosome index, assigned after parsing & alphabetical sort
+	int len;			// max value of the bucket-sort key seen on this chromosome:
+						//   beg for --sort s/b, or strand-aware 5'-end for --sort 5
+	uint32_t lastRead;	// head of the linked list of read indices for this chromosome
+						// (0 = no reads yet / end-of-list sentinel)
+	uint32_t idx;		// sequential chromosome index, assigned after parsing & alphabetical sort
 	chrInfoT() : len(0), lastRead(0), idx(0) {}
 };
 
@@ -393,7 +396,7 @@ static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
 struct lowMemNode
 {
 	size_t off;
-	int next;
+	uint32_t next;
 	int beg;
 };
 
@@ -526,7 +529,9 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 
 	string2chrInfoT chrInfo;
 	lowMemNode* nodes = NULL;
-	int nodeCount = 1;  // index 0 reserved as end-of-list sentinel
+	size_t nodeCount = 1;  // index 0 reserved as end-of-list sentinel
+	// Hard cap: node indices are stored in lowMemNode::next (uint32_t), so the
+	// usable index range is 1..UINT32_MAX-1 → at most ~4.29 B reads.
 
 	// Pre-pass: emit any leading BED header lines (#, track, browser) to stdout
 	// and advance bodyStart past them. Headers are leading-only by convention
@@ -575,13 +580,13 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		}
 
 		// Pass 1a: count newlines per chunk in parallel so we can size nodes[] exactly.
-		std::vector<int> chunkCount(N, 0);
+		std::vector<size_t> chunkCount(N, 0);
 		std::vector<int> indices(N);
 		for(int i = 0; i < N; i++) indices[i] = i;
 		std::for_each(std::execution::par, indices.begin(), indices.end(),
 			[&](int i) {
 				size_t a = chunkStart[i], b = chunkStart[i + 1];
-				int c = 0;
+				size_t c = 0;
 				const char* p = mmapBase + a;
 				const char* pe = mmapBase + b;
 				while(p < pe)
@@ -597,12 +602,22 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			chunkCount[N - 1]++;
 
 		// Prefix-sum -> per-chunk base offset in nodes[]. Slot 0 is the sentinel.
-		std::vector<int> chunkBase(N + 1);
+		std::vector<size_t> chunkBase(N + 1);
 		chunkBase[0] = 0;
 		for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
-		int totalNodes = chunkBase[N];
+		size_t totalNodes = chunkBase[N];
 
-		nodes = (lowMemNode*) malloc(((size_t)totalNodes + 1) * sizeof(lowMemNode));
+		// Indices into nodes[] are stored in lowMemNode::next (uint32_t), so
+		// we can't address more than UINT32_MAX-1 reads. 1 is the sentinel slot.
+		if(totalNodes >= (size_t)UINT32_MAX)
+		{
+			cerr << "Error: " << totalNodes << " reads exceeds the 4.29 B limit "
+			     << "imposed by the 32-bit per-line index. Split your input "
+			     << "or sort chromosome-by-chromosome." << endl;
+			return 1;
+		}
+
+		nodes = (lowMemNode*) malloc((totalNodes + 1) * sizeof(lowMemNode));
 		if(!nodes)
 		{
 			cerr << "Error: out of memory allocating " << totalNodes
@@ -611,7 +626,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		}
 
 		// Per-chunk per-chrom partials, indexed by global node index.
-		struct LowMemChunkPartial { int head; int tail; };
+		struct LowMemChunkPartial { uint32_t head; uint32_t tail; };
 		using LowMemChunkMap = ChrNameMap<LowMemChunkPartial>;
 		std::vector<LowMemChunkMap> chunkChr(N);
 
@@ -620,7 +635,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			[&](int i) {
 				char* end = mmapBase + chunkStart[i + 1];
 				char* mmapCur = mmapBase + chunkStart[i];
-				int idx = chunkBase[i] + 1;
+				uint32_t idx = (uint32_t)(chunkBase[i] + 1);
 				LowMemChunkMap& chrMap = chunkChr[i];
 				auto thisIt = chrMap.end();
 
@@ -734,7 +749,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		auto seedIns = chrInfo.insert(make_pair(string(""), chrInfoT()));
 		auto thisChrIt = seedIns.first;
 
-		int nodeCap = 1024;
+		size_t nodeCap = 1024;
 		nodes = (lowMemNode*) malloc(nodeCap * sizeof(lowMemNode));
 		if(!nodes)
 		{
@@ -808,7 +823,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 
 			if(nodeCount == nodeCap)
 			{
-				nodeCap = (int)(nodeCap * 2);
+				nodeCap *= 2;
 				lowMemNode* tmp = (lowMemNode*) realloc(nodes, nodeCap * sizeof(lowMemNode));
 				if(!tmp)
 				{
@@ -819,11 +834,23 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				nodes = tmp;
 			}
 
+			// nodeCount is the index we're about to write to nodes[]; it's also
+			// the value we'll store as a uint32_t into chrInfoT::lastRead, so
+			// it must fit in uint32_t. UINT32_MAX is reserved as well-out-of-range;
+			// 0 is the end-of-list sentinel; usable range is 1..UINT32_MAX-1.
+			if(nodeCount >= (size_t)UINT32_MAX)
+			{
+				cerr << "Error: " << nodeCount << " reads exceeds the 4.29 B limit "
+				     << "imposed by the 32-bit per-line index." << endl;
+				free(nodes);
+				return 1;
+			}
+
 			(void)end;  // parsed for validation only; end isn't cached in lowMemNode
 			nodes[nodeCount].off = (size_t)(linePtr - mmapBase);
 			nodes[nodeCount].next = thisChrIt->second.lastRead;
 			nodes[nodeCount].beg = beg;
-			thisChrIt->second.lastRead = nodeCount;
+			thisChrIt->second.lastRead = (uint32_t)nodeCount;
 			nodeCount++;
 		}
 
@@ -869,8 +896,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 
 		// Collect node indices for this chromosome (linked-list walk).
-		vector<int> nodeIdx;
-		for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
+		vector<uint32_t> nodeIdx;
+		for(uint32_t cur = cit->second.lastRead; cur; cur = nodes[cur].next)
 			nodeIdx.push_back(cur);
 
 		if(fCollapse)
@@ -879,7 +906,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			wp.reserve(nodeIdx.size());
 			for(size_t i = 0; i < nodeIdx.size(); i++)
 			{
-				int idx = nodeIdx[i];
+				uint32_t idx = nodeIdx[i];
 				const char* linePtr = mmapBase + nodes[idx].off;
 				char weight[chrNameBufSize];
 				weight[0] = '0'; weight[1] = '\0';
@@ -931,11 +958,11 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 
 		if(needStrand)
 		{
-			vector<pair<int, int>> kp;  // (chosenPos, nodeIdx)
+			vector<pair<int, uint32_t>> kp;  // (chosenPos, nodeIdx)
 			kp.reserve(nodeIdx.size());
 			for(size_t i = 0; i < nodeIdx.size(); i++)
 			{
-				int idx = nodeIdx[i];
+				uint32_t idx = nodeIdx[i];
 				const char* linePtr = mmapBase + nodes[idx].off;
 				char strandChar = '+';
 				int dummy_beg = 0, dummy_end = 0;
@@ -972,7 +999,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		sr.reserve(nodeIdx.size());
 		if(sortMode == 'b')
 		{
-			for(int idx : nodeIdx)
+			for(uint32_t idx : nodeIdx)
 			{
 				const char* linePtr = mmapBase + nodes[idx].off;
 				const char* dchrPtr; int dchrLen;
@@ -988,7 +1015,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		}
 		else
 		{
-			for(int idx : nodeIdx)
+			for(uint32_t idx : nodeIdx)
 				sr.push_back({nodes[idx].beg, 0, nodes[idx].off});
 		}
 
@@ -1061,7 +1088,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				// budget ~62 B per read (12 B sort-rec + ~50 B output buffer).
 				string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 				size_t chromCount = 0;
-				for(int cur = cit->second.lastRead; cur; cur = nodes[cur].next)
+				for(uint32_t cur = cit->second.lastRead; cur; cur = nodes[cur].next)
 					chromCount++;
 				size_t cost = chromCount * 62;
 				size_t effCost = (maxMemBytes > 0) ? std::min(cost, maxMemBytes) : 0;
@@ -1549,7 +1576,7 @@ template<bool UseMmap>
 static void parseLines(
     char* mmapBase, size_t mmapSize,
     FILE* fh,
-    seqread*& reads, int& readCount, int& currMaxReads,
+    seqread*& reads, size_t& readCount, size_t& currMaxReads,
     string2chrInfoT& chrInfo, string2chrInfoT::iterator& thisChrIt,
     Arena* arena,
     bool fRal, int fCollapse, char sortMode)
@@ -1602,10 +1629,23 @@ static void parseLines(
 
 		if(readCount == currMaxReads)
 		{
-			currMaxReads = (int) (currMaxReads * 2);
+			currMaxReads *= 2;
 			seqread* tmp = (seqread*) realloc(reads, currMaxReads * sizeof(seqread));
 			if(!tmp) { fprintf(stderr, "Error: out of memory\n"); exit(1); }
 			reads = tmp;
+		}
+		// reads[].next is uint32_t (cap: UINT32_MAX-1), but the classic/bucket
+		// sort path also stores indices in `int* order` and passes them as
+		// `int n` — so the tighter cap is INT_MAX. Above that, switch to
+		// --low-mem-ssd, which stores per-chrom indices and never builds a
+		// global int* array.
+		if(readCount > (size_t)INT32_MAX)
+		{
+			fprintf(stderr, "Error: %zu reads exceeds the ~2.15 B limit "
+			        "of the classic sort path. Re-run with --low-mem-ssd "
+			        "(supports up to ~4.29 B reads) or split your input.\n",
+			        readCount);
+			exit(1);
 		}
 
 		int beg = 0;
@@ -1699,7 +1739,7 @@ static void parseLines(
 				if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
 				reads[readCount].next = thisChrIt->second.lastRead;
 			}
-			thisChrIt->second.lastRead = readCount;
+			thisChrIt->second.lastRead = (uint32_t)readCount;
 		}
 		else
 		{
@@ -1727,17 +1767,17 @@ static void parseLines(
 
 struct ChunkChrPartial
 {
-	int head;   // global idx of head (most recently inserted read)
-	int tail;   // global idx of tail (read whose .next is 0)
-	int len;    // max chosenPosition seen
+	uint32_t head;   // global idx of head (most recently inserted read)
+	uint32_t tail;   // global idx of tail (read whose .next is 0)
+	int len;         // max chosenPosition seen
 };
 
 typedef ChrNameMap<ChunkChrPartial> ChunkChrMap;
 
 struct ChunkResult
 {
-	int firstIdx;
-	int count;
+	uint32_t firstIdx;
+	uint32_t count;
 	ChunkChrMap chr;
 };
 
@@ -1750,7 +1790,7 @@ struct ChunkResult
 // out of the (possibly clobbered) line buffer; reads[i].line then points at
 // the arena copy. arena must be non-null whenever fCollapse is set.
 static void parseChunkMmap(char* start, char* end,
-                           seqread* reads, int base,
+                           seqread* reads, uint32_t base,
                            ChunkResult& result,
                            bool fRal, int fCollapse, char sortMode,
                            Arena* arena)
@@ -1758,7 +1798,7 @@ static void parseChunkMmap(char* start, char* end,
 	const bool needExtra = fRal || fCollapse || (sortMode == '5');
 	char* mmapCur = start;
 	char* mmapLim = end;
-	int idx = base + 1;
+	uint32_t idx = base + 1;
 	auto thisChrIt = result.chr.end();
 
 	while(mmapCur < mmapLim)
@@ -1879,26 +1919,26 @@ static seqread* parseMmapSerial(char* mmapBase, size_t bodyStart, size_t mmapSiz
                                 bool fRal, int fCollapse, char sortMode,
                                 Arena* arena,
                                 string2chrInfoT& chrInfo,
-                                int& outReadCount)
+                                size_t& outReadCount)
 {
-	int currMaxReads = 1024;
+	size_t currMaxReads = 1024;
 	size_t bodySize = mmapSize - bodyStart;
 	size_t scanSize = bodySize < 65536 ? bodySize : 65536;
-	int nLines = 0;
+	size_t nLines = 0;
 	for(size_t i = 0; i < scanSize; i++)
 		if(mmapBase[bodyStart + i] == '\n') nLines++;
 	if(nLines > 0)
-		currMaxReads = (int)((double)bodySize / (double)scanSize * nLines * 1.1);
+		currMaxReads = (size_t)((double)bodySize / (double)scanSize * (double)nLines * 1.1);
 	if(currMaxReads < 1024) currMaxReads = 1024;
 
-	seqread* reads = (seqread*) malloc((size_t)currMaxReads * sizeof(seqread));
+	seqread* reads = (seqread*) malloc(currMaxReads * sizeof(seqread));
 	if(!reads)
 	{
 		cerr << "Error: out of memory allocating reads array" << endl;
 		exit(1);
 	}
 
-	int readCount = 1;  // slot 0 is the end-of-list sentinel
+	size_t readCount = 1;  // slot 0 is the end-of-list sentinel
 	auto ins = chrInfo.insert(std::make_pair(std::string(""), chrInfoT()));
 	auto thisChrIt = ins.first;
 	parseLines<true>(mmapBase + bodyStart, bodySize, NULL,
@@ -1919,7 +1959,7 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
                                   Arena* arena,
                                   std::vector<Arena*>* chunkArenas,
                                   string2chrInfoT& chrInfo,
-                                  int& outReadCount)
+                                  size_t& outReadCount)
 {
 	// Pre-pass: emit leading header lines (#, track, browser) to stdout and
 	// advance bodyStart past them. BED convention puts headers at the top.
@@ -1978,13 +2018,13 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	}
 
 	// Pass 1: count newlines per chunk in parallel.
-	std::vector<int> chunkCount(N, 0);
+	std::vector<size_t> chunkCount(N, 0);
 	std::vector<int> indices(N);
 	for(int i = 0; i < N; i++) indices[i] = i;
 	std::for_each(std::execution::par, indices.begin(), indices.end(),
 		[&](int i) {
 			size_t a = chunkStart[i], b = chunkStart[i + 1];
-			int c = 0;
+			size_t c = 0;
 			const char* p = mmapBase + a;
 			const char* pe = mmapBase + b;
 			while(p < pe)
@@ -2000,12 +2040,25 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	if(mmapSize > bodyStart && mmapBase[mmapSize - 1] != '\n')
 		chunkCount[N - 1]++;
 
-	std::vector<int> chunkBase(N + 1);
+	std::vector<size_t> chunkBase(N + 1);
 	chunkBase[0] = 0;
 	for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
-	int totalReads = chunkBase[N];
+	size_t totalReads = chunkBase[N];
 
-	seqread* reads = (seqread*) malloc(((size_t)totalReads + 1) * sizeof(seqread));
+	// reads[].next is uint32_t (cap: UINT32_MAX-1), but the classic/bucket
+	// sort path also stores indices in `int* order` / int-valued chromTable
+	// and passes them as `int n` — so the tighter cap is INT_MAX. Above that,
+	// use --low-mem-ssd (per-chrom indices, no global int* array; supports
+	// up to UINT32_MAX-1 reads).
+	if(totalReads > (size_t)INT32_MAX)
+	{
+		cerr << "Error: " << totalReads << " reads exceeds the ~2.15 B limit "
+		     << "of the classic sort path. Re-run with --low-mem-ssd "
+		     << "(supports up to ~4.29 B reads) or split your input." << endl;
+		exit(1);
+	}
+
+	seqread* reads = (seqread*) malloc((totalReads + 1) * sizeof(seqread));
 	if(!reads)
 	{
 		cerr << "Error: out of memory allocating reads array (" << totalReads << " entries)" << endl;
@@ -2134,8 +2187,8 @@ int main(int argc, char *argv[])
 	tbb::global_control tbbThreadCap(
 		tbb::global_control::max_allowed_parallelism, (size_t)numThreads);
 
-	int readCount = 1;	// count == 0 is used as an end of a list.
-	int currMaxReads = 1024;
+	size_t readCount = 1;	// count == 0 is used as an end of a list.
+	size_t currMaxReads = 1024;
 	long fileSize = -1;
 
 	char* mmapBase = NULL;
@@ -2226,11 +2279,11 @@ int main(int argc, char *argv[])
 
 			// Estimate read count from first 64KB
 			size_t scanSize = mmapSize < 65536 ? mmapSize : 65536;
-			int nLines = 0;
+			size_t nLines = 0;
 			for(size_t i = 0; i < scanSize; i++)
 				if(mmapBase[i] == '\n') nLines++;
 			if(nLines > 0)
-				currMaxReads = (int)((double)mmapSize / scanSize * nLines * 1.1);
+				currMaxReads = (size_t)((double)mmapSize / (double)scanSize * (double)nLines * 1.1);
 			if(currMaxReads < 1024)
 				currMaxReads = 1024;
 
@@ -2272,7 +2325,7 @@ int main(int argc, char *argv[])
 		// per chunk so weight-string copies don't serialise on a shared mutex).
 		// Header lines (track/browser/#) are emitted to stdout in a leading
 		// pre-pass before chunking.
-		int parsed = 0;
+		size_t parsed = 0;
 		reads = parseMmapDispatch(mmapBase, mmapSize,
 		                          (bool)fRal, fCollapse, sortMode,
 		                          numThreads, arena, &chunkArenas,
@@ -2331,8 +2384,8 @@ int main(int argc, char *argv[])
 	for(int ci = 0; ci < (int)chroms.size(); ci++)
 		chrInfo.find(chroms[ci])->second.idx = ci;
 
-	int totalReads = readCount - 1;
-	bool useBucketSort = (bucketCutoff == 0) || (totalReads >= bucketCutoff);
+	size_t totalReads = readCount - 1;
+	bool useBucketSort = (bucketCutoff == 0) || (totalReads >= (size_t)bucketCutoff);
 	if(useBucketSort)
 		cerr << "Using bucket sort (" << totalReads << " reads >= cutoff " << bucketCutoff << ")" << endl;
 	else
@@ -2355,12 +2408,12 @@ int main(int argc, char *argv[])
 		for(int ci = 0; ci < (int)chroms.size(); ci++)
 		{
 			string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
-			int curr = cit->second.lastRead;
+			uint32_t curr = cit->second.lastRead;
 			while(curr)
 			{
-				int nxt = reads[curr].next;
-				reads[curr].chrIdx = ci;
-				order[oi++] = curr;
+				uint32_t nxt = reads[curr].next;
+				reads[curr].chrIdx = (uint32_t)ci;
+				order[oi++] = (int)curr;
 				curr = nxt;
 			}
 		}
@@ -2370,15 +2423,15 @@ int main(int argc, char *argv[])
 		// std::execution::par based on numThreads.
 		if(numThreads > 1)
 			cerr << "Parallel sort using " << numThreads << " threads" << endl;
-		sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
+		sortIndicesDispatch(order, (int)totalReads, reads, sortMode, numThreads);
 
 		if(fCollapse)
 		{
-			int i = 0;
+			size_t i = 0;
 			while(i < totalReads)
 			{
 				int ri = order[i];
-				int ci = reads[ri].chrIdx;
+				uint32_t ci = reads[ri].chrIdx;
 				int pos = reads[ri].beg;
 				float sum = 0.0f;
 				while(i < totalReads)
@@ -2396,7 +2449,7 @@ int main(int argc, char *argv[])
 			// Hoist fullLine outside the per-read loop so gcc fully constant-folds it.
 			if(fRal || useMmap)
 			{
-				for(int i = 0; i < totalReads; i++)
+				for(size_t i = 0; i < totalReads; i++)
 				{
 					fputs_unlocked(reads[order[i]].line, stdout);
 					fputc_unlocked('\n', stdout);
@@ -2404,7 +2457,7 @@ int main(int argc, char *argv[])
 			}
 			else
 			{
-				for(int i = 0; i < totalReads; i++)
+				for(size_t i = 0; i < totalReads; i++)
 				{
 					int ri = order[i];
 					writeBedLine(chroms[reads[ri].chrIdx].c_str(),
