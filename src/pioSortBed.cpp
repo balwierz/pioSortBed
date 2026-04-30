@@ -378,7 +378,7 @@ static int parseRalLine(const char* buf,
 
 // Parse a weight string written into reads[idx].line (collapse mode) using
 // strtof (faster + locale-independent compared to sscanf). Aborts on malformed input.
-static inline float parseWeight(const seqread* reads, int idx)
+static inline float parseWeight(const seqread* reads, uint32_t idx)
 {
 	char* endptr;
 	float w = strtof(reads[idx].line, &endptr);
@@ -390,8 +390,8 @@ static inline float parseWeight(const seqread* reads, int idx)
 	return w;
 }
 
-// Sum weights across a contiguous int buffer of read indices.
-static inline float sumWeightsBuf(const seqread* reads, const int* idxs, int n)
+// Sum weights across a contiguous buffer of read indices.
+static inline float sumWeightsBuf(const seqread* reads, const uint32_t* idxs, int n)
 {
 	float sum = 0.0f;
 	for(int j = 0; j < n; ++j) sum += parseWeight(reads, idxs[j]);
@@ -400,7 +400,7 @@ static inline float sumWeightsBuf(const seqread* reads, const int* idxs, int n)
 
 // Sum weights along a chromTable linked list at a given position, consuming the list.
 // On return chromTable[pos] == 0.
-static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
+static inline float sumWeightsList(seqread* reads, uint32_t* chromTable, int pos)
 {
 	float sum = 0.0f;
 	while(chromTable[pos])
@@ -1238,7 +1238,7 @@ template<char SortMode>
 struct ReadCmp
 {
 	seqread* reads;
-	bool operator()(int a, int b) const
+	bool operator()(uint32_t a, uint32_t b) const
 	{
 		if(reads[a].chrIdx != reads[b].chrIdx) return reads[a].chrIdx < reads[b].chrIdx;
 		if constexpr(SortMode == 'b')
@@ -1271,12 +1271,12 @@ struct ReadCmp
 //
 // Aux buffers are scratch and freed before return. After the sort, the final
 // index order is written back into `order` (the caller's buffer).
-static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
+static void radixSort64(uint64_t* keys, uint32_t* order, size_t n, int numThreads)
 {
 	if(n < 2) return;
 
-	uint64_t* keysAux = (uint64_t*) malloc((size_t)n * sizeof(uint64_t));
-	int* idxsAux = (int*) malloc((size_t)n * sizeof(int));
+	uint64_t* keysAux = (uint64_t*) malloc(n * sizeof(uint64_t));
+	uint32_t* idxsAux = (uint32_t*) malloc(n * sizeof(uint32_t));
 	if(!keysAux || !idxsAux)
 	{
 		cerr << "Error: out of memory for radix sort scratch (" << n << " entries)" << endl;
@@ -1286,20 +1286,20 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 	// Find which bytes vary across all keys; constant bytes can be skipped.
 	uint64_t allOr = 0;
 	uint64_t allAnd = ~uint64_t(0);
-	for(int i = 0; i < n; i++) { allOr |= keys[i]; allAnd &= keys[i]; }
+	for(size_t i = 0; i < n; i++) { allOr |= keys[i]; allAnd &= keys[i]; }
 	uint64_t varies = allOr ^ allAnd;
 
 	uint64_t* k0 = keys;
 	uint64_t* k1 = keysAux;
-	int* i0 = order;
-	int* i1 = idxsAux;
+	uint32_t* i0 = order;
+	uint32_t* i1 = idxsAux;
 	int passesDone = 0;
 
 	// Decide on chunk count. A few hundred K of work per thread keeps the
 	// scheduling overhead amortised; below that the serial path is faster.
 	int T = numThreads;
 	if(T < 1) T = 1;
-	if((long long)n / 200000 < T) T = (int)std::max<long long>(1, (long long)n / 200000);
+	if(n / 200000 < (size_t)T) T = (int)std::max<size_t>(1, n / 200000);
 
 	if(T <= 1)
 	{
@@ -1310,10 +1310,10 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 			const int shift = pass * 8;
 
 			size_t hist[257] = {0};
-			for(int i = 0; i < n; i++) hist[((k0[i] >> shift) & 0xff) + 1]++;
+			for(size_t i = 0; i < n; i++) hist[((k0[i] >> shift) & 0xff) + 1]++;
 			for(int b = 1; b < 257; b++) hist[b] += hist[b - 1];
 
-			for(int i = 0; i < n; i++)
+			for(size_t i = 0; i < n; i++)
 			{
 				size_t pos = hist[(k0[i] >> shift) & 0xff]++;
 				k1[pos] = k0[i];
@@ -1327,9 +1327,9 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 	else
 	{
 		// ---- Parallel path ----
-		std::vector<int> chunkStart(T + 1);
+		std::vector<size_t> chunkStart(T + 1);
 		for(int t = 0; t <= T; t++)
-			chunkStart[t] = (int)((long long)n * t / T);
+			chunkStart[t] = n * (size_t)t / (size_t)T;
 
 		std::vector<int> tIds(T);
 		for(int t = 0; t < T; t++) tIds[t] = t;
@@ -1348,8 +1348,8 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 			std::for_each(std::execution::par, tIds.begin(), tIds.end(), [&](int t) {
 				size_t* h = hist.data() + (size_t)t * 256;
 				for(int b = 0; b < 256; b++) h[b] = 0;
-				int e = chunkStart[t + 1];
-				for(int i = chunkStart[t]; i < e; i++)
+				size_t e = chunkStart[t + 1];
+				for(size_t i = chunkStart[t]; i < e; i++)
 					h[(k0[i] >> shift) & 0xff]++;
 			});
 
@@ -1370,8 +1370,8 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 			// per-(thread, bucket) range, so no contention.
 			std::for_each(std::execution::par, tIds.begin(), tIds.end(), [&](int t) {
 				size_t* c = cursor.data() + (size_t)t * 256;
-				int e = chunkStart[t + 1];
-				for(int i = chunkStart[t]; i < e; i++)
+				size_t e = chunkStart[t + 1];
+				for(size_t i = chunkStart[t]; i < e; i++)
 				{
 					size_t pos = c[(k0[i] >> shift) & 0xff]++;
 					k1[pos] = k0[i];
@@ -1388,7 +1388,7 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 	// If we did an odd number of passes, the final data is in the aux buffer;
 	// copy it back so the caller's `order` holds the result.
 	if(passesDone & 1)
-		memcpy(order, i0, (size_t)n * sizeof(int));
+		memcpy(order, i0, n * sizeof(uint32_t));
 
 	free(keysAux);
 	free(idxsAux);
@@ -1397,19 +1397,19 @@ static void radixSort64(uint64_t* keys, int* order, int n, int numThreads)
 // Build 64-bit radix keys for SortMode 's' or '5'.
 // Layout: high 32 bits = chrIdx, low 32 bits = position (beg or 5'-end).
 template<char SortMode>
-static void buildRadixKeys(uint64_t* keys, const int* order, int n, const seqread* reads)
+static void buildRadixKeys(uint64_t* keys, const uint32_t* order, size_t n, const seqread* reads)
 {
 	static_assert(SortMode == 's' || SortMode == '5',
 	              "radix path only supports SortMode 's' or '5'");
-	for(int i = 0; i < n; i++)
+	for(size_t i = 0; i < n; i++)
 	{
-		int idx = order[i];
+		uint32_t idx = order[i];
 		uint32_t pos;
 		if constexpr(SortMode == '5')
 			pos = (reads[idx].str == '-') ? (uint32_t)reads[idx].end : (uint32_t)reads[idx].beg;
 		else
 			pos = (uint32_t)reads[idx].beg;
-		keys[i] = (uint64_t((uint32_t)reads[idx].chrIdx) << 32) | pos;
+		keys[i] = ((uint64_t)reads[idx].chrIdx << 32) | pos;
 	}
 }
 
@@ -1417,11 +1417,11 @@ static void buildRadixKeys(uint64_t* keys, const int* order, int n, const seqrea
 // histogram+double-buffer cost vs std::sort. Multi-thread: parallel radix
 // has more setup (T*256 histograms, two parallel_for syncs per pass), so
 // stay on the heavily-tuned std::sort(par) below ~3M reads.
-static constexpr int RADIX_SORT_THRESHOLD       = 100000;
-static constexpr int RADIX_SORT_THRESHOLD_PAR   = 3000000;
+static constexpr size_t RADIX_SORT_THRESHOLD       = 100000;
+static constexpr size_t RADIX_SORT_THRESHOLD_PAR   = 3000000;
 
 template<char SortMode>
-static void sortIndices(int* order, int n, seqread* reads, int numThreads)
+static void sortIndices(uint32_t* order, size_t n, seqread* reads, int numThreads)
 {
 	// Radix path: large enough, sortMode supports a single 32-bit position key.
 	// --sort b needs a tertiary key (end), which doesn't pack into 64 bits at
@@ -1430,10 +1430,10 @@ static void sortIndices(int* order, int n, seqread* reads, int numThreads)
 	// dispatches to a serial or parallel histogram + scatter pipeline.
 	if constexpr(SortMode == 's' || SortMode == '5')
 	{
-		const int threshold = (numThreads > 1) ? RADIX_SORT_THRESHOLD_PAR : RADIX_SORT_THRESHOLD;
+		const size_t threshold = (numThreads > 1) ? RADIX_SORT_THRESHOLD_PAR : RADIX_SORT_THRESHOLD;
 		if(n >= threshold)
 		{
-			uint64_t* keys = (uint64_t*) malloc((size_t)n * sizeof(uint64_t));
+			uint64_t* keys = (uint64_t*) malloc(n * sizeof(uint64_t));
 			if(!keys)
 			{
 				cerr << "Error: out of memory for radix keys (" << n << " entries)" << endl;
@@ -1456,7 +1456,7 @@ static void sortIndices(int* order, int n, seqread* reads, int numThreads)
 }
 
 // Dispatch the templated sort by the runtime sortMode char.
-static void sortIndicesDispatch(int* order, int n, seqread* reads, char sortMode, int numThreads)
+static void sortIndicesDispatch(uint32_t* order, size_t n, seqread* reads, char sortMode, int numThreads)
 {
 	switch(sortMode)
 	{
@@ -1497,19 +1497,19 @@ static size_t parseMemSize(const std::string& s)
 // fetch/decode branch per emitted line at -t 1 on multi-million-read files.
 template<bool FullLine>
 static __attribute__((always_inline)) inline void processChromBucketTpl(
-    const char* chrName, int thisChrLen, int firstRead,
+    const char* chrName, int thisChrLen, uint32_t firstRead,
     seqread* reads, char sortMode, int fCollapse,
-    int* chromTable, int* numReadsBeg, FILE* out)
+    uint32_t* chromTable, int* numReadsBeg, FILE* out)
 {
 	// Phase 1: scatter into chromTable linked lists keyed by chosenPosition.
-	int currRead = firstRead;
+	uint32_t currRead = firstRead;
 	int maxNumReads = 0;
 	while(currRead)
 	{
 		int chosenPosition = (sortMode == '5')
 			? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg)
 			: reads[currRead].beg;
-		int oldPtr = chromTable[chosenPosition];
+		uint32_t oldPtr = chromTable[chosenPosition];
 		chromTable[chosenPosition] = currRead;
 		currRead = reads[currRead].next;        // must read .next before overwriting it below
 		reads[chromTable[chosenPosition]].next = oldPtr;
@@ -1523,7 +1523,7 @@ static __attribute__((always_inline)) inline void processChromBucketTpl(
 	// Phase 2: scan positions in order, emit and consume each bucket.
 	if(sortMode == 'b')
 	{
-		int* readBuff = (int*) calloc((size_t)maxNumReads, sizeof(int));
+		uint32_t* readBuff = (uint32_t*) calloc((size_t)maxNumReads, sizeof(uint32_t));
 		for(int pos = 0; pos <= thisChrLen; pos++)
 		{
 			if(!chromTable[pos]) continue;
@@ -1534,7 +1534,7 @@ static __attribute__((always_inline)) inline void processChromBucketTpl(
 				readBuff[n++] = chromTable[pos];
 				chromTable[pos] = reads[chromTable[pos]].next;
 			}
-			std::sort(readBuff, readBuff + foo, [reads](int a, int b) {
+			std::sort(readBuff, readBuff + foo, [reads](uint32_t a, uint32_t b) {
 				return reads[a].end < reads[b].end;
 			});
 			if(fCollapse)
@@ -1568,7 +1568,7 @@ static __attribute__((always_inline)) inline void processChromBucketTpl(
 			{
 				while(chromTable[pos])
 				{
-					int ri = chromTable[pos];
+					uint32_t ri = chromTable[pos];
 					fputs_unlocked(reads[ri].line, out);
 					fputc_unlocked('\n', out);
 					chromTable[pos] = reads[ri].next;
@@ -1578,7 +1578,7 @@ static __attribute__((always_inline)) inline void processChromBucketTpl(
 			{
 				while(chromTable[pos])
 				{
-					int ri = chromTable[pos];
+					uint32_t ri = chromTable[pos];
 					writeBedLine(chrName, reads[ri].beg, reads[ri].end, reads[ri].line, out);
 					chromTable[pos] = reads[ri].next;
 				}
@@ -1589,9 +1589,9 @@ static __attribute__((always_inline)) inline void processChromBucketTpl(
 
 // Runtime dispatch over the FullLine template parameter.
 static __attribute__((always_inline)) inline void processChromBucket(
-    const char* chrName, int thisChrLen, int firstRead,
+    const char* chrName, int thisChrLen, uint32_t firstRead,
     seqread* reads, char sortMode, int fCollapse, bool fullLine,
-    int* chromTable, int* numReadsBeg, FILE* out)
+    uint32_t* chromTable, int* numReadsBeg, FILE* out)
 {
 	if(fullLine)
 		processChromBucketTpl<true>(chrName, thisChrLen, firstRead, reads, sortMode, fCollapse,
@@ -1672,16 +1672,13 @@ static void parseLines(
 			if(!tmp) { fprintf(stderr, "Error: out of memory\n"); exit(1); }
 			reads = tmp;
 		}
-		// reads[].next is uint32_t (cap: UINT32_MAX-1), but the classic/bucket
-		// sort path also stores indices in `int* order` and passes them as
-		// `int n` — so the tighter cap is INT_MAX. Above that, switch to
-		// --low-mem-ssd, which stores per-chrom indices and never builds a
-		// global int* array.
-		if(readCount > (size_t)INT32_MAX)
+		// reads[].next, the order[] array, chromTable[] entries, and radix-sort
+		// internals are all uint32_t. Index 0 is reserved as the end-of-list
+		// sentinel, so usable range is 1..UINT32_MAX-1.
+		if(readCount >= (size_t)UINT32_MAX)
 		{
-			fprintf(stderr, "Error: %zu reads exceeds the ~2.15 B limit "
-			        "of the classic sort path. Re-run with --low-mem-ssd "
-			        "(supports up to ~4.29 B reads) or split your input.\n",
+			fprintf(stderr, "Error: %zu reads exceeds the 4.29 B limit "
+			        "imposed by the 32-bit per-read index. Split your input.\n",
 			        readCount);
 			exit(1);
 		}
@@ -2078,16 +2075,13 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
 	size_t totalReads = chunkBase[N];
 
-	// reads[].next is uint32_t (cap: UINT32_MAX-1), but the classic/bucket
-	// sort path also stores indices in `int* order` / int-valued chromTable
-	// and passes them as `int n` — so the tighter cap is INT_MAX. Above that,
-	// use --low-mem-ssd (per-chrom indices, no global int* array; supports
-	// up to UINT32_MAX-1 reads).
-	if(totalReads > (size_t)INT32_MAX)
+	// reads[].next, the order[] array, chromTable[] entries, and radix-sort
+	// internals are all uint32_t. Index 0 is reserved as the end-of-list
+	// sentinel, so usable range is 1..UINT32_MAX-1.
+	if(totalReads >= (size_t)UINT32_MAX)
 	{
-		cerr << "Error: " << totalReads << " reads exceeds the ~2.15 B limit "
-		     << "of the classic sort path. Re-run with --low-mem-ssd "
-		     << "(supports up to ~4.29 B reads) or split your input." << endl;
+		cerr << "Error: " << totalReads << " reads exceeds the 4.29 B limit "
+		     << "imposed by the 32-bit per-read index. Split your input." << endl;
 		exit(1);
 	}
 
@@ -2163,8 +2157,7 @@ int main(int argc, char *argv[])
 		"  Weight field (BED col 4 / RAL): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
 		"  Bucket-sort path: rejects a chromosome whose chromTable would exceed\n"
 		"    --max-mem (default " + to_string(kDefaultBucketChromBudget >> 30) + " GB); use --low-mem-ssd otherwise.\n"
-		"  Read number limit: " + to_string((unsigned long long)INT32_MAX) + " (classic/bucket path),\n"
-		"    " + to_string((unsigned long long)UINT32_MAX - 1) + " (--low-mem-ssd path).\n"};
+		"  Read number limit: " + to_string((unsigned long long)UINT32_MAX - 1) + " (all paths).\n"};
 	app.set_version_flag("-V,--version", VERSION_STRING);
 
 	string inputFile;
@@ -2493,17 +2486,17 @@ int main(int argc, char *argv[])
 		 *  3. Linear scan to print (and optionally collapse).
 		 *************************************************************/
 
-		int* order = (int*) malloc(totalReads * sizeof(int));
-		int oi = 0;
-		for(int ci = 0; ci < (int)chroms.size(); ci++)
+		uint32_t* order = (uint32_t*) malloc(totalReads * sizeof(uint32_t));
+		size_t oi = 0;
+		for(uint32_t ci = 0; ci < (uint32_t)chroms.size(); ci++)
 		{
 			string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 			uint32_t curr = cit->second.lastRead;
 			while(curr)
 			{
 				uint32_t nxt = reads[curr].next;
-				reads[curr].chrIdx = (uint32_t)ci;
-				order[oi++] = (int)curr;
+				reads[curr].chrIdx = ci;
+				order[oi++] = curr;
 				curr = nxt;
 			}
 		}
@@ -2511,20 +2504,20 @@ int main(int argc, char *argv[])
 		// Both 1-thread and N-thread paths go through sortIndicesDispatch which
 		// picks the templated comparator at compile time and chooses serial vs
 		// std::execution::par based on numThreads.
-		sortIndicesDispatch(order, (int)totalReads, reads, sortMode, numThreads);
+		sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
 
 		if(fCollapse)
 		{
 			size_t i = 0;
 			while(i < totalReads)
 			{
-				int ri = order[i];
+				uint32_t ri = order[i];
 				uint32_t ci = reads[ri].chrIdx;
 				int pos = reads[ri].beg;
 				float sum = 0.0f;
 				while(i < totalReads)
 				{
-					int rj = order[i];
+					uint32_t rj = order[i];
 					if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
 					sum += parseWeight(reads, rj);
 					i++;
@@ -2547,7 +2540,7 @@ int main(int argc, char *argv[])
 			{
 				for(size_t i = 0; i < totalReads; i++)
 				{
-					int ri = order[i];
+					uint32_t ri = order[i];
 					writeBedLine(chroms[reads[ri].chrIdx].c_str(),
 					             reads[ri].beg, reads[ri].end,
 					             reads[ri].line, stdout);
@@ -2587,7 +2580,7 @@ int main(int argc, char *argv[])
 				     << "Re-run with --low-mem-ssd, or raise --max-mem." << endl;
 				exit(1);
 			}
-			int* chromTable = (int*) calloc((size_t)maxChrLen + 1, sizeof(int));
+			uint32_t* chromTable = (uint32_t*) calloc((size_t)maxChrLen + 1, sizeof(uint32_t));
 			int* numReadsBeg = (sortMode == 'b')
 				? (int*) calloc((size_t)maxChrLen + 1, sizeof(int))
 				: NULL;
@@ -2664,7 +2657,7 @@ int main(int argc, char *argv[])
 						exit(1);
 					}
 					{
-						std::vector<int> chromTable((size_t)thisChrLen + 1, 0);
+						std::vector<uint32_t> chromTable((size_t)thisChrLen + 1, 0);
 						std::vector<int> numReadsBeg;
 						if(sortMode == 'b') numReadsBeg.assign((size_t)thisChrLen + 1, 0);
 

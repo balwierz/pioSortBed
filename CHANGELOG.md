@@ -4,6 +4,32 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.8] — 2026-04-30
+
+### Changed
+- **Classic + bucket sort path read-count cap raised from INT_MAX to
+  UINT32_MAX-1**, matching `--low-mem-ssd`. All read-index storage
+  (`order[]`, `chromTable[]`, radix-sort scratch arrays, `readBuff[]`)
+  now uses `uint32_t` instead of `int`. The cap on every path is the
+  same: 4.29 B reads (1..UINT32_MAX-1; 0 is the end-of-list sentinel).
+- `sortIndicesDispatch` / `sortIndices<>` / `radixSort64` /
+  `buildRadixKeys<>` / `processChromBucketTpl<>` /
+  `processChromBucket` / `parseWeight` / `sumWeightsBuf` /
+  `sumWeightsList` / `ReadCmp<>` all updated to take `uint32_t*`
+  for indices and `size_t` for counts.
+
+### Fixed (incidental, but very welcome)
+- **The v3.0.6 mmap `-t 1` 6% layout regression is gone.** The type
+  widening above happened to nudge gcc into a code layout for main()
+  and the sort dispatch that performs at v3.0.5 speeds. Confirmed at
+  10M reads, p-core pinned: -t 1 went 2.31s -> 2.18-2.24s (back to
+  v3.0.5's 2.17s); -t 22 default went 1.79s -> 1.67-1.71s (back to
+  v3.0.5's 1.67s). Same source -> same binary -> same timing
+  (deterministic), so this is genuine, not noise. Net effect: v3.0.8
+  has all of v3.0.7's wins (silent stderr, -o, -v, slurp stdin,
+  parallel chunked emit, smaller lowMemNode, dynamic chrLenLimit,
+  no fixed line-length / chr-name limits) AND no -t 1 regression.
+
 ## [3.0.7] — 2026-04-30
 
 ### Added
