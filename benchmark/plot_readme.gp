@@ -1,4 +1,8 @@
 set datafile separator ','
+# Treat 0 values as "missing" so configurations skipped at huge sizes (e.g.
+# pioSortBed -t 8 and bedtools at 100M+ where they'd OOM on this fixture)
+# don't drop to log(0) = -inf.
+set datafile missing '0'
 set logscale x 10
 set format x '%.0s%c'
 set xtics nomirror

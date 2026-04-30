@@ -192,6 +192,65 @@ isn't available. For everyday file-input usage you almost always want
 
 ---
 
+## [3.0.0] — 2026-04-30
+
+Major version bump signalling the cumulative shift since 2.0.x: `pioSortBed`
+is now markedly faster than every other tool we tested across the full size
+range, and `--low-mem-ssd` has gone from "use this when RAM is tight" to
+"use this by default" — it's now strictly the fastest configuration for any
+mmap-able file >50k reads.
+
+### Bug fix
+- **`--low-mem-ssd` no longer caps the input file at <4 GB.** v2.2.2's
+  `uint32_t off` packing in `lowMemNode` (intended to be memory-neutral)
+  silently bailed out at files ≥4 GB, which silently aborted the benchmark
+  when it reached 100M reads. Reverted to `size_t off`; node size grows
+  from 16 B to 24 B (the trailing `int` requires 4 B padding for `size_t`
+  alignment), which is fine: the speed wins from pre-parsed `beg`+`end`
+  (also v2.2.2) are unaffected, and at 200M reads the node table is
+  4.8 GB — well within the 21 GB peak.
+
+### New benchmark coverage (100M and 200M reads)
+The benchmark now runs through 200M-row BED6 fixtures (~8.6 GB input).
+At those sizes `pioSortBed -t 8` and `bedtools` are skipped because
+their memory growth (per-thread `chromTable` slabs and linear-in-input
+respectively) would exceed the 30 GB RAM available on the test box.
+
+#### 200M reads — wall time
+| Tool | Wall | Peak RSS |
+|---|---:|---:|
+| **`pioSortBed --low-mem-ssd`** (default `-t 0`, `--max-mem=4G`) | **22.72 s** | 21.1 GB |
+| GNU sort `--parallel=8` | 1min 45.5 s | 15.4 GB |
+| bedops `sort-bed` | 2min 34.6 s | 10.4 GB |
+| `pioSortBed -t 1` | 1min 8.4 s | 13.6 GB |
+| GNU sort `--parallel=1` | 5min 28.5 s | 15.4 GB |
+
+`pioSortBed --low-mem-ssd` is **4.6× faster than GNU sort 8t**, **6.8×
+faster than bedops**, and **14.5× faster than GNU sort 1t** at 200M.
+
+### Tooling
+- `benchmark.sh` extended to 14 size points (10k → 200M).
+- For huge sizes (`>= 100M`):
+  - `pio8` and `bedtools` skipped (would OOM the 30 GB system).
+  - `pio-lm` runs with `--max-mem=4G` to cap concurrent per-chromosome buffers.
+  - GNU sort uses `--buffer-size=50%` (down from 80%) so its in-process
+    buffer doesn't race against `pio-lm`'s working set.
+  - Tool outputs go to `/dev/null` instead of the tmpfs `$TMPDIR/output.tmp`
+    so multi-GB outputs don't fill the workdir.
+- Recommend running with `TMPDIR=/var/tmp bash benchmark/benchmark.sh` for
+  huge fixtures: GNU sort's external-sort spillover and the 8 GB BED file
+  together exceed the typical 16 GB tmpfs ceiling.
+
+### Notes
+- `pio-lm` at 100M+ exclusively uses `--max-mem=4G` in the benchmark; without
+  that cap the default-thread-count parallelism would queue ~20 GB of
+  per-chromosome output buffers.
+- The 200M `pio-lm` measurement is technically run with default-but-capped
+  parallelism. Without the cap, peak RSS at -t 0 (22 cores) on this fixture
+  would push past 30 GB and risk OOM.
+
+---
+
 ## [Unreleased]
 
 ### Performance

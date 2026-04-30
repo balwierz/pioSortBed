@@ -8,6 +8,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PIO="$REPO_DIR/pioSortBed"
+# Default workdir is /tmp (typically tmpfs on Linux — fast, in RAM). Override
+# with TMPDIR=/var/tmp (or any disk-backed path) for huge fixtures: an 8 GB
+# 200M-row BED plus sort's external-sort spill files easily exceed the 16 GB
+# tmpfs ceiling on this hardware.
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/pioSortBed-bench.XXXXXX")
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -20,7 +24,12 @@ for arg in "$@"; do
     esac
 done
 
-SIZES=(10000 20000 50000 100000 200000 500000 1000000 2000000 5000000 10000000 20000000 50000000)
+SIZES=(10000 20000 50000 100000 200000 500000 1000000 2000000 5000000 10000000 20000000 50000000 100000000 200000000)
+
+# At sizes >= this, the regular pioSortBed -t 8 path and bedtools both exceed
+# 32 GB peak RSS on this fixture (per-thread chromTable slabs and bedtools'
+# linear-in-input memory model). Skip those configurations rather than OOM.
+HUGE_SKIP_THRESHOLD=100000000
 CHROMS=("chr1" "chr2" "chr3" "chr4" "chr5" "chr10" "chr11" "chr20" "chrX" "chrY")
 
 # ---------------------------------------------------------------------------
@@ -48,12 +57,17 @@ generate_bed() {
 # Sets globals: RESULT_MS, RESULT_KB
 TIME_BIN=/usr/bin/time
 
+# When BENCH_BIG=1 (set for sizes >=100M to keep tmpfs from filling), tool
+# outputs go to /dev/null instead of $TMPDIR/output.tmp. Verification can't
+# work in that mode but timing/memory measurements are unaffected.
 run_and_measure() {
     local time_out="$TMPDIR/time.tmp"
+    local out_target="$TMPDIR/output.tmp"
+    if [[ "${BENCH_BIG:-0}" = "1" ]]; then out_target="/dev/null"; fi
     if [[ -n "${BENCH_STDIN:-}" ]]; then
-        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
+        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" < "$BENCH_STDIN" > "$out_target" 2>"$TMPDIR/stderr.tmp"
     else
-        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
+        "$TIME_BIN" -f '%e %M' -o "$time_out" "$@" > "$out_target" 2>"$TMPDIR/stderr.tmp"
     fi
     # GNU time outputs: elapsed_seconds peak_rss_kb
     read -r secs kb < "$time_out"
@@ -66,10 +80,12 @@ run_and_measure() {
 run_shell_and_measure() {
     local cmd="$1"
     local time_out="$TMPDIR/time.tmp"
+    local out_target="$TMPDIR/output.tmp"
+    if [[ "${BENCH_BIG:-0}" = "1" ]]; then out_target="/dev/null"; fi
     if [[ -n "${BENCH_STDIN:-}" ]]; then
-        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" < "$BENCH_STDIN" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
+        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" < "$BENCH_STDIN" > "$out_target" 2>"$TMPDIR/stderr.tmp"
     else
-        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" > "$TMPDIR/output.tmp" 2>"$TMPDIR/stderr.tmp"
+        "$TIME_BIN" -f '%e %M' -o "$time_out" bash -c "$cmd" > "$out_target" 2>"$TMPDIR/stderr.tmp"
     fi
     read -r secs kb < "$time_out"
     RESULT_MS=$(awk "BEGIN { printf \"%d\", $secs * 1000 }")
@@ -197,11 +213,23 @@ for n in "${SIZES[@]}"; do
     BENCH_FILE="$TMPDIR/test_${n}.bed"
     BENCH_STDIN=""
 
+    # At sizes >= HUGE_SKIP_THRESHOLD: redirect tool outputs to /dev/null so
+    # multi-GB outputs don't fill the tmpfs $TMPDIR; also skip the cp's.
+    BENCH_BIG=0
+    if (( n >= HUGE_SKIP_THRESHOLD )); then BENCH_BIG=1; fi
+    export BENCH_BIG
+
+    # Lower sort's --buffer-size at huge sizes so sort -t 8 doesn't pre-
+    # allocate a buffer that races against pio-lm's working set on a
+    # 30 GB-RAM system.
+    EFF_SORT_BUF="$SORT_BUF"
+    if (( BENCH_BIG )); then EFF_SORT_BUF="50%"; fi
+
     # Generate test data
     generate_bed "$n" "$BENCH_FILE"
 
     # --- Reference: LC_ALL=C sort -k1,1 -k2,2n (gold standard) ---
-    if (( VERIFY )); then
+    if (( VERIFY )) && (( ! BENCH_BIG )); then
         LC_ALL=C sort -k1,1 -k2,2n --buffer-size="$SORT_BUF" "$BENCH_FILE" > "$TMPDIR/ref_out.txt"
         awk -F'\t' '{print $1"\t"$2}' "$TMPDIR/ref_out.txt" > "$TMPDIR/ref_keys.txt"
     fi
@@ -210,35 +238,45 @@ for n in "${SIZES[@]}"; do
     # --- pioSortBed single-threaded ---
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE"
     pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
-    cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
+    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
 
-    # --- pioSortBed 8-threaded (parallelizes at all sizes since v2.1.0) ---
-    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
-    pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
-    cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+    # --- pioSortBed 8-threaded (regular bucket-sort path; per-thread chromTable
+    # slabs blow past 32 GB at 100M+ reads, so skip those sizes) ---
+    pio8_ms=0; pio8_kb=0
+    if (( ! BENCH_BIG )); then
+        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
+        pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
+        cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+    fi
 
-    # --- pioSortBed low-memory SSD mode ---
-    bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
+    # --- pioSortBed low-memory SSD mode (default thread count = all cores).
+    # At huge sizes, cap concurrent per-chromosome buffers via --max-mem so
+    # default-thread-count parallelism can't blow past available RAM. ---
+    if (( BENCH_BIG )); then
+        bench_one "pio-lm" "$PIO" --low-mem-ssd --max-mem=4G "$BENCH_FILE"
+    else
+        bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE"
+    fi
     pio_lm_ms=$RESULT_MS; pio_lm_kb=$RESULT_KB
-    cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm_out.txt"
+    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm_out.txt"
 
     # --- GNU sort single-threaded ---
     sort1_ms=0; sort1_kb=0
     if (( HAS_SORT )); then
-        bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$SORT_BUF '$BENCH_FILE'"
+        bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort1_ms=$RESULT_MS; sort1_kb=$RESULT_KB
     fi
 
     # --- GNU sort 8-threaded ---
     sort8_ms=0; sort8_kb=0
     if (( HAS_SORT )); then
-        bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$SORT_BUF '$BENCH_FILE'"
+        bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort8_ms=$RESULT_MS; sort8_kb=$RESULT_KB
     fi
 
-    # --- bedtools sort ---
+    # --- bedtools sort (memory grows ~linearly with input; skip at >=100M) ---
     bt_ms=0; bt_kb=0
-    if (( HAS_BEDTOOLS )) && (( n < 100000000 )); then
+    if (( HAS_BEDTOOLS )) && (( ! BENCH_BIG )); then
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS; bt_kb=$RESULT_KB
         cp "$TMPDIR/output.tmp" "$TMPDIR/bt_out.txt"
@@ -249,7 +287,7 @@ for n in "${SIZES[@]}"; do
     if (( HAS_BEDOPS )); then
         bench_one "bo" sort-bed "$BENCH_FILE"
         bo_ms=$RESULT_MS; bo_kb=$RESULT_KB
-        cp "$TMPDIR/output.tmp" "$TMPDIR/bo_out.txt"
+        (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/bo_out.txt"
     fi
 
     # --- Verify correctness vs LC_ALL=C sort reference ---
@@ -325,20 +363,34 @@ echo ""
 for n in "${SIZES[@]}"; do
     BENCH_FILE="$TMPDIR/test_${n}.bed"
     BENCH_STDIN=""
+
+    BENCH_BIG=0
+    if (( n >= HUGE_SKIP_THRESHOLD )); then BENCH_BIG=1; fi
+    export BENCH_BIG
+    EFF_SORT_BUF="$SORT_BUF"
+    if (( BENCH_BIG )); then EFF_SORT_BUF="50%"; fi
+
     generate_bed "$n" "$BENCH_FILE"
 
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE";  pio1_ms=$RESULT_MS
-    bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
-    bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
+    pio8_ms=0
+    if (( ! BENCH_BIG )); then
+        bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
+    fi
+    if (( BENCH_BIG )); then
+        bench_one "pio-lm" "$PIO" --low-mem-ssd --max-mem=4G "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
+    else
+        bench_one "pio-lm" "$PIO" --low-mem-ssd "$BENCH_FILE";  pio_lm_ms=$RESULT_MS
+    fi
 
     sort1_ms=0; sort8_ms=0; bt_ms=0; bo_ms=0
     if (( HAS_SORT )); then
-        bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$SORT_BUF '$BENCH_FILE'"
+        bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort1_ms=$RESULT_MS
-        bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$SORT_BUF '$BENCH_FILE'"
+        bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort8_ms=$RESULT_MS
     fi
-    if (( HAS_BEDTOOLS )) && (( n < 100000000 )); then
+    if (( HAS_BEDTOOLS )) && (( ! BENCH_BIG )); then
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS
     fi

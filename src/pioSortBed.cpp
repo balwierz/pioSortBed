@@ -376,20 +376,19 @@ static inline float sumWeightsList(seqread* reads, int* chromTable, int pos)
 
 // One node per line in --low-mem-ssd's pass-1 index.
 //
-//   off  — byte offset of the line's start within the mmap. uint32_t (rather
-//          than size_t) saves 4 bytes per node and bounds the mode to files
-//          <4 GB (the BED equivalent is well above 100M reads).
+//   off  — byte offset of the line's start within the mmap (size_t so files
+//          can exceed 4 GB; ~100M+ reads).
 //   next — index of the next node in this chromosome's linked list (0 = end).
 //   beg, end — pre-parsed BED start/end coordinates. Storing them here lets
 //          pass 2 sort and emit without re-parsing the line; the only modes
 //          that still need a re-read are --sort 5 (strand) and --collapse
 //          (weight), each of which consults a single field.
 //
-// 16 bytes / node — same size as the previous {size_t off, int next} layout,
-// so 50M reads still cost ~800 MB of node table.
+// 24 bytes / node (size_t alignment forces 4 B padding after the trailing
+// int). 50M reads cost ~1.2 GB of node table; 200M reads cost ~4.8 GB.
 struct lowMemNode
 {
-	uint32_t off;
+	size_t off;
 	int next;
 	int beg;
 	int end;
@@ -436,16 +435,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 {
 	time_t tstart, tend;
 	time(&tstart);
-
-	// uint32_t offsets cap the file at <4 GB. Above that we'd silently
-	// truncate; bail out cleanly instead.
-	if(mmapSize > (size_t)UINT32_MAX)
-	{
-		cerr << "Error: --low-mem-ssd doesn't support files >= 4 GB "
-		     << "(input is " << (mmapSize >> 30) << " GB). "
-		     << "Use the default --threads N path, or rebuild with size_t offsets." << endl;
-		return 1;
-	}
 
 	string2chrInfoT chrInfo;
 	lowMemNode* nodes = NULL;
@@ -597,7 +586,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 						exit(1);
 					}
 
-					nodes[idx].off = (uint32_t)(linePtr - mmapBase);
+					nodes[idx].off = (size_t)(linePtr - mmapBase);
 					nodes[idx].beg = beg;
 					nodes[idx].end = lineEnd;
 
@@ -742,7 +731,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				nodes = tmp;
 			}
 
-			nodes[nodeCount].off = (uint32_t)(linePtr - mmapBase);
+			nodes[nodeCount].off = (size_t)(linePtr - mmapBase);
 			nodes[nodeCount].next = thisChrIt->second.lastRead;
 			nodes[nodeCount].beg = beg;
 			nodes[nodeCount].end = end;
@@ -781,8 +770,11 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	const bool needStrand = (sortMode == '5') && !fCollapse;
 
 	// Per-chrom worker. Returns 0 on success, 1 on parse error.
-	struct SortRecSB { int beg; int end; uint32_t off; };
-	static_assert(sizeof(SortRecSB) == 12, "SortRecSB should pack to 12 bytes");
+	// SortRecSB carries the bucket-sort key (beg, end) plus the line offset so
+	// pass 2 can emit without re-reading nodes[]. size_t off bumps the rec to
+	// 24 B (16 B + 8 padding to size_t alignment) but is required for
+	// files >= 4 GB.
+	struct SortRecSB { int beg; int end; size_t off; };
 	auto processChrom = [&](int ci, FILE* out) -> int {
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
 
