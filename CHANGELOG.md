@@ -4,6 +4,44 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.7] — 2026-04-30
+
+### Added
+- **`-v,--verbose`** flag — opt-in stderr timing and per-chromosome length
+  printout (the messages v3.0.6 removed). Default is silent.
+
+### Changed
+- **Stdin / gzip input now slurp into a buffer and parse via the mmap
+  path** instead of going line-by-line through `parseLines<false>`. The
+  old path called `getline` per line and arena-copied each line's tail
+  bytes (~50 B/line memcpy + per-call stdio overhead). The new path
+  reads the whole input once with `fread`, then runs the same
+  zero-copy memchr-based parser the file-mmap path uses.
+  - **Stdin @ 10M reads: 3.17 s → 1.71 s — 46% faster, and now matches
+    file-mmap performance (1.66 s).**
+  - Verified bit-identical output between file-input, stdin, and gzip
+    paths on the same fixture.
+  - Memory cost: holding the entire input in RAM. ~+30% peak RSS at
+    10M reads (657 MB → 886 MB) since the slurp buffer is the input
+    size and the realloc-doubling strategy holds old + new transiently.
+    For practical pipe inputs (<10 GB) this is fine.
+
+### Performance note (mmap -t 1 regression from v3.0.6)
+- v3.0.6's removal of the cerr / time() code in main() / lowMemSortMmap
+  caused a ~6% slowdown on classic mmap -t 1 (2.18s → 2.31s at 10M
+  reads, p-core pinned), even though the deleted code only ran once
+  per phase. Cause: gcc's response to source-size changes — different
+  inlining and code-layout decisions in main(). Confirmed deterministic
+  build; `-flto`, `-falign-{loops,functions}=64` didn't recover the
+  v3.0.5 layout. PGO would, but is out of scope.
+  - The `-v` flag in v3.0.7 puts the print code back behind a runtime
+    branch but does not recover the layout (compiler still optimizes
+    the dead branch out when verbose=false).
+  - --low-mem-ssd path: unchanged across v3.0.5..v3.0.7.
+  - stdin path: now 46% faster than v3.0.5 thanks to slurp+mmap.
+  - Net: the `-t 1` classic-sort path loses 6% but everywhere else
+    gets meaningful wins.
+
 ## [3.0.6] — 2026-04-30
 
 ### Added

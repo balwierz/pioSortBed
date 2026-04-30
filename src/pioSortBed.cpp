@@ -555,8 +555,11 @@ struct ChromBuf
 // depends on the largest chromosome chunk, not the whole file.
 static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
                           bool fRal, int fCollapse, char sortMode, int numThreads,
-                          bool naturalSort, size_t maxMemBytes)
+                          bool naturalSort, size_t maxMemBytes, bool verbose)
 {
+	time_t tstart, tend;
+	if(verbose) time(&tstart);
+
 	string2chrInfoT chrInfo;
 	lowMemNode* nodes = NULL;
 	size_t nodeCount = 1;  // index 0 reserved as end-of-list sentinel
@@ -889,6 +892,16 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	else
 		std::sort(chroms.begin(), chroms.end());
 
+	if(verbose)
+	{
+		time(&tend);
+		fprintf(stderr, "Reading has taken %d seconds\n",
+		        (int)(difftime(tend, tstart)+0.5));
+		cerr << "We have " << nodeCount - 1 << " regions, "
+		     << chroms.size() << " chromosomes. Sorting..." << endl;
+		time(&tstart);
+	}
+
 	// Pass 2 accesses lines in chromosome-sorted order (not file order).
 	madvise(mmapBase, mmapSize, MADV_RANDOM);
 
@@ -1161,6 +1174,12 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	}
 
 	free(nodes);
+	if(verbose)
+	{
+		time(&tend);
+		fprintf(stderr, "Sorting has taken %d seconds\n",
+		        (int)(difftime(tend, tstart)+0.5));
+	}
 	return 0;
 }
 
@@ -2158,6 +2177,7 @@ int main(int argc, char *argv[])
 	bool naturalSort = false;
 	std::string maxMemStr;
 	std::string outputFile;
+	bool verbose = false;
 
 	app.add_option("input-file", inputFile,
 		"input file; \"-\" reads from stdin; .gz files are decompressed automatically")
@@ -2192,6 +2212,9 @@ int main(int argc, char *argv[])
 		"(e.g. 4G, 500M, 2048K, or bare bytes). Caps concurrent per-chromosome "
 		"chromTable allocations so peak RAM stays within budget. "
 		"Default: no cap (each thread allocates its own chromTable).");
+	app.add_flag("-v,--verbose", verbose,
+		"print parsing / sorting timing and per-chromosome length info to stderr "
+		"(default: silent)");
 
 	CLI11_PARSE(app, argc, argv);
 	const size_t maxMemBytes = parseMemSize(maxMemStr);
@@ -2230,11 +2253,42 @@ int main(int argc, char *argv[])
 	FILE* fh = NULL;
 	Arena* arena = NULL;
 
+	// Helper: slurp an entire FILE* into a malloc'd buffer + 1 NUL byte.
+	// Buffer doubles on growth. Returns NULL on OOM (caller errors out).
+	auto slurpStream = [](FILE* in, size_t* outFill) -> char* {
+		size_t cap = 1UL << 24;  // 16 MB initial
+		char* buf = (char*) malloc(cap + 1);
+		if(!buf) return NULL;
+		size_t fill = 0;
+		size_t n;
+		while((n = fread(buf + fill, 1, cap - fill, in)) > 0)
+		{
+			fill += n;
+			if(fill == cap)
+			{
+				cap *= 2;
+				char* nb = (char*) realloc(buf, cap + 1);
+				if(!nb) { free(buf); return NULL; }
+				buf = nb;
+			}
+		}
+		buf[fill] = '\0';
+		*outFill = fill;
+		return buf;
+	};
+
 	if(inputFile == "-")
 	{
-		fh = stdin;
+		// Slurp stdin into a buffer and feed it to the mmap-style parser.
+		// This gets us zero-copy line pointers (no per-line memcpy into an
+		// arena) at the cost of holding the input in memory.
+		size_t fill = 0;
+		mmapBase = slurpStream(stdin, &fill);
+		if(!mmapBase) { cerr << "Error: out of memory slurping stdin" << endl; return 1; }
+		mmapSize = fill;
+		useMmap = true;
 		const size_t chunkSize = 64UL * 1024 * 1024;
-		arena = new Arena(chunkSize, chunkSize);
+		arena = new Arena(chunkSize, chunkSize);  // for --collapse weight strings
 	}
 	else
 	{
@@ -2258,8 +2312,17 @@ int main(int argc, char *argv[])
 				cerr << "Error: cannot decompress " << inputFile << endl;
 				return 1;
 			}
+			// Slurp the decompressed output into a buffer (same trick as stdin).
+			size_t fill = 0;
+			mmapBase = slurpStream(fh, &fill);
+			pclose(fh);
+			fh = NULL;
+			isGzip = false;  // no longer need pclose at end
+			if(!mmapBase) { cerr << "Error: out of memory slurping gzip stream" << endl; return 1; }
+			mmapSize = fill;
+			useMmap = true;
 			const size_t chunkSize = 64UL * 1024 * 1024;
-			arena = new Arena(chunkSize, chunkSize);
+			arena = new Arena(chunkSize, chunkSize);  // for --collapse weight strings
 		}
 		else
 		{
@@ -2335,8 +2398,11 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 		return lowMemSortMmap(mmapBase, mmapSize, fRal, fCollapse, sortMode,
-		                      numThreads, naturalSort, maxMemBytes);
+		                      numThreads, naturalSort, maxMemBytes, verbose);
 	}
+
+	time_t tstart, tend;
+	if(verbose) time(&tstart);
 
 	int maxChrLen = 0;
 	string2chrInfoT chrInfo;
@@ -2375,12 +2441,20 @@ int main(int argc, char *argv[])
 	if(isGzip && fh) pclose(fh);
 	else if(fh && fh != stdin) fclose(fh);
 
+	if(verbose)
+	{
+		time(&tend);
+		fprintf(stderr, "Reading has taken %d seconds\n",
+		        (int)(difftime(tend, tstart)+0.5));
+	}
+
 	/***********************************
 	 *  the actual sorting starts here *
 	 * *********************************/
 	std::vector<std::string> chroms;
 	for(string2chrInfoT::iterator it=chrInfo.begin(); it!=chrInfo.end(); it++)
 	{
+		if(verbose) cerr << it->first << ": " << it->second.len << endl;
 		chroms.push_back(it->first);
 		if(maxChrLen < it->second.len)
 			maxChrLen = it->second.len;
@@ -2398,6 +2472,14 @@ int main(int argc, char *argv[])
 
 	size_t totalReads = readCount - 1;
 	bool useBucketSort = (bucketCutoff == 0) || (totalReads >= (size_t)bucketCutoff);
+	if(verbose)
+	{
+		cerr << "We have " << totalReads << " regions, "
+		     << chroms.size() << " chromosomes. "
+		     << (useBucketSort ? "Using bucket sort." : "Using classic sort.")
+		     << endl;
+		time(&tstart);
+	}
 
 	if(!useBucketSort)
 	{
@@ -2615,6 +2697,12 @@ int main(int argc, char *argv[])
 					printCv.notify_all();
 				});
 		}
+	}
+	if(verbose)
+	{
+		time(&tend);
+		fprintf(stderr, "Sorting has taken %d seconds\n",
+		        (int)(difftime(tend, tstart)+0.5));
 	}
 	return 0;
 }
