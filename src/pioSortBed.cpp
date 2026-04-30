@@ -557,9 +557,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
                           bool fRal, int fCollapse, char sortMode, int numThreads,
                           bool naturalSort, size_t maxMemBytes)
 {
-	time_t tstart, tend;
-	time(&tstart);
-
 	string2chrInfoT chrInfo;
 	lowMemNode* nodes = NULL;
 	size_t nodeCount = 1;  // index 0 reserved as end-of-list sentinel
@@ -892,12 +889,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	else
 		std::sort(chroms.begin(), chroms.end());
 
-	time(&tend);
-	fprintf(stderr, "Reading has taken %d seconds\n", (int)(difftime(tend, tstart)+0.5));
-	cerr << "We have " << nodeCount - 1 << " regions.\n"
-		 << chroms.size() << " chromosomes\nSorting..." << endl;
-	time(&tstart);
-
 	// Pass 2 accesses lines in chromosome-sorted order (not file order).
 	madvise(mmapBase, mmapSize, MADV_RANDOM);
 
@@ -1170,8 +1161,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	}
 
 	free(nodes);
-	time(&tend);
-	fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime(tend, tstart)+0.5));
 	return 0;
 }
 
@@ -2168,10 +2157,13 @@ int main(int argc, char *argv[])
 	int numThreads = 0;
 	bool naturalSort = false;
 	std::string maxMemStr;
+	std::string outputFile;
 
 	app.add_option("input-file", inputFile,
 		"input file; \"-\" reads from stdin; .gz files are decompressed automatically")
 		->required();
+	app.add_option("-o,--output", outputFile,
+		"write sorted output to this file (default: stdout)");
 	app.add_option("-s,--sort", sortMode,
 		"s: start coordinate [default]\n"
 		"b: sort also by end coordinate\n"
@@ -2204,6 +2196,19 @@ int main(int argc, char *argv[])
 	CLI11_PARSE(app, argc, argv);
 	const size_t maxMemBytes = parseMemSize(maxMemStr);
 
+	// -o/--output redirects stdout to the named file. All downstream data
+	// emit (fputs_unlocked, fwrite_unlocked, printf in collapse mode) goes
+	// through stdout, so freopen-ing it here is a single-line redirect with
+	// no other code changes needed. Diagnostics stay on stderr.
+	if(!outputFile.empty())
+	{
+		if(!freopen(outputFile.c_str(), "w", stdout))
+		{
+			cerr << "Error: cannot open " << outputFile << " for writing" << endl;
+			return 1;
+		}
+	}
+
 	if(numThreads <= 0)
 	{
 		unsigned hw = std::thread::hardware_concurrency();
@@ -2228,7 +2233,6 @@ int main(int argc, char *argv[])
 	if(inputFile == "-")
 	{
 		fh = stdin;
-		cerr << "Reading data from standard input" << endl;
 		const size_t chunkSize = 64UL * 1024 * 1024;
 		arena = new Arena(chunkSize, chunkSize);
 	}
@@ -2254,7 +2258,6 @@ int main(int argc, char *argv[])
 				cerr << "Error: cannot decompress " << inputFile << endl;
 				return 1;
 			}
-			cerr << "Reading gzip data from " << inputFile << endl;
 			const size_t chunkSize = 64UL * 1024 * 1024;
 			arena = new Arena(chunkSize, chunkSize);
 		}
@@ -2335,9 +2338,6 @@ int main(int argc, char *argv[])
 		                      numThreads, naturalSort, maxMemBytes);
 	}
 
-	time_t tstart, tend;
-	time(&tstart);
-
 	int maxChrLen = 0;
 	string2chrInfoT chrInfo;
 	seqread* reads = NULL;
@@ -2375,25 +2375,16 @@ int main(int argc, char *argv[])
 	if(isGzip && fh) pclose(fh);
 	else if(fh && fh != stdin) fclose(fh);
 
-	time(&tend);
-	double difftime_reading = difftime(tend, tstart);
-	fprintf(stderr, "Reading has taken %d seconds\n", (int)(difftime_reading+0.5));
-
 	/***********************************
 	 *  the actual sorting starts here *
 	 * *********************************/
-	int nChrom = chrInfo.size();
 	std::vector<std::string> chroms;
 	for(string2chrInfoT::iterator it=chrInfo.begin(); it!=chrInfo.end(); it++)
 	{
-		cerr << it->first << ": " << it->second.len << endl;
 		chroms.push_back(it->first);
 		if(maxChrLen < it->second.len)
 			maxChrLen = it->second.len;
 	}
-	cerr << "We have " << readCount-1 << " regions.\n"
-		<< nChrom << " chromosomes\nSorting..." << endl;
-	time(&tstart);
 
 	if(naturalSort)
 		std::sort(chroms.begin(), chroms.end(), naturalChrLess);
@@ -2407,10 +2398,6 @@ int main(int argc, char *argv[])
 
 	size_t totalReads = readCount - 1;
 	bool useBucketSort = (bucketCutoff == 0) || (totalReads >= (size_t)bucketCutoff);
-	if(useBucketSort)
-		cerr << "Using bucket sort (" << totalReads << " reads >= cutoff " << bucketCutoff << ")" << endl;
-	else
-		cerr << "Using classic sort (" << totalReads << " reads < cutoff " << bucketCutoff << ")" << endl;
 
 	if(!useBucketSort)
 	{
@@ -2442,8 +2429,6 @@ int main(int argc, char *argv[])
 		// Both 1-thread and N-thread paths go through sortIndicesDispatch which
 		// picks the templated comparator at compile time and chooses serial vs
 		// std::execution::par based on numThreads.
-		if(numThreads > 1)
-			cerr << "Parallel sort using " << numThreads << " threads" << endl;
 		sortIndicesDispatch(order, (int)totalReads, reads, sortMode, numThreads);
 
 		if(fCollapse)
@@ -2526,7 +2511,6 @@ int main(int argc, char *argv[])
 				: NULL;
 			for(const std::string& chrom : chroms)
 			{
-				cerr << "Sorting " << chrom << endl;
 				string2chrInfoT::iterator cit = chrInfo.find(chrom);
 				processChromBucket(chrom.c_str(), cit->second.len, cit->second.lastRead,
 				                   reads, sortMode, fCollapse, fullLine,
@@ -2537,12 +2521,6 @@ int main(int argc, char *argv[])
 		}
 		else
 		{
-			cerr << "Parallel bucket sort using up to " << numThreads << " threads ("
-			     << chroms.size() << " chromosomes)";
-			if(maxMemBytes > 0)
-				cerr << ", chromTable budget = " << (maxMemBytes >> 20) << " MB";
-			cerr << endl;
-
 			std::vector<int> idxs(chroms.size());
 			for(size_t i = 0; i < chroms.size(); i++) idxs[i] = (int)i;
 
@@ -2638,8 +2616,5 @@ int main(int argc, char *argv[])
 				});
 		}
 	}
-	time(&tend);
-	double difftime_sorting = difftime(tend, tstart);
-	fprintf(stderr, "Sorting has taken %d seconds\n", (int)(difftime_sorting+0.5));
 	return 0;
 }

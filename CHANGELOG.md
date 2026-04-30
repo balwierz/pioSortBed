@@ -4,6 +4,25 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.0.6] — 2026-04-30
+
+### Added
+- **`-o,--output FILE`** — write sorted output to a file directly. Internally
+  this `freopen`'s stdout, so all data-emit paths route there with no other
+  code changes. `pioSortBed file.bed > sorted.bed` continues to work
+  identically.
+
+### Removed
+- All chatty informational stderr messages. Stdout was always data-only,
+  but stderr was carrying decade-old "Reading has taken N seconds",
+  "Sorting has taken N seconds", "We have N regions / M chromosomes",
+  per-chromosome length printouts, "Sorting chr1" / "Sorting chr2",
+  "Using bucket sort", "Using classic sort", "Parallel sort using N
+  threads", "Parallel bucket sort using up to N threads", "Reading data
+  from standard input", "Reading gzip data from ...". All gone.
+- Error / "out of memory" / parse-failure / over-budget-allocation
+  messages remain on stderr — those are actionable.
+
 ## [3.0.5] — 2026-04-30
 
 ### Removed
