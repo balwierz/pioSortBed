@@ -87,11 +87,14 @@ Comprehensive sorting benchmark on realistic BED6 files (10 chromosomes, coordin
 
 | Tool | Version | Command |
 |------|---------|---------|
-| **pioSortBed** | 3.0.0 | `pioSortBed -t 1 input.bed` (single-thread) |
-| **pioSortBed** | 3.0.0 | `pioSortBed -t 8 input.bed` (8 threads) |
-| **pioSortBed** (low-mem) | 3.0.0 | `pioSortBed --low-mem-ssd -t 1 input.bed` (single-thread) |
-| **pioSortBed** (low-mem) | 3.0.0 | `pioSortBed --low-mem-ssd -t 8 input.bed` (8 threads, recommended fast path) |
+| **pioSortBed** | 3.0.8 | `pioSortBed -t 1 input.bed` (single-thread) |
+| **pioSortBed** | 3.0.8 | `pioSortBed -t 4 input.bed` (4 threads) |
+| **pioSortBed** | 3.0.8 | `pioSortBed -t 8 input.bed` (8 threads) |
+| **pioSortBed** (low-mem) | 3.0.8 | `pioSortBed --low-mem-ssd -t 1 input.bed` (single-thread) |
+| **pioSortBed** (low-mem) | 3.0.8 | `pioSortBed --low-mem-ssd -t 4 input.bed` (4 threads) |
+| **pioSortBed** (low-mem) | 3.0.8 | `pioSortBed --low-mem-ssd -t 8 input.bed` (8 threads, recommended fast path) |
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n input.bed` (single-thread) |
+| **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n --parallel=4 input.bed` (4 threads) |
 | **GNU sort** | 9.10 | `LC_ALL=C sort -k1,1 -k2,2n --parallel=8 input.bed` (8 threads) |
 | **bedtools** | 2.31.1 | `bedtools sort -i input.bed` |
 | **bedops sort-bed** | 2.4.42 | `sort-bed input.bed` |
@@ -107,57 +110,64 @@ Wall time and peak RSS (resident set size) measured with GNU time. Times in seco
 
 #### Legend (colour & line style):
 
-Same colour per tool; thread count distinguished by line style (`-t 1` solid, `-t 8` dotted). pioSortBed classic and pioSortBed low-mem are different *algorithms* and get different colours.
+Same colour per tool family; thread count distinguished by line style (`-t 1` solid, `-t 4` dashed, `-t 8` dotted). pioSortBed classic and pioSortBed low-mem are different *algorithms* and get different colours. bedtools and bedops are single-threaded by design.
 
 | Tool                | Colour     | Marker | Line   | Description |
 |---------------------|------------|--------|--------|-------------|
-| **pioSortBed 1t**       | <span style="color:#e41a1c">████</span> | ● | solid  | Classic path, single-thread |
-| **pioSortBed 8t**       | <span style="color:#e41a1c">████</span> | ● | dotted | Classic path, 8 threads |
-| **pioSortBed low-mem 1t** | <span style="color:#c51b7d">████</span> | ◆ | solid  | Low-memory SSD mode, single-thread |
-| **pioSortBed low-mem 8t** | <span style="color:#c51b7d">████</span> | ◆ | dotted | Low-memory SSD mode, 8 threads (recommended fast path) |
-| **GNU sort 1t**         | <span style="color:#4daf4a">████</span> | ▲ | solid  | Single-thread |
-| **GNU sort 8t**         | <span style="color:#4daf4a">████</span> | ▲ | dotted | 8 threads |
-| **bedtools**            | <span style="color:#984ea3">████</span> | ✚ | solid  | bedtools sort |
-| **bedops**              | <span style="color:#a65628">████</span> | ✦ | solid  | bedops sort-bed |
+| **pioSortBed 1t**       | <span style="color:#e41a1c">████</span> | ● | solid   | Classic path, single-thread |
+| **pioSortBed 4t**       | <span style="color:#e41a1c">████</span> | ● | dashed  | Classic path, 4 threads |
+| **pioSortBed 8t**       | <span style="color:#e41a1c">████</span> | ● | dotted  | Classic path, 8 threads |
+| **pioSortBed low-mem 1t** | <span style="color:#c51b7d">████</span> | ◆ | solid   | Low-memory SSD mode, single-thread |
+| **pioSortBed low-mem 4t** | <span style="color:#c51b7d">████</span> | ◆ | dashed  | Low-memory SSD mode, 4 threads |
+| **pioSortBed low-mem 8t** | <span style="color:#c51b7d">████</span> | ◆ | dotted  | Low-memory SSD mode, 8 threads (recommended fast path) |
+| **GNU sort 1t**         | <span style="color:#4daf4a">████</span> | ▲ | solid   | Single-thread |
+| **GNU sort 4t**         | <span style="color:#4daf4a">████</span> | ▲ | dashed  | 4 threads |
+| **GNU sort 8t**         | <span style="color:#4daf4a">████</span> | ▲ | dotted  | 8 threads |
+| **bedtools**            | <span style="color:#984ea3">████</span> | ✚ | solid   | bedtools sort |
+| **bedops**              | <span style="color:#a65628">████</span> | ✦ | solid   | bedops sort-bed |
 
-| Reads | pio 1t ● | pio 8t ● | pio low-mem 1t ◆ | pio low-mem 8t ◆ | sort 1t ▲  | sort 8t ▲  | bedtools ✚ | bedops ✦   |
-|------:|---------:|---------:|-----------------:|-----------------:|-----------:|-----------:|-----------:|-----------:|
-| 10k   | 0 ms     | 0 ms      | 0 ms             | 0 ms             | 10 ms      | 0 ms       | 10 ms      | 0 ms       |
-| 20k   | 0 ms     | 0 ms      | 10 ms            | 0 ms             | 10 ms      | 10 ms      | 20 ms      | 10 ms      |
-| 50k   | 10 ms    | 10 ms     | 10 ms            | 10 ms            | 30 ms      | 30 ms      | 40 ms      | 30 ms      |
-| 100k  | 10 ms    | 10 ms     | 40 ms            | 20 ms            | 70 ms      | 70 ms      | 90 ms      | 50 ms      |
-| 200k  | 30 ms    | 20 ms     | 60 ms            | 30 ms            | 150 ms     | 90 ms      | 170 ms     | 110 ms     |
-| 500k  | 100 ms   | 70 ms     | 150 ms           | **60 ms**        | 410 ms     | 160 ms     | 450 ms     | 290 ms     |
-| 1M    | 210 ms   | 170 ms    | 210 ms           | **150 ms**       | 880 ms     | 320 ms     | 920 ms     | 590 ms     |
-| 2M    | 440 ms   | 350 ms    | 410 ms           | **230 ms**       | 1870 ms    | 630 ms     | 1930 ms    | 1360 ms    |
-| 5M    | 1120 ms  | 880 ms    | 1520 ms          | **490 ms**       | 5170 ms    | 1670 ms    | 4680 ms    | 3310 ms    |
-| 10M   | 2250 ms  | 1780 ms   | 2480 ms          | **1060 ms**      | 11.29 s    | 3450 ms    | 9610 ms    | 6540 ms    |
-| 20M   | 4620 ms  | 3640 ms   | 5170 ms          | **1940 ms**      | 24.48 s    | 7120 ms    | 19.93 s    | 14.26 s    |
-| 50M   | 19.74 s  | 6150 ms   | 13.40 s          | **4.30 s**       | 1min07.2s  | 19.85 s    | 53.10 s    | 34.42 s    |
-| 100M  | 35.66 s  | —         | 25.67 s          | **7.64 s**       | 2min24.0s  | 51.21 s    | —          | 1min07.7s  |
-| 200M  | 1min08.4s | —        | 55.30 s          | **23.56 s**      | 5min28.5s  | 1min45.5s  | —          | 2min34.6s  |
+| Reads | pio 1t | pio 4t | pio 8t | pio lm 1t | pio lm 4t | pio lm 8t | sort 1t   | sort 4t  | sort 8t   | bedtools | bedops    |
+|------:|-------:|-------:|-------:|----------:|----------:|----------:|----------:|---------:|----------:|---------:|----------:|
+| 10k   | 0 ms   | 0 ms   | 0 ms   | 0 ms      | 0 ms      | 0 ms      | 0 ms      | 10 ms    | 0 ms      | 10 ms    | 0 ms      |
+| 20k   | 0 ms   | 0 ms   | 0 ms   | 0 ms      | 0 ms      | 0 ms      | 10 ms     | 10 ms    | 10 ms     | 20 ms    | 10 ms     |
+| 50k   | 10 ms  | 0 ms   | 0 ms   | 10 ms     | 0 ms      | 0 ms      | 30 ms     | 30 ms    | 30 ms     | 40 ms    | 30 ms     |
+| 100k  | 10 ms  | 10 ms  | 10 ms  | 10 ms     | 10 ms     | 10 ms     | 70 ms     | 70 ms    | 70 ms     | 80 ms    | 50 ms     |
+| 200k  | 30 ms  | 30 ms  | 20 ms  | 30 ms     | 20 ms     | 20 ms     | 150 ms    | 90 ms    | 90 ms     | 180 ms   | 120 ms    |
+| 500k  | 100 ms | 70 ms  | 70 ms  | 90 ms     | **40 ms** | **40 ms** | 410 ms    | 170 ms   | 170 ms    | 450 ms   | 300 ms    |
+| 1M    | 210 ms | 180 ms | 170 ms | 180 ms    | 130 ms    | **70 ms** | 880 ms    | 360 ms   | 310 ms    | 900 ms   | 630 ms    |
+| 2M    | 430 ms | 410 ms | 380 ms | 360 ms    | 210 ms    | **150 ms**| 1900 ms   | 730 ms   | 600 ms    | 1900 ms  | 1290 ms   |
+| 5M    | 1130 ms| 920 ms | 900 ms | 930 ms    | 590 ms    | **350 ms**| 5210 ms   | 2030 ms  | 1690 ms   | 4690 ms  | 3330 ms   |
+| 10M   | 2280 ms| 1810 ms| 1830 ms| 1950 ms   | 1020 ms   | **690 ms**| 11.32 s   | 4370 ms  | 3470 ms   | 9600 ms  | 6770 ms   |
+| 20M   | 4670 ms| 3690 ms| 3660 ms| 3900 ms   | 2710 ms   | **1330 ms**| 24.44 s  | 9220 ms  | 7270 ms   | 20.03 s  | 13.80 s   |
+| 50M   | 21.51 s| 15.52 s| 5960 ms| 10.17 s   | 5300 ms   | **3310 ms**| 1min07.5s| 24.74 s  | 19.70 s   | 53.35 s  | 34.23 s   |
+| 100M  | 38.56 s| —      | —      | 20.31 s   | 11.49 s   | **7230 ms**| 2min25.5s| 53.14 s  | 51.00 s   | —        | 1min07.9s |
+| 200M  | 1min11s| —      | —      | 42.72 s   | 23.59 s   | **19.02 s**| 5min25.4s| 2min06.5s| 1min47.8s | —        | 2min32.9s |
 
 > Sub-50 ms timings (10k–50k) bottom out at GNU `time`'s 10 ms resolution; raw 0 ms readings just mean the tool finished faster than the timer can resolve.
 >
-> `pio 8t` and `bedtools` are skipped at 100M+ because they would exceed the 30 GB RAM available on this hardware. `pio 8t` allocates a per-chromosome `chromTable` slab on each worker (chr1 alone is ~1 GB), and `bedtools` memory grows linearly with the input. Use `pioSortBed --low-mem-ssd -t 8` instead at those sizes.
+> `pio 4t` / `pio 8t` and `bedtools` are skipped at 100M+ because they would exceed the 30 GB RAM available on this hardware. `pio -t N` allocates a per-chromosome `chromTable` slab on each worker (chr1 alone is ~1 GB), and `bedtools` memory grows linearly with the input. Use `pioSortBed --low-mem-ssd -t 4` or `-t 8` instead at those sizes.
 
 **Key observations:**
-- **`pioSortBed --low-mem-ssd -t 8` is the fastest configuration at every size from
-  500k upwards.** Both passes are parallelised; the per-line index is a 16-byte
-  flat node table; pass-2 output is written through a pre-sized chunked buffer
-  with no realloc churn. At 200M reads (8.6 GB BED file), it's **23.6 s —
-  4.5× faster than GNU sort 8t, 6.6× over bedops, 13.9× over GNU sort 1t**.
+- **`pioSortBed --low-mem-ssd -t 8` is the fastest configuration at every size
+  from 500k upwards.** Both passes are parallelised; the per-line index is a
+  16-byte flat node table; pass-2 output is written through a pre-sized
+  chunked buffer. At 200M reads (8.6 GB BED file), it's **19.0 s — 5.7× faster
+  than GNU sort 8t, 8.0× over bedops, 17.1× over GNU sort 1t**.
+- **`pioSortBed --low-mem-ssd -t 4` is a sweet spot between memory and speed.**
+  At 200M it's **23.6 s / 15.2 GB**: ~25% slower than `-t 8` but uses ~17%
+  less RAM, and still 4.5× faster than GNU sort 8t.
 - **`pioSortBed --low-mem-ssd -t 1` beats `pioSortBed -t 1` from 5M upwards**
-  (50M: 13.4 s vs 19.7 s — 1.5× faster) and uses ~30% less memory (50M: 2.9 GB
+  (50M: 10.2 s vs 21.5 s — 2.1× faster) and uses ~30% less memory (50M: 2.9 GB
   vs 4.1 GB). At small sizes the two-pass overhead makes the regular path
   marginally faster, but the low-mem path scales much better.
-- **`pioSortBed 1t`** (with the LSD radix sort) beats GNU sort 1t by 3–5× across
+- **`pioSortBed 1t`** (with the LSD radix sort) beats GNU sort 1t by 3–4× across
   the whole range and stays competitive with GNU sort 8t up through 2M.
 - **`bedops sort-bed`** remains the closest single-threaded competitor and uses
   the least memory of any tool tested at small sizes.
-- The regular `pioSortBed -t 8` parallel bucket-sort path is fast at 50M
-  (6.15 s) but its per-thread `chromTable` slabs scale linearly with the
-  largest chromosome. For large inputs, `--low-mem-ssd -t 8` strictly dominates.
+- The regular `pioSortBed -t 4 / -t 8` parallel bucket-sort path is fast at 50M
+  (6.0 s at -t 8) but its per-thread `chromTable` slabs scale linearly with
+  the largest chromosome. For large inputs, `--low-mem-ssd -t 8` strictly
+  dominates.
 
 ### Peak Memory (RSS)
 
@@ -165,43 +175,46 @@ Same colour per tool; thread count distinguished by line style (`-t 1` solid, `-
 
 ![Peak memory usage (both axes linear)](benchmark/benchmark_memory_linear.png)
 
-| Reads | pio 1t ●  | pio 8t ●    | pio low-mem 1t ◆ | pio low-mem 8t ◆ | sort 1t ▲ | sort 8t ▲ | bedtools ✚ | bedops ✦   |
-|------:|----------:|------------:|-----------------:|-----------------:|----------:|----------:|-----------:|-----------:|
-| 10k   | 6.6 MB    | 6.7 MB      | 6.8 MB           | 6.4 MB           | 3.3 MB    | 3.2 MB    | 8.8 MB     | 2.0 MB     |
-| 20k   | 7.7 MB    | 7.1 MB      | 7.4 MB           | 8.2 MB           | 3.2 MB    | 3.3 MB    | 12.4 MB    | 2.5 MB     |
-| 50k   | 10.4 MB   | 11.1 MB     | 10.0 MB          | 11.9 MB          | 5.7 MB    | 5.4 MB    | 24.3 MB    | 3.9 MB     |
-| 100k  | 15.6 MB   | 16.4 MB     | 14.6 MB          | 17.8 MB          | 9.8 MB    | 9.8 MB    | 44.1 MB    | 6.8 MB     |
-| 200k  | 26.1 MB   | 27.0 MB     | 24.2 MB          | 30.0 MB          | 18.5 MB   | 21.3 MB   | 83.8 MB    | 12.0 MB    |
-| 500k  | 47.3 MB   | 47.5 MB     | 41.7 MB          | 55.5 MB          | 43.8 MB   | 66.4 MB   | 202.9 MB   | 28.1 MB    |
-| 1M    | 90.1 MB   | 82.4 MB     | 70.3 MB          | 102.4 MB         | 86.6 MB   | 161.9 MB  | 400.8 MB   | 54.8 MB    |
-| 2M    | 176.3 MB  | 145.8 MB    | 128.3 MB         | 195.0 MB         | 172.7 MB  | 324.1 MB  | 797.8 MB   | 107.9 MB   |
-| 5M    | 434.6 MB  | 434.4 MB    | 301.4 MB         | 473.2 MB         | 431.2 MB  | 811.3 MB  | 1.9 GB     | 268.2 MB   |
-| 10M   | 865.1 MB  | 865.1 MB    | 591.3 MB         | 934.7 MB         | 861.4 MB  | 1.6 GB    | 3.9 GB     | 535.3 MB   |
-| 20M   | 1.7 GB    | 1.7 GB      | 1.2 GB           | 1.8 GB           | 1.7 GB    | 3.2 GB    | 7.8 GB     | 1.0 GB     |
-| 50M   | 4.1 GB    | **12.6 GB** | **2.9 GB**       | 4.6 GB           | 4.2 GB    | 8.0 GB    | 19.4 GB    | 2.6 GB     |
-| 100M  | 7.2 GB    | —           | **5.7 GB**       | 9.1 GB           | 8.5 GB    | 15.4 GB   | —          | 5.2 GB     |
-| 200M  | 13.6 GB   | —           | **11.5 GB**      | 17.7 GB          | 15.4 GB   | 15.4 GB   | —          | 10.4 GB    |
+| Reads | pio 1t  | pio 4t   | pio 8t      | pio lm 1t  | pio lm 4t | pio lm 8t | sort 1t  | sort 4t  | sort 8t | bedtools | bedops   |
+|------:|--------:|---------:|------------:|-----------:|----------:|----------:|---------:|---------:|--------:|---------:|---------:|
+| 10k   | 6.7 MB  | 6.6 MB   | 6.9 MB      | 6.5 MB     | 6.8 MB    | 6.6 MB    | 3.2 MB   | 3.0 MB   | 3.3 MB  | 8.7 MB   | 2.0 MB   |
+| 20k   | 7.5 MB  | 8.0 MB   | 7.5 MB      | 7.4 MB     | 7.8 MB    | 7.9 MB    | 3.3 MB   | 3.3 MB   | 3.4 MB  | 12.5 MB  | 2.3 MB   |
+| 50k   | 10.5 MB | 11.0 MB  | 11.0 MB     | 10.0 MB    | 11.6 MB   | 12.1 MB   | 5.9 MB   | 5.4 MB   | 5.8 MB  | 24.3 MB  | 4.1 MB   |
+| 100k  | 15.6 MB | 16.0 MB  | 16.4 MB     | 14.7 MB    | 17.5 MB   | 18.0 MB   | 9.7 MB   | 10.0 MB  | 9.9 MB  | 44.2 MB  | 6.8 MB   |
+| 200k  | 26.1 MB | 26.9 MB  | 26.9 MB     | 24.2 MB    | 28.6 MB   | 30.7 MB   | 18.5 MB  | 21.0 MB  | 21.3 MB | 84.0 MB  | 12.0 MB  |
+| 500k  | 47.8 MB | 48.5 MB  | 47.7 MB     | 41.4 MB    | 54.6 MB   | 58.5 MB   | 43.8 MB  | 66.2 MB  | 66.1 MB | 202.6 MB | 28.1 MB  |
+| 1M    | 90.3 MB | 82.7 MB  | 83.3 MB     | 70.0 MB    | 88.8 MB   | 102.9 MB  | 86.5 MB  | 131.5 MB | 161.4 MB| 401.0 MB | 54.8 MB  |
+| 2M    | 176.3 MB| 146.2 MB | 146.2 MB    | 128.3 MB   | 181.0 MB  | 193.9 MB  | 172.6 MB | 263.5 MB | 323.8 MB| 797.8 MB | 108.0 MB |
+| 5M    | 435.0 MB| 434.5 MB | 434.5 MB    | 301.5 MB   | 405.8 MB  | 487.2 MB  | 430.9 MB | 659.0 MB | 810.8 MB| 1.9 GB   | 268.4 MB |
+| 10M   | 865.3 MB| 865.3 MB | 864.6 MB    | 590.9 MB   | 811.8 MB  | 963.7 MB  | 861.3 MB | 1.3 GB   | 1.6 GB  | 3.9 GB   | 535.3 MB |
+| 20M   | 1.7 GB  | 1.7 GB   | 1.7 GB      | 1.2 GB     | 1.5 GB    | 1.9 GB    | 1.7 GB   | 2.6 GB   | 3.2 GB  | 7.8 GB   | 1.0 GB   |
+| 50M   | 4.1 GB  | 7.9 GB   | **12.6 GB** | **2.9 GB** | 3.9 GB    | 4.8 GB    | 4.2 GB   | 6.5 GB   | 8.0 GB  | 19.4 GB  | 2.6 GB   |
+| 100M  | 7.2 GB  | —        | —           | **5.7 GB** | 7.8 GB    | 9.0 GB    | 8.5 GB   | 13.0 GB  | 15.4 GB | —        | 5.2 GB   |
+| 200M  | 13.6 GB | —        | —           | **11.5 GB**| 15.2 GB   | 18.4 GB   | 15.4 GB  | 15.4 GB  | 15.4 GB | —        | 10.4 GB  |
 
-> `pio low-mem 8t` at 100M+ uses `--max-mem=4G` to cap concurrent per-chromosome buffers.
+> `pio low-mem 4t` and `pio low-mem 8t` at 100M+ use `--max-mem=4G` to cap concurrent per-chromosome buffers.
 
 **Key observations:**
 - **`pioSortBed --low-mem-ssd -t 8` is the recommended fast path for files.**
-  At 50M it beats `pio -t 8` by 30% on wall time AND uses ~36% less memory
-  (4.30 s / 4.6 GB vs 6.15 s / 12.6 GB). At 100M and 200M it's the only
-  pioSortBed mode besides single-threaded that fits in 32 GB RAM at all.
+  At 50M it beats `pio -t 8` by 45% on wall time AND uses ~62% less memory
+  (3.31 s / 4.8 GB vs 5.96 s / 12.6 GB). At 100M and 200M it's one of only
+  three pioSortBed configurations that fits in 32 GB RAM at all.
+- **`pioSortBed --low-mem-ssd -t 4` is the memory/speed sweet spot.** Half
+  the threads of `-t 8` but only ~25% slower on the headline 200M case
+  (23.6 s vs 19.0 s) and uses ~17% less peak RAM (15.2 GB vs 18.4 GB).
 - **`pioSortBed --low-mem-ssd -t 1` is the lowest-memory pioSortBed mode** —
   beats `pio -t 1` on memory at every size from 5M up (50M: 2.9 GB vs 4.1 GB,
-  ~30% less) AND on wall time (50M: 13.4 s vs 19.7 s). At 200M reads it's
+  ~30% less) AND on wall time (50M: 10.17 s vs 21.51 s). At 200M reads it's
   the lowest-RAM pioSortBed mode at 11.5 GB.
 - **Memory grows ~linearly with input for every tool.** At 200M: pio-lm 8t
-  17.7 GB, pio-lm 1t 11.5 GB, GNU sort 15 GB, bedops 10 GB. `bedtools` and
-  `pio -t 8` would have needed >32 GB and were skipped.
+  18.4 GB, pio-lm 4t 15.2 GB, pio-lm 1t 11.5 GB, GNU sort 15.4 GB, bedops
+  10.4 GB. `bedtools` and `pio -t 4 / -t 8` would have needed >32 GB.
 - **`bedops sort-bed`** uses the least memory throughout — a sensible choice
   on RAM-constrained systems where wall time isn't critical.
-- **`pioSortBed -t 8`** trades RAM for speed via per-thread `chromTable`
-  slabs. The `--max-mem=N[GMK]` flag (v2.2.0+) lets you cap the peak in
-  exchange for wall time. For large inputs `--low-mem-ssd -t 8` is now
-  strictly better on both axes and `pio -t 8` is mainly useful below ~50M.
+- **`pioSortBed -t N`** (classic) trades RAM for speed via per-thread
+  `chromTable` slabs. The `--max-mem=N[GMK]` flag (v3.0.4+) lets you cap the
+  peak. For large inputs `--low-mem-ssd -t 4` or `-t 8` is strictly better on
+  both axes; classic `-t N` is mainly useful below ~50M.
 
 ### Performance Summary
 

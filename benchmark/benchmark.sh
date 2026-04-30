@@ -186,7 +186,7 @@ SORT_BUF="80%"
 
 # CSV output for plotting
 CSV_FILE="$SCRIPT_DIR/benchmark_results.csv"
-echo "reads,pio1_ms,pio1_kb,pio8_ms,pio8_kb,pio_lm1_ms,pio_lm1_kb,pio_lm8_ms,pio_lm8_kb,sort1_ms,sort1_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
+echo "reads,pio1_ms,pio1_kb,pio4_ms,pio4_kb,pio8_ms,pio8_kb,pio_lm1_ms,pio_lm1_kb,pio_lm4_ms,pio_lm4_kb,pio_lm8_ms,pio_lm8_kb,sort1_ms,sort1_kb,sort4_ms,sort4_kb,sort8_ms,sort8_kb,bt_ms,bt_kb,bo_ms,bo_kb" > "$CSV_FILE"
 
 SEP="%-10s"
 HDR_TIME="  %14s"
@@ -197,10 +197,13 @@ ROW_MEM="  %10s"
 # Print header
 printf "$SEP" "Reads"
 printf "$HDR_TIME$HDR_MEM" "pio-1t" "RSS"
+printf "$HDR_TIME$HDR_MEM" "pio-4t" "RSS"
 printf "$HDR_TIME$HDR_MEM" "pio-8t" "RSS"
 printf "$HDR_TIME$HDR_MEM" "pio-lm-1t" "RSS"
+printf "$HDR_TIME$HDR_MEM" "pio-lm-4t" "RSS"
 printf "$HDR_TIME$HDR_MEM" "pio-lm-8t" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-1t" "RSS"
+(( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-4t" "RSS"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "sort-8t" "RSS"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "bedtools" "RSS"
 (( HAS_BEDOPS ))   && printf "$HDR_TIME$HDR_MEM" "bedops" "RSS"
@@ -210,8 +213,11 @@ echo ""
 printf "$SEP" "-----"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
 printf "$HDR_TIME$HDR_MEM" "------" "---"
+printf "$HDR_TIME$HDR_MEM" "------" "---"
 printf "$HDR_TIME$HDR_MEM" "---------" "---"
 printf "$HDR_TIME$HDR_MEM" "---------" "---"
+printf "$HDR_TIME$HDR_MEM" "---------" "---"
+(( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
 (( HAS_SORT ))     && printf "$HDR_TIME$HDR_MEM" "-------" "---"
 (( HAS_BEDTOOLS )) && printf "$HDR_TIME$HDR_MEM" "--------" "---"
@@ -248,25 +254,39 @@ for n in "${SIZES[@]}"; do
     # --- pioSortBed single-threaded ---
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE"
     pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
-    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
+    (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
 
-    # --- pioSortBed 8-threaded (regular bucket-sort path; per-thread chromTable
-    # slabs blow past 32 GB at 100M+ reads, so skip those sizes) ---
+    # --- pioSortBed 4-threaded and 8-threaded (regular bucket-sort path;
+    # per-thread chromTable slabs blow past 32 GB at 100M+ reads, so skip
+    # those sizes) ---
+    pio4_ms=NA; pio4_kb=NA
     pio8_ms=NA; pio8_kb=NA
     if (( ! BENCH_BIG )); then
+        bench_one "pio4" "$PIO" -t 4 "$BENCH_FILE"
+        pio4_ms=$RESULT_MS; pio4_kb=$RESULT_KB
+        (( VERIFY )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio4_out.txt"
+
         bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE"
         pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
-        cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
+        (( VERIFY )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio8_out.txt"
     fi
 
-    # --- pioSortBed low-memory SSD mode at -t 1 and -t 8 (apples-to-apples
-    # with pio-1t/pio-8t and sort-1t/sort-8t). At -t 1 only one chromTable is
-    # in flight, so --max-mem isn't needed. At -t 8 with huge inputs we cap
-    # concurrent per-chromosome buffers so the producer queue can't blow past
-    # available RAM. ---
+    # --- pioSortBed low-memory SSD mode at -t 1, -t 4 and -t 8 (apples-to-
+    # apples with pio-1t/pio-4t/pio-8t and sort-1t/sort-4t/sort-8t). At -t 1
+    # only one chromTable is in flight, so --max-mem isn't needed. At -t 4/8
+    # with huge inputs we cap concurrent per-chromosome buffers so the producer
+    # queue can't blow past available RAM. ---
     bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE"
     pio_lm1_ms=$RESULT_MS; pio_lm1_kb=$RESULT_KB
-    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm1_out.txt"
+    (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm1_out.txt"
+
+    if (( BENCH_BIG )); then
+        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 --max-mem=4G "$BENCH_FILE"
+    else
+        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE"
+    fi
+    pio_lm4_ms=$RESULT_MS; pio_lm4_kb=$RESULT_KB
+    (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm4_out.txt"
 
     if (( BENCH_BIG )); then
         bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE"
@@ -274,13 +294,20 @@ for n in "${SIZES[@]}"; do
         bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE"
     fi
     pio_lm8_ms=$RESULT_MS; pio_lm8_kb=$RESULT_KB
-    (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm8_out.txt"
+    (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio_lm8_out.txt"
 
     # --- GNU sort single-threaded ---
     sort1_ms=NA; sort1_kb=NA
     if (( HAS_SORT )); then
         bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort1_ms=$RESULT_MS; sort1_kb=$RESULT_KB
+    fi
+
+    # --- GNU sort 4-threaded ---
+    sort4_ms=NA; sort4_kb=NA
+    if (( HAS_SORT )); then
+        bench_one_shell "sort4" "LC_ALL=C sort -k1,1 -k2,2n --parallel=4 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
+        sort4_ms=$RESULT_MS; sort4_kb=$RESULT_KB
     fi
 
     # --- GNU sort 8-threaded ---
@@ -295,7 +322,7 @@ for n in "${SIZES[@]}"; do
     if (( HAS_BEDTOOLS )) && (( ! BENCH_BIG )); then
         bench_one "bt" bedtools sort -i "$BENCH_FILE"
         bt_ms=$RESULT_MS; bt_kb=$RESULT_KB
-        cp "$TMPDIR/output.tmp" "$TMPDIR/bt_out.txt"
+        (( VERIFY )) && cp "$TMPDIR/output.tmp" "$TMPDIR/bt_out.txt"
     fi
 
     # --- bedops sort-bed ---
@@ -303,14 +330,14 @@ for n in "${SIZES[@]}"; do
     if (( HAS_BEDOPS )); then
         bench_one "bo" sort-bed "$BENCH_FILE"
         bo_ms=$RESULT_MS; bo_kb=$RESULT_KB
-        (( BENCH_BIG )) || cp "$TMPDIR/output.tmp" "$TMPDIR/bo_out.txt"
+        (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/bo_out.txt"
     fi
 
     # --- Verify correctness vs LC_ALL=C sort reference ---
     match="-"
     if (( VERIFY )); then
         match="OK"
-        for tool in pio1 pio8 pio_lm1 pio_lm8 bt bo; do
+        for tool in pio1 pio4 pio8 pio_lm1 pio_lm4 pio_lm8 bt bo; do
             outfile="$TMPDIR/${tool}_out.txt"
             [[ -f "$outfile" ]] || continue
             awk -F'\t' '{print $1"\t"$2}' "$outfile" > "$TMPDIR/${tool}_keys.txt"
@@ -329,11 +356,14 @@ for n in "${SIZES[@]}"; do
     # --- Print row ---
     printf "$SEP" "$(fmt_reads $n)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio1_ms)" "$(fmt_size $pio1_kb)"
+    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio4_ms)" "$(fmt_size $pio4_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio8_ms)" "$(fmt_size $pio8_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm1_ms)" "$(fmt_size $pio_lm1_kb)"
+    printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm4_ms)" "$(fmt_size $pio_lm4_kb)"
     printf "$ROW_TIME$ROW_MEM" "$(fmt_time $pio_lm8_ms)" "$(fmt_size $pio_lm8_kb)"
     if (( HAS_SORT )); then
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort1_ms)" "$(fmt_size $sort1_kb)"
+        printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort4_ms)" "$(fmt_size $sort4_kb)"
         printf "$ROW_TIME$ROW_MEM" "$(fmt_time $sort8_ms)" "$(fmt_size $sort8_kb)"
     fi
     if (( HAS_BEDTOOLS )); then
@@ -346,7 +376,7 @@ for n in "${SIZES[@]}"; do
     echo ""
 
     # Write CSV row
-    echo "$n,$pio1_ms,$pio1_kb,$pio8_ms,$pio8_kb,$pio_lm1_ms,$pio_lm1_kb,$pio_lm8_ms,$pio_lm8_kb,$sort1_ms,$sort1_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
+    echo "$n,$pio1_ms,$pio1_kb,$pio4_ms,$pio4_kb,$pio8_ms,$pio8_kb,$pio_lm1_ms,$pio_lm1_kb,$pio_lm4_ms,$pio_lm4_kb,$pio_lm8_ms,$pio_lm8_kb,$sort1_ms,$sort1_kb,$sort4_ms,$sort4_kb,$sort8_ms,$sort8_kb,$bt_ms,$bt_kb,$bo_ms,$bo_kb" >> "$CSV_FILE"
 
     # Clean up large files between runs
     rm -f "$BENCH_FILE" "$TMPDIR"/*.txt
@@ -362,17 +392,21 @@ echo "Speedup relative to pioSortBed 8-thread:"
 echo "(values >1x mean pioSortBed-8t is faster)"
 echo ""
 
-printf "%-10s  %8s" "Reads" "vs pio1"
+printf "%-10s  %8s  %8s" "Reads" "vs pio1" "vs pio4"
 printf "  %12s" "vs pio-lm-1t"
+printf "  %12s" "vs pio-lm-4t"
 printf "  %12s" "vs pio-lm-8t"
 (( HAS_SORT ))     && printf "  %8s" "vs sort1"
+(( HAS_SORT ))     && printf "  %8s" "vs sort4"
 (( HAS_SORT ))     && printf "  %8s" "vs sort8"
 (( HAS_BEDTOOLS )) && printf "  %8s" "vs bt"
 (( HAS_BEDOPS ))   && printf "  %8s" "vs bo"
 echo ""
-printf "%-10s  %8s" "-----" "-------"
+printf "%-10s  %8s  %8s" "-----" "-------" "-------"
 printf "  %12s" "------------"
 printf "  %12s" "------------"
+printf "  %12s" "------------"
+(( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_SORT ))     && printf "  %8s" "-------"
 (( HAS_BEDTOOLS )) && printf "  %8s" "-----"
@@ -392,21 +426,26 @@ for n in "${SIZES[@]}"; do
     generate_bed "$n" "$BENCH_FILE"
 
     bench_one "pio1" "$PIO" -t 1 "$BENCH_FILE";  pio1_ms=$RESULT_MS
-    pio8_ms=NA
+    pio4_ms=NA; pio8_ms=NA
     if (( ! BENCH_BIG )); then
+        bench_one "pio4" "$PIO" -t 4 "$BENCH_FILE";  pio4_ms=$RESULT_MS
         bench_one "pio8" "$PIO" -t 8 "$BENCH_FILE";  pio8_ms=$RESULT_MS
     fi
     bench_one "pio-lm-1t" "$PIO" --low-mem-ssd -t 1 "$BENCH_FILE";  pio_lm1_ms=$RESULT_MS
     if (( BENCH_BIG )); then
+        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 --max-mem=4G "$BENCH_FILE";  pio_lm4_ms=$RESULT_MS
         bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 --max-mem=4G "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
     else
+        bench_one "pio-lm-4t" "$PIO" --low-mem-ssd -t 4 "$BENCH_FILE";  pio_lm4_ms=$RESULT_MS
         bench_one "pio-lm-8t" "$PIO" --low-mem-ssd -t 8 "$BENCH_FILE";  pio_lm8_ms=$RESULT_MS
     fi
 
-    sort1_ms=NA; sort8_ms=NA; bt_ms=NA; bo_ms=NA
+    sort1_ms=NA; sort4_ms=NA; sort8_ms=NA; bt_ms=NA; bo_ms=NA
     if (( HAS_SORT )); then
         bench_one_shell "sort1" "LC_ALL=C sort -k1,1 -k2,2n --parallel=1 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort1_ms=$RESULT_MS
+        bench_one_shell "sort4" "LC_ALL=C sort -k1,1 -k2,2n --parallel=4 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
+        sort4_ms=$RESULT_MS
         bench_one_shell "sort8" "LC_ALL=C sort -k1,1 -k2,2n --parallel=8 --buffer-size=$EFF_SORT_BUF -T "$TMPDIR" '$BENCH_FILE'"
         sort8_ms=$RESULT_MS
     fi
@@ -422,16 +461,22 @@ for n in "${SIZES[@]}"; do
     printf "%-10s" "$(fmt_reads $n)"
     if [[ "$pio8_ms" != "NA" ]] && (( pio8_ms > 0 )); then
         printf "  %8s"  "$(ratio_or_dash $pio1_ms     $pio8_ms)"
+        printf "  %8s"  "$(ratio_or_dash $pio4_ms     $pio8_ms)"
         printf "  %12s" "$(ratio_or_dash $pio_lm1_ms  $pio8_ms)"
+        printf "  %12s" "$(ratio_or_dash $pio_lm4_ms  $pio8_ms)"
         printf "  %12s" "$(ratio_or_dash $pio_lm8_ms  $pio8_ms)"
         (( HAS_SORT ))     && printf "  %8s" "$(ratio_or_dash $sort1_ms $pio8_ms)"
+        (( HAS_SORT ))     && printf "  %8s" "$(ratio_or_dash $sort4_ms $pio8_ms)"
         (( HAS_SORT ))     && printf "  %8s" "$(ratio_or_dash $sort8_ms $pio8_ms)"
         (( HAS_BEDTOOLS )) && printf "  %8s" "$(ratio_or_dash $bt_ms    $pio8_ms)"
         (( HAS_BEDOPS ))   && printf "  %8s" "$(ratio_or_dash $bo_ms    $pio8_ms)"
     else
         printf "  %8s" "inf"
+        printf "  %8s" "inf"
         printf "  %12s" "inf"
         printf "  %12s" "inf"
+        printf "  %12s" "inf"
+        (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_SORT ))     && printf "  %8s" "inf"
         (( HAS_BEDTOOLS )) && printf "  %8s" "inf"
@@ -471,20 +516,26 @@ echo ""
 # Convert results CSV to README plot format and regenerate PNGs via plot_readme.gp
 # ---------------------------------------------------------------------------
 
-# benchmark_results.csv: 17 cols, time-ms and memory-kb interleaved per tool.
-# benchmark_readme.csv:  17 cols, reads + 8 ms cols + 8 mb cols. Used by plot_readme.gp.
+# benchmark_results.csv: 23 cols, reads + 11 tool pairs (time-ms, memory-kb).
+# benchmark_readme.csv:  23 cols, reads + 11 ms cols + 11 mb cols. Used by plot_readme.gp.
 # Skipped runs are 'NA' in both CSVs; gnuplot's `set datafile missing 'NA'`
 # drops those points cleanly on both log and linear axes.
 README_CSV="$SCRIPT_DIR/benchmark_readme.csv"
 awk -F',' 'BEGIN{OFS=","}
 function mb(v) { return (v == "NA") ? "NA" : sprintf("%.1f", v/1024) }
 NR==1 {
-    print "reads,pio1_ms,pio8_ms,piolm1_ms,piolm8_ms,sort1_ms,sort8_ms,bt_ms,bo_ms,pio1_mb,pio8_mb,piolm1_mb,piolm8_mb,sort1_mb,sort8_mb,bt_mb,bo_mb"
+    print "reads,pio1_ms,pio4_ms,pio8_ms,piolm1_ms,piolm4_ms,piolm8_ms,sort1_ms,sort4_ms,sort8_ms,bt_ms,bo_ms,pio1_mb,pio4_mb,pio8_mb,piolm1_mb,piolm4_mb,piolm8_mb,sort1_mb,sort4_mb,sort8_mb,bt_mb,bo_mb"
     next
 }
 {
-    print $1, $2,$4,$6,$8,$10,$12,$14,$16, \
-        mb($3),mb($5),mb($7),mb($9),mb($11),mb($13),mb($15),mb($17)
+    # Source layout (results CSV, 23 cols):
+    #   1 reads
+    #   2/3 pio1_ms/kb       4/5  pio4_ms/kb     6/7  pio8_ms/kb
+    #   8/9 piolm1_ms/kb     10/11 piolm4_ms/kb  12/13 piolm8_ms/kb
+    #   14/15 sort1_ms/kb    16/17 sort4_ms/kb   18/19 sort8_ms/kb
+    #   20/21 bt_ms/kb       22/23 bo_ms/kb
+    print $1, $2,$4,$6,$8,$10,$12,$14,$16,$18,$20,$22, \
+        mb($3),mb($5),mb($7),mb($9),mb($11),mb($13),mb($15),mb($17),mb($19),mb($21),mb($23)
 }' "$CSV_FILE" > "$README_CSV"
 echo "Wrote $README_CSV"
 
