@@ -4,6 +4,33 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.1.0] — 2026-05-05
+
+### Added
+- Optional in-RAM BAM input path, opt-in at build time via
+  `make WITH_BAM=1 HTSLIB=/path/to/htslib`. Detects `.bam` (case-insensitive)
+  on the input filename and routes to a new `bamSortAndEmit` that reads every
+  record into memory, builds packed `(tid << 32 | pos)` uint64 keys, runs the
+  existing `radixSort64`, and writes a coordinate-sorted BAM via `sam_write1`
+  with `hts_set_threads` driving htslib's BGZF worker pool. Only the default
+  coordinate sort is supported on BAM; `--collapse`, `--low-mem-ssd`,
+  `--natural-sort`, and `--sort=b|5` are rejected with a clear error. Output
+  is byte-equivalent to `samtools sort` (modulo `@HD SO:coordinate`); on a
+  10 M-record BAM it is competitive with but not faster than `samtools sort`,
+  because BGZF compression dominates wall time on BAM and is not the
+  bottleneck pioSortBed's design targets. The default `make` (no `WITH_BAM`)
+  has zero htslib dependency.
+
+### Removed
+- `-r` / `--ral` flag and the entire RAL input path. The format was niche
+  and the second input format complicated every parser branch
+  (`parseRalLine`, `if(fRal)` arms in `parseLines`, `parseChunkMmap`, the
+  low-mem `--collapse` and strand re-parse paths, the per-emit `fullLine`
+  hoist, the `needExtra` derivation, plus the `bool fRal` parameter
+  threaded through five function signatures). Net: ~108 source lines and
+  ~20 test lines removed; all 27 remaining tests pass. Users who relied on
+  `--ral` should pin to v3.0.12.
+
 ## [3.0.12] — 2026-04-30
 
 ### Removed

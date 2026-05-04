@@ -1,4 +1,4 @@
-VERSION  = 3.0.12
+VERSION  = 3.1.0
 PREFIX  ?= /usr/local
 
 CC      = g++
@@ -8,6 +8,21 @@ CFLAGS  = -Isrc -O3 -std=c++17 -DVERSION_STRING=\"$(VERSION)\"
 # libtbb stays dynamic (no libtbb.a in Debian).
 LDFLAGS = -static-libstdc++ -static-libgcc -ltbb
 DEPS    =
+
+# Optional BAM input via htslib. Build with:
+#   make WITH_BAM=1 HTSLIB=/path/to/htslib
+# HTSLIB should point to a built htslib tree (i.e. one that contains
+# libhts.{a,so} and the htslib/ header dir). Without WITH_BAM the binary
+# is BED-only and has zero htslib dependency.
+WITH_BAM ?=
+HTSLIB   ?=
+ifneq ($(WITH_BAM),)
+  ifeq ($(HTSLIB),)
+    $(error WITH_BAM=1 requires HTSLIB=/path/to/htslib)
+  endif
+  CFLAGS  += -DWITH_BAM -I$(HTSLIB)
+  LDFLAGS += -L$(HTSLIB) -Wl,-rpath,$(HTSLIB) -lhts -lz -lpthread
+endif
 
 src/pioSortBed.o: src/pioSortBed.cpp $(DEPS)
 	$(CC) -c -o $@ $< $(CFLAGS)

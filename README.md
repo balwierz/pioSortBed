@@ -82,7 +82,6 @@ pioSortBed [options] -   # read from standard input
 | `-s b` / `--sort b` | Sort by start and end coordinate |
 | `-s 5` / `--sort 5` | Sort by 5' end (respects strand: col 6) |
 | `-n` / `--natural-sort` | Natural chromosome order: `chr2 < chr10` (default: lexicographic) |
-| `-r` / `--ral` | Input is in RAL format instead of BED |
 | `--collapse` | Collapse overlapping regions, summing weights |
 | `--low-mem-ssd` | Two-pass mode (SSD-friendly). **Recommended fast path for any file ≥ ~1 M reads** — beats the classic path on both wall time and peak RSS at scale. Stdin and `.gz` inputs are slurped into memory first; file input is mmap'd directly. |
 | `--bucket-cutoff N` | Opt in to bucket sort (within the classic path) at ≥N reads. `0` = always bucket sort. Default: `-1` (bucket sort disabled). Only meaningful when `--low-mem-ssd` is *not* set. |

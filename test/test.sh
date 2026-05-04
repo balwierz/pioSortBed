@@ -290,26 +290,6 @@ check_eq "parallel bucket vs serial bucket" "$got_pb" "$got_sb"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- RAL input format ---"
-
-# RAL fields: id chr strand+context beg end weight ...
-RAL="$TMPDIR_BASE/data.ral"
-awk 'BEGIN{srand(42); for(i=0;i<2000;i++){
-    c="chr"((i%5)+1); strand=(rand()>0.5)?"+":"-"
-    beg=int(rand()*1000000); endp=beg+int(rand()*200)+1
-    printf "id%d\t%s\t%s\t%d\t%d\t%g\n", i, c, strand, beg, endp, int(rand()*100)/10
-}}' > "$RAL"
-
-# RAL output preserves the input format. Reference: sort by chr (col 2), beg (col 4).
-want_ral=$(LC_ALL=C sort -k2,2 -k4,4n "$RAL" | canon)
-got=$("$PIO" --ral "$RAL" 2>/dev/null | canon)
-check_eq "ral default" "$got" "$want_ral"
-
-got=$("$PIO" --ral -t 8 "$RAL" 2>/dev/null | canon)
-check_eq "ral -t 8" "$got" "$want_ral"
-
-# ---------------------------------------------------------------------------
-echo ""
 echo "--- Version flag ---"
 
 ver=$("$PIO" --version 2>&1)

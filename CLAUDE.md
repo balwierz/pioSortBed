@@ -21,6 +21,20 @@ g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
     -static-libstdc++ -static-libgcc -ltbb -DVERSION_STRING=\"3.0.12\"
 ```
 
+**Optional BAM input** (opt-in at build time):
+```bash
+make WITH_BAM=1 HTSLIB=/path/to/htslib
+```
+Adds an in-RAM coordinate sort path that fires on `*.bam` input, reusing
+`radixSort64` for the sort step and writing BAM via `sam_write1` with
+`hts_set_threads()` driving htslib's BGZF worker pool. Reads everything into
+memory (no spill); peak RSS is ~3× the BAM's decompressed size, so input is
+capped by RAM. Only the default coordinate sort is supported on BAM —
+`--collapse`, `--low-mem-ssd`, `--natural-sort`, and `--sort=b|5` are
+rejected. `HTSLIB` must point at a built htslib tree containing
+`libhts.{a,so}` and the `htslib/` header directory. The default `make`
+(without `WITH_BAM`) has zero htslib dependency.
+
 ## Usage
 
 ```bash
@@ -32,7 +46,6 @@ g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
 
 Options:
 - `--sort s` (by start, default), `--sort b` (start + end), `--sort 5` (5'-end, strand-aware)
-- `-r` / `--ral` — RAL input format instead of BED
 - `-n` / `--natural-sort` — `chr2 < chr10` instead of lexicographic
 - `--collapse` — sum weights of regions sharing (chr, start)
 - `--low-mem-ssd` — two-pass mode, **recommended fast path** for any input ≥ ~1 M reads
@@ -80,7 +93,7 @@ Per-chromosome output is a pre-sized `ChromBuf` (custom append-to-`char*` wrappe
 2. **Sort**:
    - `--sort s` and `--sort 5`: global LSD radix sort over packed 64-bit keys (high 32 = chrIdx, low 32 = position) when `n ≥ RADIX_SORT_THRESHOLD` (serial) or `RADIX_SORT_THRESHOLD_PAR` (parallel). Below threshold: `std::sort` with templated `ReadCmp<SortMode>` comparator (parallel exec policy at `-t > 1`).
    - `--sort b`: per-chromosome radix sort (`sortIndicesPerChromB`). Each chromosome's slice of `order[]` is sorted independently with a 64-bit `(beg, end)` key (the global `(chrIdx, beg, end)` would be 96 bits, too wide for `radixSort64`). Chromosomes processed in parallel via `std::for_each(par)` at `-t > 1`; serial radix per chrom.
-3. **Emit** lines from `order[]`: full mmap line via `fputs_unlocked` (RAL or mmap path), or reconstruct `chr\tbeg\tend` + tail via `writeBedLine`.
+3. **Emit** lines from `order[]`: full mmap line via `fputs_unlocked` (mmap path), or reconstruct `chr\tbeg\tend` + tail via `writeBedLine` (stdin/gzip path, where only the tail is in the arena).
 
 `--bucket-cutoff` swaps step 2 for bucket sort. Body in `processChromBucketTpl<bool FullLine>` (`always_inline`, templated on full-line vs reconstruct-from-tail). Per chromosome, scatter reads into `chromTable[chosenPosition]`, then scan positions in order. Single-thread reuses one slab; multi-thread allocates per-thread per-chrom slabs and flushes through the producer-consumer barrier.
 
@@ -92,7 +105,7 @@ Per-chromosome output is a pre-sized `ChromBuf` (custom append-to-`char*` wrappe
 
 Top of `src/pioSortBed.cpp`:
 
-- `kWeightBufSize` = 256 — stack buffer for BED score / RAL weight field. Over-long values rejected with a clear error.
+- `kWeightBufSize` = 256 — stack buffer for the BED weight field on the `--collapse` path. Over-long values rejected with a clear error.
 - `kDefaultBucketChromBudget` = 4 GB — implicit per-chromosome `chromTable` rejection threshold. Override with `--max-mem`.
 - `defaultBucketCutoff` = -1 — bucket sort disabled by default. Override with `--bucket-cutoff`.
 - `RADIX_SORT_THRESHOLD` = 100 k, `RADIX_SORT_THRESHOLD_PAR` = 3 M — radix vs `std::sort` thresholds (in `sortIndices<>`).

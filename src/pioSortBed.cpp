@@ -20,6 +20,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "CLI11.hpp"
+#ifdef WITH_BAM
+#include <htslib/sam.h>
+#include <htslib/hts.h>
+#endif
 
 // Fallback for manual compilation without -DVERSION_STRING; the Makefile
 // always injects the real version, so this only matters for one-off builds.
@@ -142,10 +146,10 @@ public:
 
 typedef ChrNameMap<chrInfoT> string2chrInfoT;
 
-// Stack buffer used for the BED weight / RAL weight field (field 4 in BED,
-// field 5 in RAL). Real weights are short numeric strings; 256 B is generous.
-// On overflow, copyField returns 0 and the parser errors with a clear message
-// rather than silently truncating.
+// Stack buffer used for the BED weight field (col 4) on the --collapse path.
+// Real weights are short numeric strings; 256 B is generous. On overflow,
+// copyField returns 0 and the parser errors with a clear message rather than
+// silently truncating.
 const int kWeightBufSize = 256;
 
 // Default per-allocation budget for the bucket-sort path's chromTable when
@@ -223,13 +227,13 @@ struct Arena
 
 
 // ============================================================================
-// PARSERS — FIELDS, BED / RAL LINES, COLLAPSE-MODE WEIGHTS
+// PARSERS — FIELDS, BED LINES, COLLAPSE-MODE WEIGHTS
 // ----------------------------------------------------------------------------
 // Field-level (skipField/parseUInt/copyField) and line-level
-// (parseBedLine3/parseBedLineFull/parseRalLine) primitives, all `inline` for
-// the hot path. Plus parseWeight/sumWeights* which the bucket-sort and
-// classic-sort emit paths use to consume `--collapse` weight strings.
-// Hand-written; faster than sscanf.
+// (parseBedLine3/parseBedLineFull) primitives, all `inline` for the hot path.
+// Plus parseWeight/sumWeights* which the bucket-sort and classic-sort emit
+// paths use to consume `--collapse` weight strings. Hand-written; faster
+// than sscanf.
 // ============================================================================
 
 // Hand-written field parsers (faster than sscanf).
@@ -351,54 +355,6 @@ static inline int parseBedLineFull(const char* buf,
 	// col 6 (strand) — copyField already consumed the tab before this field
 	if (!*p || *p == '\r' || *p == '\n') return 4;
 	*strandChar = *p;
-	return 5;
-}
-
-// RAL line parser. Records chr as pointer+length into the line buffer
-// (caller owns the buffer; no copy / no fixed length limit) — same pattern
-// parseBedLine3/parseBedLineFull use for chr.
-static int parseRalLine(const char* buf,
-                        const char** chrPtr, int* chrLen,
-                        int* beg, int* end,
-                        char* weightBuf, int weightMax,
-                        char* strandChar)
-{
-	const char* p = buf;
-
-	if (!skipField(&p)) return 0;
-
-	// Field 2 (chr) — record pointer+length; no copying, no limit.
-	*chrPtr = p;
-	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
-	*chrLen = (int)(p - *chrPtr);
-	if (*chrLen == 0) return 0;
-	if (*p != '\t' && *p != ' ') return 0;
-	p++;
-
-	*strandChar = *p;
-	while (*p && *p != '\t' && *p != ' ' && *p != '\r' && *p != '\n') p++;
-	if (*p != '\t' && *p != ' ') return 1;
-	p++;
-
-	int v = parseUInt(&p);
-	if (v < 0) return 1;
-	*beg = v;
-	if (*p == '\t' || *p == ' ') p++;
-
-	v = parseUInt(&p);
-	if (v < 0) return 3;
-	*end = v;
-
-	if (*p != '\t' && *p != ' ') return 3;
-	p++;
-	int n = copyField(&p, weightBuf, weightMax);
-	if (n == 0) return 3;
-	if (n < 0) {
-		fprintf(stderr, "Error: RAL weight field exceeds %d bytes in: %s\n",
-		        weightMax - 1, buf);
-		exit(1);
-	}
-
 	return 5;
 }
 
@@ -594,7 +550,7 @@ struct ChromBuf
 // Pass 2: process one chromosome at a time (parse, sort, print), so peak RAM
 // depends on the largest chromosome chunk, not the whole file.
 static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
-                          bool fRal, int fCollapse, char sortMode, int numThreads,
+                          int fCollapse, char sortMode, int numThreads,
                           bool naturalSort, size_t maxMemBytes, bool verbose)
 {
 	time_t tstart, tend;
@@ -730,23 +686,9 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					int beg = 0, lineEnd = 0;
 					const char* chrPtr;
 					int chrLen;
-					char strandChar = '+';
-					char weight[kWeightBufSize];
-					weight[0] = '0'; weight[1] = '\0';
 					const char* tailPtr = "";
-					int numArgsRead;
-
-					if(fRal)
-					{
-						numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
-						                           &beg, &lineEnd, weight, kWeightBufSize,
-						                           &strandChar);
-					}
-					else
-					{
-						numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen,
-						                            &beg, &lineEnd, &tailPtr);
-					}
+					int numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen,
+					                                &beg, &lineEnd, &tailPtr);
 					if(numArgsRead < 3)
 					{
 						cerr << "Error in parsing line: " << linePtr << endl;
@@ -848,22 +790,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			int chrLen;
 			int beg = 0;
 			int end = 0;
-			char strandChar = '+';
-			char weight[kWeightBufSize];
-			weight[0] = '0'; weight[1] = '\0';
 			const char* tailPtr = "";
-			int numArgsRead;
-
-			if(fRal)
-			{
-				numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
-				                           &beg, &end, weight, kWeightBufSize,
-				                           &strandChar);
-			}
-			else
-			{
-				numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
-			}
+			int numArgsRead = parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr);
 
 			if(numArgsRead < 3)
 			{
@@ -985,13 +913,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				char dummy_str = '+';
 				const char* chrPtr; int chrLen;
 				const char* tailPtr = "";
-				int n;
-				if(fRal)
-					n = parseRalLine(linePtr, &chrPtr, &chrLen,
-					                 &dummy_beg, &dummy_end, weight, kWeightBufSize, &dummy_str);
-				else
-					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
-					                     weight, kWeightBufSize, &dummy_str, &tailPtr);
+				int n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
+				                         weight, kWeightBufSize, &dummy_str, &tailPtr);
 				if(n < 3)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
@@ -1039,13 +962,8 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				char weight[kWeightBufSize]; weight[0] = '0'; weight[1] = '\0';
 				const char* chrPtr; int chrLen;
 				const char* tailPtr = "";
-				int n;
-				if(fRal)
-					n = parseRalLine(linePtr, &chrPtr, &chrLen,
-					                 &dummy_beg, &dummy_end, weight, kWeightBufSize, &strandChar);
-				else
-					n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
-					                     weight, kWeightBufSize, &strandChar, &tailPtr);
+				int n = parseBedLineFull(linePtr, &chrPtr, &chrLen, &dummy_beg, &dummy_end,
+				                         weight, kWeightBufSize, &strandChar, &tailPtr);
 				if(n < 5)
 				{
 					cerr << "Error in parsing line: " << linePtr << endl;
@@ -1683,9 +1601,8 @@ static __attribute__((always_inline)) inline void processChromBucket(
 }
 
 // Parsing loop, templated on UseMmap to eliminate per-line branch.
-// For BED, stores only the "tail" (fields 4+) in reads[].line (mmap: full line pointer;
+// Stores only the "tail" (fields 4+) in reads[].line (mmap: full line pointer;
 // stdin/gzip: only tail copied to arena, saving ~50% arena memory).
-// For RAL, stores the full line (output format differs from BED).
 template<bool UseMmap>
 static void parseLines(
     char* mmapBase, size_t mmapSize,
@@ -1693,7 +1610,7 @@ static void parseLines(
     seqread*& reads, size_t& readCount, size_t& currMaxReads,
     string2chrInfoT& chrInfo, string2chrInfoT::iterator& thisChrIt,
     Arena* arena,
-    bool fRal, int fCollapse, char sortMode)
+    int fCollapse, char sortMode)
 {
 	char* mmapCur = mmapBase;
 	char* mmapLim = mmapBase + mmapSize;
@@ -1702,7 +1619,7 @@ static void parseLines(
 	// UseMmap is false; freed at end of function.
 	char* lineBuf = NULL;
 	size_t lineBufCap = 0;
-	const bool needExtra = fRal || fCollapse || (sortMode == '5');
+	const bool needExtra = fCollapse || (sortMode == '5');
 
 	while(1)
 	{
@@ -1774,13 +1691,7 @@ static void parseLines(
 		const char* tailPtr = "";
 		int numArgsRead;
 
-		if(fRal)
-		{
-			numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
-			                           &beg, &end, weight, kWeightBufSize,
-			                           &strandChar);
-		}
-		else if(needExtra)
+		if(needExtra)
 		{
 			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
 			                              &beg, &end, weight, kWeightBufSize,
@@ -1798,14 +1709,7 @@ static void parseLines(
 				cerr << "Error: negative coordinates in the bed file\n" << linePtr << endl;
 				exit(1);
 			}
-			if(fRal)
-			{
-				if(UseMmap)
-					reads[readCount].line = linePtr;
-				else
-					reads[readCount].line = arena->alloc(linePtr, strlen(linePtr) + 1);
-			}
-			else if(!fCollapse)
+			if(!fCollapse)
 			{
 				if(UseMmap)
 				{
@@ -1906,10 +1810,10 @@ struct ChunkResult
 static void parseChunkMmap(char* start, char* end,
                            seqread* reads, uint32_t base,
                            ChunkResult& result,
-                           bool fRal, int fCollapse, char sortMode,
+                           int fCollapse, char sortMode,
                            Arena* arena)
 {
-	const bool needExtra = fRal || fCollapse || (sortMode == '5');
+	const bool needExtra = fCollapse || (sortMode == '5');
 	char* mmapCur = start;
 	char* mmapLim = end;
 	uint32_t idx = base + 1;
@@ -1939,13 +1843,7 @@ static void parseChunkMmap(char* start, char* end,
 		const char* tailPtr = "";
 		int numArgsRead;
 
-		if(fRal)
-		{
-			numArgsRead = parseRalLine(linePtr, &chrPtr, &chrLen,
-			                           &beg, &lineEnd, weight, kWeightBufSize,
-			                           &strandChar);
-		}
-		else if(needExtra)
+		if(needExtra)
 		{
 			numArgsRead = parseBedLineFull(linePtr, &chrPtr, &chrLen,
 			                               &beg, &lineEnd, weight, kWeightBufSize,
@@ -2027,7 +1925,7 @@ static void parseChunkMmap(char* start, char* end,
 // Body parsing starts at `bodyStart` (after any leading header lines that
 // the caller has already emitted to stdout).
 static seqread* parseMmapSerial(char* mmapBase, size_t bodyStart, size_t mmapSize,
-                                bool fRal, int fCollapse, char sortMode,
+                                int fCollapse, char sortMode,
                                 Arena* arena,
                                 string2chrInfoT& chrInfo,
                                 size_t& outReadCount)
@@ -2055,7 +1953,7 @@ static seqread* parseMmapSerial(char* mmapBase, size_t bodyStart, size_t mmapSiz
 	parseLines<true>(mmapBase + bodyStart, bodySize, NULL,
 	                 reads, readCount, currMaxReads,
 	                 chrInfo, thisChrIt, arena,
-	                 fRal, fCollapse, sortMode);
+	                 fCollapse, sortMode);
 	chrInfo.erase("");
 	outReadCount = readCount - 1;
 	return reads;
@@ -2065,7 +1963,7 @@ static seqread* parseMmapSerial(char* mmapBase, size_t bodyStart, size_t mmapSiz
 // either runs parseMmapSerial (N==1) or chunks the body and parses in
 // parallel. Returns the malloc'd reads array; caller frees.
 static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
-                                  bool fRal, int fCollapse, char sortMode,
+                                  int fCollapse, char sortMode,
                                   int numThreads,
                                   Arena* arena,
                                   std::vector<Arena*>* chunkArenas,
@@ -2103,7 +2001,7 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	// a separate pre-count pass over the mmap.
 	if(N == 1)
 		return parseMmapSerial(mmapBase, bodyStart, mmapSize,
-		                       fRal, fCollapse, sortMode, arena,
+		                       fCollapse, sortMode, arena,
 		                       chrInfo, outReadCount);
 
 	// In --collapse mode each chunk needs its own Arena to hold weight strings
@@ -2179,7 +2077,7 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 			Arena* a = fCollapse ? (*chunkArenas)[i] : NULL;
 			parseChunkMmap(mmapBase + chunkStart[i], mmapBase + chunkStart[i + 1],
 			               reads, chunkBase[i], chunkRes[i],
-			               fRal, fCollapse, sortMode, a);
+			               fCollapse, sortMode, a);
 		});
 
 	for(int i = 0; i < N; i++)
@@ -2218,6 +2116,158 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	outReadCount = totalReads;
 	return reads;
 }
+
+#ifdef WITH_BAM
+// ============================================================================
+// BAM PATH (--bam / *.bam input, optional, opt-in at build time via WITH_BAM)
+// ----------------------------------------------------------------------------
+// In-RAM coordinate sort using htslib. Reads every record into a vector,
+// builds a (tid, pos) packed-uint64 key per record, runs the existing
+// radixSort64 for the index permutation, then writes the records out as BAM
+// in sorted order via sam_write1. hts_set_threads enables htslib's worker
+// pool for parallel BGZF compression/decompression.
+//
+// This is the "Approach A" MVP: simple, beats samtools on RAM-resident BAMs
+// (parallel radix vs. ksort comparator), but holds all records in memory so
+// it tops out around half-RAM input size. Larger BAMs need spill+merge
+// (samtools-clone) which is intentionally out of scope here.
+// ============================================================================
+static int bamSortAndEmit(const std::string& inputFile,
+                          const std::string& outputFile,
+                          int numThreads,
+                          bool verbose)
+{
+	samFile* in = sam_open(inputFile.c_str(), "r");
+	if(!in)
+	{
+		std::cerr << "Error: cannot open BAM " << inputFile << std::endl;
+		return 1;
+	}
+	if(numThreads > 1) hts_set_threads(in, numThreads);
+
+	sam_hdr_t* hdr = sam_hdr_read(in);
+	if(!hdr)
+	{
+		std::cerr << "Error: cannot read BAM header from " << inputFile << std::endl;
+		sam_close(in);
+		return 1;
+	}
+
+	time_t tstart, tend;
+	if(verbose) time(&tstart);
+
+	std::vector<bam1_t*> records;
+	while(true)
+	{
+		bam1_t* b = bam_init1();
+		int r = sam_read1(in, hdr, b);
+		if(r < -1)
+		{
+			std::cerr << "Error: truncated/corrupt BAM at record "
+			          << records.size() << std::endl;
+			bam_destroy1(b);
+			sam_hdr_destroy(hdr);
+			sam_close(in);
+			return 1;
+		}
+		if(r == -1) { bam_destroy1(b); break; }
+		records.push_back(b);
+	}
+	sam_close(in);
+
+	if(verbose)
+	{
+		time(&tend);
+		std::cerr << "BAM read: " << records.size() << " records in "
+		          << (long)(tend - tstart) << " s" << std::endl;
+		time(&tstart);
+	}
+
+	// Update header SO before write; works for empty input too.
+	sam_hdr_update_hd(hdr, "SO", "coordinate");
+
+	const char* outPath = outputFile.empty() ? "-" : outputFile.c_str();
+	samFile* out = sam_open(outPath, "wb");
+	if(!out)
+	{
+		std::cerr << "Error: cannot open output BAM " << outPath << std::endl;
+		sam_hdr_destroy(hdr);
+		for(auto* b : records) bam_destroy1(b);
+		return 1;
+	}
+	if(numThreads > 1) hts_set_threads(out, numThreads);
+
+	size_t n = records.size();
+	uint32_t* order = NULL;
+	if(n > 0)
+	{
+		uint64_t* keys = (uint64_t*) malloc(n * sizeof(uint64_t));
+		order = (uint32_t*) malloc(n * sizeof(uint32_t));
+		if(!keys || !order)
+		{
+			std::cerr << "Error: out of memory for BAM sort index ("
+			          << n << " entries)" << std::endl;
+			sam_close(out);
+			sam_hdr_destroy(hdr);
+			for(auto* b : records) bam_destroy1(b);
+			return 1;
+		}
+		for(size_t i = 0; i < n; i++)
+		{
+			// tid == -1 (unmapped) wraps to UINT32_MAX, which sorts after every
+			// real reference id. pos is 0-based int64_t in modern htslib; cast
+			// to uint32_t — fine for any standard reference (max chrom < 2^31).
+			uint32_t tid = (uint32_t) records[i]->core.tid;
+			uint32_t pos = (uint32_t) records[i]->core.pos;
+			keys[i] = ((uint64_t)tid << 32) | pos;
+			order[i] = (uint32_t) i;
+		}
+		radixSort64(keys, order, n, numThreads);
+		free(keys);
+
+		if(verbose)
+		{
+			time(&tend);
+			std::cerr << "BAM sort: " << (long)(tend - tstart) << " s" << std::endl;
+			time(&tstart);
+		}
+	}
+
+	if(sam_hdr_write(out, hdr) < 0)
+	{
+		std::cerr << "Error: cannot write BAM header" << std::endl;
+		sam_close(out);
+		sam_hdr_destroy(hdr);
+		free(order);
+		for(auto* b : records) bam_destroy1(b);
+		return 1;
+	}
+	for(size_t i = 0; i < n; i++)
+	{
+		if(sam_write1(out, hdr, records[order[i]]) < 0)
+		{
+			std::cerr << "Error: cannot write BAM record " << i << std::endl;
+			sam_close(out);
+			sam_hdr_destroy(hdr);
+			free(order);
+			for(auto* b : records) bam_destroy1(b);
+			return 1;
+		}
+	}
+	sam_close(out);
+
+	if(verbose && n > 0)
+	{
+		time(&tend);
+		std::cerr << "BAM write: " << (long)(tend - tstart) << " s" << std::endl;
+	}
+
+	for(auto* b : records) bam_destroy1(b);
+	free(order);
+	sam_hdr_destroy(hdr);
+	return 0;
+}
+#endif // WITH_BAM
 
 // ============================================================================
 // CLI / MAIN
@@ -2265,7 +2315,7 @@ int main(int argc, char *argv[])
 		"Compilation-time limits:\n"
 		"  Line length: no fixed limit (stdin/gzip uses getline; mmap uses memchr).\n"
 		"  Chromosome name: no fixed limit (stored as pointer+length).\n"
-		"  Weight field (BED col 4 / RAL): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
+		"  Weight field (BED col 4, --collapse): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
 		"  Bucket-sort path: rejects a chromosome whose chromTable would exceed\n"
 		"    --max-mem (default " + to_string(kDefaultBucketChromBudget >> 30) + " GB); use --low-mem-ssd otherwise.\n"
 		"  Read number limit: " + to_string((unsigned long long)UINT32_MAX - 1) + " (all paths).\n"};
@@ -2274,7 +2324,6 @@ int main(int argc, char *argv[])
 	string inputFile;
 	char sortMode = 's';
 	int fCollapse = 0;
-	int fRal = 0;
 	int lowMemSSD = 0;
 	int bucketCutoff = defaultBucketCutoff;
 	int numThreads = 0;
@@ -2293,7 +2342,6 @@ int main(int argc, char *argv[])
 		"b: sort also by end coordinate\n"
 		"5: sort by 5' end (respects strand)")
 		->default_val('s');
-	app.add_flag("-r,--ral", fRal, "input is in RAL format");
 	app.add_flag("--collapse", fCollapse,
 		"collapse BEDWEIGHT by summing weights of the reads and truncate the coordinates, "
 		"set strand to \"+\", id to \".\". Makes no sense for --sort=b");
@@ -2327,6 +2375,39 @@ int main(int argc, char *argv[])
 	CLI11_PARSE(app, argc, argv);
 	const size_t maxMemBytes = parseMemSize(maxMemStr);
 
+	if(numThreads <= 0)
+	{
+		unsigned hw = std::thread::hardware_concurrency();
+		numThreads = hw ? (int)hw : 1;
+	}
+	// TBB owns the worker pool used by std::execution::par. Capping it here
+	// gives `--threads N` the same behavior the OpenMP build had. Set early
+	// so it also applies to the BAM path's radixSort64 invocation.
+	tbb::global_control tbbThreadCap(
+		tbb::global_control::max_allowed_parallelism, (size_t)numThreads);
+
+	// BAM input dispatch (opt-in at build time via WITH_BAM). Detect by .bam
+	// extension; route to the in-RAM bamSortAndEmit path which reuses
+	// radixSort64 and writes a coordinate-sorted BAM via htslib. None of the
+	// BED-specific machinery below (stdout freopen, mmap, lowMemSortMmap,
+	// bucket sort, etc.) applies — the BAM path opens outputFile directly via
+	// sam_open instead of going through stdout.
+#ifdef WITH_BAM
+	if(inputFile.size() > 4 &&
+	   (inputFile.compare(inputFile.size() - 4, 4, ".bam") == 0 ||
+	    inputFile.compare(inputFile.size() - 4, 4, ".BAM") == 0))
+	{
+		if(fCollapse || lowMemSSD || naturalSort || sortMode != 's')
+		{
+			cerr << "Error: BAM input only supports default coordinate sort; "
+			        "--collapse / --low-mem-ssd / --natural-sort / "
+			        "--sort=b|5 are not implemented for BAM" << endl;
+			return 1;
+		}
+		return bamSortAndEmit(inputFile, outputFile, numThreads, verbose);
+	}
+#endif
+
 	// -o/--output redirects stdout to the named file. All downstream data
 	// emit (fputs_unlocked, fwrite_unlocked, printf in collapse mode) goes
 	// through stdout, so freopen-ing it here is a single-line redirect with
@@ -2339,16 +2420,6 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-
-	if(numThreads <= 0)
-	{
-		unsigned hw = std::thread::hardware_concurrency();
-		numThreads = hw ? (int)hw : 1;
-	}
-	// TBB owns the worker pool used by std::execution::par. Capping it here
-	// gives `--threads N` the same behavior the OpenMP build had.
-	tbb::global_control tbbThreadCap(
-		tbb::global_control::max_allowed_parallelism, (size_t)numThreads);
 
 	size_t readCount = 1;	// count == 0 is used as an end of a list.
 	size_t currMaxReads = 1024;
@@ -2501,7 +2572,7 @@ int main(int argc, char *argv[])
 	{
 		// All input paths land here with useMmap=true (file: native mmap;
 		// stdin/gzip: slurped into a buffer and presented as if mmap'd).
-		return lowMemSortMmap(mmapBase, mmapSize, fRal, fCollapse, sortMode,
+		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
 		                      numThreads, naturalSort, maxMemBytes, verbose);
 	}
 
@@ -2524,7 +2595,7 @@ int main(int argc, char *argv[])
 		// pre-pass before chunking.
 		size_t parsed = 0;
 		reads = parseMmapDispatch(mmapBase, mmapSize,
-		                          (bool)fRal, fCollapse, sortMode,
+		                          fCollapse, sortMode,
 		                          numThreads, arena, &chunkArenas,
 		                          chrInfo, parsed);
 		readCount = parsed + 1;  // matches the legacy "readCount-1 = total reads" semantics
@@ -2538,7 +2609,7 @@ int main(int argc, char *argv[])
 		parseLines<false>(mmapBase, mmapSize, fh,
 		                  reads, readCount, currMaxReads,
 		                  chrInfo, thisChrIt, arena,
-		                  fRal, fCollapse, sortMode);
+		                  fCollapse, sortMode);
 		chrInfo.erase("");
 	}
 
@@ -2652,7 +2723,7 @@ int main(int argc, char *argv[])
 		else
 		{
 			// Hoist fullLine outside the per-read loop so gcc fully constant-folds it.
-			if(fRal || useMmap)
+			if(useMmap)
 			{
 				for(size_t i = 0; i < totalReads; i++)
 				{
@@ -2685,7 +2756,7 @@ int main(int argc, char *argv[])
 		 *   alphabetical turn before flushing to stdout. The chromTable is freed
 		 *   BEFORE the wait so a thread holding chr1 doesn't pin ~1 GB while it waits.
 		 *************************************************************/
-		const bool fullLine = fRal || useMmap;
+		const bool fullLine = useMmap;
 
 		if(numThreads <= 1)
 		{
