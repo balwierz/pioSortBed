@@ -1,9 +1,13 @@
 # Plot wall time, peak RSS, and total disk writes vs. input size
 # for the --external-merge / --multi-pass / bedops / GNU sort
-# comparison. Reads benchmark/bench_external.csv.
+# comparison. Reads benchmark/bench_external_<BUDGET>.csv.
 #
 # Usage:
-#   cd benchmark && gnuplot plot_external.gp
+#   cd benchmark && gnuplot -e "BUDGET='16G'" plot_external.gp
+#   cd benchmark && gnuplot -e "BUDGET='4G'" plot_external.gp
+
+if (!exists("BUDGET")) BUDGET = '16G'
+csv = sprintf("benchmark/bench_external_%s.csv", BUDGET)
 
 set datafile separator ','
 set datafile missing 'NA'
@@ -26,14 +30,16 @@ set xrange [1e7:1e9]
 
 # Build per-tool data files via inline filter; gnuplot has no native
 # group-by-column, so we emit four temp files first.
-system("awk -F, 'NR>1 && $1==\"pio-extmerge-zstd\"' benchmark/bench_external.csv > benchmark/.bx_pioe.tmp")
-system("awk -F, 'NR>1 && $1==\"pio-multipass\"'     benchmark/bench_external.csv > benchmark/.bx_piom.tmp")
-system("awk -F, 'NR>1 && $1==\"bedops-sort-bed\"'   benchmark/bench_external.csv > benchmark/.bx_beops.tmp")
-system("awk -F, 'NR>1 && $1==\"gnu-sort\"'          benchmark/bench_external.csv > benchmark/.bx_gnu.tmp")
+system(sprintf("awk -F, 'NR>1 && $1==\"pio-extmerge-zstd\"' %s > benchmark/.bx_pioe.tmp", csv))
+system(sprintf("awk -F, 'NR>1 && $1==\"pio-multipass\"'     %s > benchmark/.bx_piom.tmp", csv))
+system(sprintf("awk -F, 'NR>1 && $1==\"bedops-sort-bed\"'   %s > benchmark/.bx_beops.tmp", csv))
+system(sprintf("awk -F, 'NR>1 && $1==\"gnu-sort\"'          %s > benchmark/.bx_gnu.tmp", csv))
+
+gnu_label = sprintf('GNU sort -S %s', BUDGET)
 
 # --- Wall time ---
-set output 'benchmark/bench_external_time.png'
-set title "Wall time @ 16 GiB cap (log-x, linear-y)" font ',22'
+set output sprintf('benchmark/bench_external_%s_time.png', BUDGET)
+set title sprintf("Wall time @ %s cap (log-x, linear-y)", BUDGET) font ',22'
 set ylabel 'Wall time (s)' font ',20'
 set yrange [0:*]
 set format y '%g'
@@ -41,27 +47,27 @@ plot \
     'benchmark/.bx_pioe.tmp' using 2:4 with linespoints ls 1 title 'pio --external-merge (zstd)', \
     'benchmark/.bx_piom.tmp' using 2:4 with linespoints ls 2 title 'pio --multi-pass', \
     'benchmark/.bx_beops.tmp' using 2:4 with linespoints ls 3 title 'bedops sort-bed', \
-    'benchmark/.bx_gnu.tmp'   using 2:4 with linespoints ls 4 title 'GNU sort -S 16G'
+    'benchmark/.bx_gnu.tmp'   using 2:4 with linespoints ls 4 title gnu_label
 
 # --- Peak RSS ---
-set output 'benchmark/bench_external_rss.png'
-set title "Peak resident set size @ 16 GiB cap" font ',22'
+set output sprintf('benchmark/bench_external_%s_rss.png', BUDGET)
+set title sprintf("Peak resident set size @ %s cap", BUDGET) font ',22'
 set ylabel 'Peak RSS (GiB)' font ',20'
 plot \
     'benchmark/.bx_pioe.tmp' using 2:($5/1048576) with linespoints ls 1 title 'pio --external-merge (zstd)', \
     'benchmark/.bx_piom.tmp' using 2:($5/1048576) with linespoints ls 2 title 'pio --multi-pass', \
     'benchmark/.bx_beops.tmp' using 2:($5/1048576) with linespoints ls 3 title 'bedops sort-bed', \
-    'benchmark/.bx_gnu.tmp'   using 2:($5/1048576) with linespoints ls 4 title 'GNU sort -S 16G'
+    'benchmark/.bx_gnu.tmp'   using 2:($5/1048576) with linespoints ls 4 title gnu_label
 
 # --- Total disk writes ---
-set output 'benchmark/bench_external_writes.png'
-set title "Total bytes written to disk (output + temps) @ 16 GiB cap" font ',22'
+set output sprintf('benchmark/bench_external_%s_writes.png', BUDGET)
+set title sprintf("Total bytes written to disk (output + temps) @ %s cap", BUDGET) font ',22'
 set ylabel 'Disk writes (GiB)' font ',20'
 plot \
     'benchmark/.bx_pioe.tmp' using 2:($8/1073741824) with linespoints ls 1 title 'pio --external-merge (zstd)', \
     'benchmark/.bx_piom.tmp' using 2:($8/1073741824) with linespoints ls 2 title 'pio --multi-pass', \
     'benchmark/.bx_beops.tmp' using 2:($8/1073741824) with linespoints ls 3 title 'bedops sort-bed', \
-    'benchmark/.bx_gnu.tmp'   using 2:($8/1073741824) with linespoints ls 4 title 'GNU sort -S 16G'
+    'benchmark/.bx_gnu.tmp'   using 2:($8/1073741824) with linespoints ls 4 title gnu_label
 
 # Cleanup temp files.
 system("rm -f benchmark/.bx_*.tmp")

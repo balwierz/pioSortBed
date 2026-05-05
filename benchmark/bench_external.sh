@@ -28,7 +28,8 @@ if [[ ! -x "$PIO" ]]; then
     exit 1
 fi
 
-CSV="benchmark/bench_external.csv"
+# Per-budget CSV file so multiple runs don't clobber each other.
+CSV="benchmark/bench_external_${BUDGET}.csv"
 echo "tool,reads,input_bytes,wall_s,peak_rss_kb,fs_writes_blocks_512,fs_reads_blocks_512,fs_writes_bytes,fs_reads_bytes" > "$CSV"
 
 # Run a command, capture wall, peak RSS, and File system inputs/outputs
