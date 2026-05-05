@@ -3267,7 +3267,7 @@ public:
 		  totalRows_(0),
 		  rowsInBatch_(0),
 		  haveCurChrom_(false),
-		  curRunMaxEnd_(INT64_MIN)
+		  curRunMaxEnd_(INT32_MIN)
 	{}
 
 	~LocissSink() {
@@ -3280,11 +3280,18 @@ public:
 
 	// Open the writer and prepare the Arrow schema. Must be called before
 	// any writeRecord(). Returns 0 on success, nonzero error code on failure.
+	//
+	// Coord columns (Start / End / MaxEndSoFar) are int32 — the spec's
+	// default since v2.x, sufficient for any per-chromosome position
+	// up to INT32_MAX = 2,147,483,647. pioSortBed's internal beg/end
+	// are int32_t too, so this matches without truncation. int64 mode
+	// would be needed for assemblies whose chromosomes exceed
+	// INT32_MAX (axolotl, lily, onion); not currently supported.
 	int open() {
 		auto chromField = arrow::field("Chromosome",  arrow::utf8(),  /*nullable=*/false);
-		auto startField = arrow::field("Start",       arrow::int64(), /*nullable=*/false);
-		auto endField   = arrow::field("End",         arrow::int64(), /*nullable=*/false);
-		auto maxField   = arrow::field("MaxEndSoFar", arrow::int64(), /*nullable=*/false);
+		auto startField = arrow::field("Start",       arrow::int32(), /*nullable=*/false);
+		auto endField   = arrow::field("End",         arrow::int32(), /*nullable=*/false);
+		auto maxField   = arrow::field("MaxEndSoFar", arrow::int32(), /*nullable=*/false);
 		schema_ = arrow::schema({chromField, startField, endField, maxField});
 
 		auto fileResult = arrow::io::FileOutputStream::Open(tmpPath_);
@@ -3333,16 +3340,16 @@ public:
 			curRunRowsBegin_= totalRows_;
 			curRunMinStart_ = beg;
 			curRunMaxStart_ = beg;
-			curRunMaxEnd_   = (int64_t)end;
+			curRunMaxEnd_   = end;
 		} else {
 			if(beg < curRunMinStart_) curRunMinStart_ = beg;
 			if(beg > curRunMaxStart_) curRunMaxStart_ = beg;
-			if((int64_t)end > curRunMaxEnd_) curRunMaxEnd_ = (int64_t)end;
+			if(end > curRunMaxEnd_)   curRunMaxEnd_ = end;
 		}
 
 		auto s1 = chromBuilder_.Append(chrom, chrLen);
-		auto s2 = startBuilder_.Append((int64_t)beg);
-		auto s3 = endBuilder_.Append((int64_t)end);
+		auto s2 = startBuilder_.Append(beg);
+		auto s3 = endBuilder_.Append(end);
 		auto s4 = maxEndBuilder_.Append(curRunMaxEnd_);
 		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok()) {
 			std::cerr << "Error: arrow builder append failed" << std::endl;
@@ -3395,9 +3402,9 @@ private:
 		std::string name;
 		int64_t  rows;
 		int64_t  rowOffset;
-		int64_t  minStart;
-		int64_t  maxStart;
-		int64_t  maxEnd;
+		int32_t  minStart;
+		int32_t  maxStart;
+		int32_t  maxEnd;
 	};
 
 	int flushBatch() {
@@ -3450,8 +3457,8 @@ private:
 		cs.name      = curChromName_;
 		cs.rowOffset = (int64_t)curRunRowsBegin_;
 		cs.rows      = (int64_t)(totalRows_ - curRunRowsBegin_);
-		cs.minStart  = (int64_t)curRunMinStart_;
-		cs.maxStart  = (int64_t)curRunMaxStart_;
+		cs.minStart  = curRunMinStart_;
+		cs.maxStart  = curRunMaxStart_;
 		cs.maxEnd    = curRunMaxEnd_;
 		chromStats_.push_back(std::move(cs));
 		haveCurChrom_ = false;
@@ -3510,17 +3517,21 @@ private:
 		o << "\"schema_columns\":[";
 		o << "{\"name\":\"Chromosome\",\"arrow_type\":\"string\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		o << "{\"name\":\"Start\",\"arrow_type\":\"int64\","
+		o << "{\"name\":\"Start\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		o << "{\"name\":\"End\",\"arrow_type\":\"int64\","
+		o << "{\"name\":\"End\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		o << "{\"name\":\"MaxEndSoFar\",\"arrow_type\":\"int64\","
+		o << "{\"name\":\"MaxEndSoFar\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":true}";
 		o << "],";
 		o << "\"sort_keys\":[\"Chromosome\",\"Start\",\"End\"],";
 		o << "\"row_group_size\":" << kRowGroupSize << ",";
 		o << "\"data_page_version\":\"2.0\",";
-		o << "\"default_compression\":[\"zstd\",3]";
+		o << "\"default_compression\":[\"zstd\",3],";
+		// coord_dtype (added in spec v2.x): records the integer width of
+		// Start / End / MaxEndSoFar so a reader can detect oversights
+		// without re-reading the schema. pioSortBed always writes int32.
+		o << "\"coord_dtype\":\"int32\"";
 		o << "}";
 		return o.str();
 	}
@@ -3532,9 +3543,9 @@ private:
 	std::shared_ptr<arrow::Schema> schema_;
 
 	arrow::StringBuilder chromBuilder_;
-	arrow::Int64Builder  startBuilder_;
-	arrow::Int64Builder  endBuilder_;
-	arrow::Int64Builder  maxEndBuilder_;
+	arrow::Int32Builder  startBuilder_;
+	arrow::Int32Builder  endBuilder_;
+	arrow::Int32Builder  maxEndBuilder_;
 
 	std::vector<ChromStat> chromStats_;
 
@@ -3544,9 +3555,9 @@ private:
 	bool        haveCurChrom_;
 	std::string curChromName_;
 	uint64_t    curRunRowsBegin_;
-	int64_t     curRunMinStart_;
-	int64_t     curRunMaxStart_;
-	int64_t     curRunMaxEnd_;
+	int32_t     curRunMinStart_;
+	int32_t     curRunMaxStart_;
+	int32_t     curRunMaxEnd_;
 };
 #endif // WITH_LOCISS
 
