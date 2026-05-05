@@ -175,13 +175,6 @@ monotonic=$(echo "$got" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last&&pos
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Bucket sort path (--bucket-cutoff 0) ---"
-
-got_bucket=$("$PIO" --bucket-cutoff 0 "$BED3" 2>/dev/null | canon)
-check_eq "bucket sort path" "$got_bucket" "$want_s"
-
-# ---------------------------------------------------------------------------
-echo ""
 echo "--- Low-mem-ssd mode ---"
 
 got_lm=$("$PIO" --low-mem-ssd "$BED3" 2>/dev/null | canon)
@@ -263,30 +256,6 @@ check_eq "-t 8 --sort b" "$got" "$want_par_b"
 got_par5=$("$PIO" -t 8 --sort 5 "$PAR" 2>/dev/null)
 mono_par5=$(echo "$got_par5" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last&&pos<lpos){ok=0;exit}; last=$1;lpos=pos}END{print ok}')
 [[ "$mono_par5" == "1" ]] && ok "-t 8 --sort 5 monotonic within chr" || fail "-t 8 --sort 5 monotonic within chr"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Forced bucket-sort path with all sort modes ---"
-
-got=$("$PIO" --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
-check_eq "bucket --sort s" "$got" "$want_par"
-
-got=$("$PIO" --bucket-cutoff 0 --sort b "$PAR" 2>/dev/null | canon)
-check_eq "bucket --sort b" "$got" "$want_par_b"
-
-got_buck5=$("$PIO" --bucket-cutoff 0 --sort 5 "$PAR" 2>/dev/null)
-mono_buck5=$(echo "$got_buck5" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last&&pos<lpos){ok=0;exit}; last=$1;lpos=pos}END{print ok}')
-[[ "$mono_buck5" == "1" ]] && ok "bucket --sort 5 monotonic within chr" || fail "bucket --sort 5 monotonic within chr"
-
-# Bucket vs classic must agree on multiset (with --sort b they must be deterministic-equivalent).
-got_b_classic=$("$PIO" --sort b "$PAR" 2>/dev/null | canon)
-got_b_bucket=$("$PIO" --bucket-cutoff 0 --sort b "$PAR" 2>/dev/null | canon)
-check_eq "bucket vs classic (--sort b)" "$got_b_classic" "$got_b_bucket"
-
-# Parallel bucket vs serial bucket must agree on multiset.
-got_pb=$("$PIO" -t 8 --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
-got_sb=$("$PIO" -t 1 --bucket-cutoff 0 "$PAR" 2>/dev/null | canon)
-check_eq "parallel bucket vs serial bucket" "$got_pb" "$got_sb"
 
 # ---------------------------------------------------------------------------
 echo ""

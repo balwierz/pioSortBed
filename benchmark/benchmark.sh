@@ -256,9 +256,10 @@ for n in "${SIZES[@]}"; do
     pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
     (( VERIFY && !BENCH_BIG )) && cp "$TMPDIR/output.tmp" "$TMPDIR/pio1_out.txt"
 
-    # --- pioSortBed 4-threaded and 8-threaded (regular bucket-sort path;
-    # per-thread chromTable slabs blow past 32 GB at 100M+ reads, so skip
-    # those sizes) ---
+    # --- pioSortBed 4-threaded and 8-threaded (classic radixSort64 path).
+    # Skipped at 100M+ pending a re-run on v3.2.0+ now that the bucket-sort
+    # per-thread chromTable slabs are gone — old data was a 32 GB blow-up.
+    # ---
     pio4_ms=NA; pio4_kb=NA
     pio8_ms=NA; pio8_kb=NA
     if (( ! BENCH_BIG )); then

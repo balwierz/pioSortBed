@@ -39,10 +39,10 @@ using namespace std;
 // CORE TYPES & ALLOCATOR
 // ----------------------------------------------------------------------------
 // seqread:    one parsed input line (24 B; lives in reads[]).
-// chrInfoT:   per-chromosome bookkeeping (linked-list head, max coordinate).
+// chrInfoT:   per-chromosome bookkeeping (linked-list head).
 // ChrNameMap: small flat-vector map keyed by chromosome name.
 // Arena:      bump allocator for line tails / weight strings on stdin/gzip.
-// Constants:  weight-field cap, bucket-sort default budget, hybrid cutoff.
+// Constants:  weight-field cap.
 // ============================================================================
 
 // Field layout minimizes padding: pointer first, then ints, then char.
@@ -66,12 +66,10 @@ class seqread
 class chrInfoT
 {
 	public:
-	int len;			// max value of the bucket-sort key seen on this chromosome:
-						//   beg for --sort s/b, or strand-aware 5'-end for --sort 5
 	uint32_t lastRead;	// head of the linked list of read indices for this chromosome
 						// (0 = no reads yet / end-of-list sentinel)
 	uint32_t idx;		// sequential chromosome index, assigned after parsing & alphabetical sort
-	chrInfoT() : len(0), lastRead(0), idx(0) {}
+	chrInfoT() : lastRead(0), idx(0) {}
 };
 
 // Small flat-vector "map" keyed by chromosome name.
@@ -151,26 +149,6 @@ typedef ChrNameMap<chrInfoT> string2chrInfoT;
 // copyField returns 0 and the parser errors with a clear message rather than
 // silently truncating.
 const int kWeightBufSize = 256;
-
-// Default per-allocation budget for the bucket-sort path's chromTable when
-// `--max-mem` isn't set. 4 GB matches the previous fixed chrLenLimit of
-// 1 Gbp × 4 B/slot — past this the bucket-sort allocation becomes a poor
-// trade-off vs. the --low-mem-ssd path. Override via --max-mem=N[GMK].
-static constexpr size_t kDefaultBucketChromBudget = 4ULL * 1024 * 1024 * 1024;
-
-// --bucket-cutoff is opt-in. Default = -1 means "bucket sort disabled,
-// always use index-array std::sort (O(n log n))" within the classic path.
-// Users explicitly enable bucket sort by passing the flag:
-//   --bucket-cutoff 0    => always bucket sort (any input size)
-//   --bucket-cutoff N    => bucket sort when totalReads >= N
-//
-// Bucket sort wins asymptotically (O(n + m)) at huge sizes when m (max
-// chromosome coordinate) is small relative to n*log(n), but allocates
-// per-thread chromTable slabs sized to m and is RAM-hungry. On human-
-// scale data (m ~ 250 Mbp) the crossover is well past the practical
-// classic-path range, and --low-mem-ssd is faster and lighter at every
-// size from ~5M up. Hence: not a default.
-const int defaultBucketCutoff = -1;
 
 
 // Arena allocator for line/weight strings.
@@ -370,27 +348,6 @@ static inline float parseWeight(const seqread* reads, uint32_t idx)
 		exit(1);
 	}
 	return w;
-}
-
-// Sum weights across a contiguous buffer of read indices.
-static inline float sumWeightsBuf(const seqread* reads, const uint32_t* idxs, int n)
-{
-	float sum = 0.0f;
-	for(int j = 0; j < n; ++j) sum += parseWeight(reads, idxs[j]);
-	return sum;
-}
-
-// Sum weights along a chromTable linked list at a given position, consuming the list.
-// On return chromTable[pos] == 0.
-static inline float sumWeightsList(seqread* reads, uint32_t* chromTable, int pos)
-{
-	float sum = 0.0f;
-	while(chromTable[pos])
-	{
-		sum += parseWeight(reads, chromTable[pos]);
-		chromTable[pos] = reads[chromTable[pos]].next;
-	}
-	return sum;
 }
 
 // ============================================================================
@@ -1142,18 +1099,18 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 }
 
 // ============================================================================
-// CLASSIC SORT PATH (default + bucket sort)
+// CLASSIC SORT PATH (default)
 // ----------------------------------------------------------------------------
 // Pipeline:
 //   parse: parseLines<UseMmap> (serial / stdin)  OR  parseChunkMmap (parallel
 //          via parseMmapDispatch / parseMmapSerial)
 //   sort:  sortIndicesDispatch -> sortIndices<SortMode> -> radixSort64 or
 //          std::sort with ReadCmp<SortMode>
-//   emit:  per-chrom processChromBucketTpl<FullLine> for the bucket path,
-//          or a flat scan over the sorted index for the classic path
+//   emit:  flat scan over the sorted index, writing each line directly from
+//          the mmap buffer (or reconstructing chr\tbeg\tend from the parsed
+//          struct + tail string for the stdin/gzip path).
 //
-// This section also owns the small write helpers (writeUInt, writeBedLine)
-// used by both sort and bucket emit paths.
+// This section also owns the small write helpers (writeUInt, writeBedLine).
 // ============================================================================
 
 // Fast integer-to-buffer writer. Returns number of chars written.
@@ -1484,122 +1441,6 @@ static void sortIndicesPerChromB(uint32_t* order,
 	}
 }
 
-// Bucket-sort one chromosome: scatter its linked list of reads into
-// chromTable[chosenPosition], then scan positions in order and emit the result.
-// chromTable and (for --sort b) numReadsBeg must be sized at least thisChrLen+1
-// and zero-initialized; on return all touched slots are 0 again so the buffers
-// can be reused for another chromosome.
-
-// Templated on FullLine so gcc constant-folds the "full mmap line vs
-// reconstruct from beg/end + tail" branch in the per-read emit loop;
-// otherwise we'd pay an extra well-predicted-but-real fetch/decode branch
-// per emitted line at -t 1 on multi-million-read files.
-template<bool FullLine>
-static __attribute__((always_inline)) inline void processChromBucketTpl(
-    const char* chrName, int thisChrLen, uint32_t firstRead,
-    seqread* reads, char sortMode, int fCollapse,
-    uint32_t* chromTable, int* numReadsBeg, FILE* out)
-{
-	// Phase 1: scatter into chromTable linked lists keyed by chosenPosition.
-	uint32_t currRead = firstRead;
-	int maxNumReads = 0;
-	while(currRead)
-	{
-		int chosenPosition = (sortMode == '5')
-			? (reads[currRead].str == '-' ? reads[currRead].end : reads[currRead].beg)
-			: reads[currRead].beg;
-		uint32_t oldPtr = chromTable[chosenPosition];
-		chromTable[chosenPosition] = currRead;
-		currRead = reads[currRead].next;        // must read .next before overwriting it below
-		reads[chromTable[chosenPosition]].next = oldPtr;
-		if(sortMode == 'b')
-		{
-			numReadsBeg[chosenPosition]++;
-			if(numReadsBeg[chosenPosition] > maxNumReads) maxNumReads++;
-		}
-	}
-
-	// Phase 2: scan positions in order, emit and consume each bucket.
-	if(sortMode == 'b')
-	{
-		uint32_t* readBuff = (uint32_t*) calloc((size_t)maxNumReads, sizeof(uint32_t));
-		for(int pos = 0; pos <= thisChrLen; pos++)
-		{
-			if(!chromTable[pos]) continue;
-			int n = 0;
-			int foo = numReadsBeg[pos];
-			while(chromTable[pos])
-			{
-				readBuff[n++] = chromTable[pos];
-				chromTable[pos] = reads[chromTable[pos]].next;
-			}
-			std::sort(readBuff, readBuff + foo, [reads](uint32_t a, uint32_t b) {
-				return reads[a].end < reads[b].end;
-			});
-			if(fCollapse)
-				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
-				        sumWeightsBuf(reads, readBuff, foo));
-			else if constexpr(FullLine)
-				for(int j = 0; j < foo; ++j)
-				{
-					fputs_unlocked(reads[readBuff[j]].line, out);
-					fputc_unlocked('\n', out);
-				}
-			else
-				for(int j = 0; j < foo; ++j)
-					writeBedLine(chrName, reads[readBuff[j]].beg, reads[readBuff[j]].end,
-					             reads[readBuff[j]].line, out);
-			numReadsBeg[pos] = 0;
-		}
-		free(readBuff);
-	}
-	else  // sortMode in {5, s}: positions already give the final order.
-	{
-		for(int pos = 0; pos <= thisChrLen; pos++)
-		{
-			if(!chromTable[pos]) continue;
-			if(fCollapse)
-			{
-				fprintf(out, "%s\t%d\t%d\t.\t%g\t+\n", chrName, pos, pos+1,
-				        sumWeightsList(reads, chromTable, pos));
-			}
-			else if constexpr(FullLine)
-			{
-				while(chromTable[pos])
-				{
-					uint32_t ri = chromTable[pos];
-					fputs_unlocked(reads[ri].line, out);
-					fputc_unlocked('\n', out);
-					chromTable[pos] = reads[ri].next;
-				}
-			}
-			else
-			{
-				while(chromTable[pos])
-				{
-					uint32_t ri = chromTable[pos];
-					writeBedLine(chrName, reads[ri].beg, reads[ri].end, reads[ri].line, out);
-					chromTable[pos] = reads[ri].next;
-				}
-			}
-		}
-	}
-}
-
-// Runtime dispatch over the FullLine template parameter.
-static __attribute__((always_inline)) inline void processChromBucket(
-    const char* chrName, int thisChrLen, uint32_t firstRead,
-    seqread* reads, char sortMode, int fCollapse, bool fullLine,
-    uint32_t* chromTable, int* numReadsBeg, FILE* out)
-{
-	if(fullLine)
-		processChromBucketTpl<true>(chrName, thisChrLen, firstRead, reads, sortMode, fCollapse,
-		                            chromTable, numReadsBeg, out);
-	else
-		processChromBucketTpl<false>(chrName, thisChrLen, firstRead, reads, sortMode, fCollapse,
-		                             chromTable, numReadsBeg, out);
-}
-
 // Parsing loop, templated on UseMmap to eliminate per-line branch.
 // Stores only the "tail" (fields 4+) in reads[].line (mmap: full line pointer;
 // stdin/gzip: only tail copied to arena, saving ~50% arena memory).
@@ -1670,9 +1511,9 @@ static void parseLines(
 			if(!tmp) { fprintf(stderr, "Error: out of memory\n"); exit(1); }
 			reads = tmp;
 		}
-		// reads[].next, the order[] array, chromTable[] entries, and radix-sort
-		// internals are all uint32_t. Index 0 is reserved as the end-of-list
-		// sentinel, so usable range is 1..UINT32_MAX-1.
+		// reads[].next, the order[] array, and radix-sort internals are all
+		// uint32_t. Index 0 is reserved as the end-of-list sentinel, so
+		// usable range is 1..UINT32_MAX-1.
 		if(readCount >= (size_t)UINT32_MAX)
 		{
 			fprintf(stderr, "Error: %zu reads exceeds the 4.29 B limit "
@@ -1730,7 +1571,6 @@ static void parseLines(
 			reads[readCount].beg = beg;
 			reads[readCount].end = end;
 			reads[readCount].str = strandChar;
-			int chosenPosition = (sortMode == '5') ? (strandChar == '-' ? end : beg) : beg;
 
 			// Fast same-chr check: compare length first, then bytes.
 			if((int)thisChrIt->first.size() != chrLen ||
@@ -1740,20 +1580,13 @@ static void parseLines(
 				// "chrom already exists" path; only allocates on a true insert.
 				auto ins = chrInfo.tryEmplaceByPtr(chrPtr, chrLen);
 				thisChrIt = ins.first;
-				if(!ins.second)
-				{
-					if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
-					reads[readCount].next = thisChrIt->second.lastRead;
-				}
-				else
-				{
+				if(ins.second)
 					reads[readCount].next = 0;
-					thisChrIt->second.len = chosenPosition;
-				}
+				else
+					reads[readCount].next = thisChrIt->second.lastRead;
 			}
 			else
 			{
-				if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
 				reads[readCount].next = thisChrIt->second.lastRead;
 			}
 			thisChrIt->second.lastRead = (uint32_t)readCount;
@@ -1787,7 +1620,6 @@ struct ChunkChrPartial
 {
 	uint32_t head;   // global idx of head (most recently inserted read)
 	uint32_t tail;   // global idx of tail (read whose .next is 0)
-	int len;         // max chosenPosition seen
 };
 
 typedef ChrNameMap<ChunkChrPartial> ChunkChrMap;
@@ -1881,7 +1713,6 @@ static void parseChunkMmap(char* start, char* end,
 		reads[idx].beg = beg;
 		reads[idx].end = lineEnd;
 		reads[idx].str = strandChar;
-		int chosenPosition = (sortMode == '5') ? (strandChar == '-' ? lineEnd : beg) : beg;
 
 		// Same-chr fast path within this chunk.
 		if(thisChrIt != result.chr.end() &&
@@ -1890,7 +1721,6 @@ static void parseChunkMmap(char* start, char* end,
 		{
 			reads[idx].next = thisChrIt->second.head;
 			thisChrIt->second.head = idx;
-			if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
 		}
 		else
 		{
@@ -1901,13 +1731,11 @@ static void parseChunkMmap(char* start, char* end,
 				reads[idx].next = 0;
 				thisChrIt->second.head = idx;
 				thisChrIt->second.tail = idx;
-				thisChrIt->second.len = chosenPosition;
 			}
 			else
 			{
 				reads[idx].next = thisChrIt->second.head;
 				thisChrIt->second.head = idx;
-				if(thisChrIt->second.len < chosenPosition) thisChrIt->second.len = chosenPosition;
 			}
 		}
 		idx++;
@@ -2054,9 +1882,9 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 	for(int i = 0; i < N; i++) chunkBase[i + 1] = chunkBase[i] + chunkCount[i];
 	size_t totalReads = chunkBase[N];
 
-	// reads[].next, the order[] array, chromTable[] entries, and radix-sort
-	// internals are all uint32_t. Index 0 is reserved as the end-of-list
-	// sentinel, so usable range is 1..UINT32_MAX-1.
+	// reads[].next, the order[] array, and radix-sort internals are all
+	// uint32_t. Index 0 is reserved as the end-of-list sentinel, so usable
+	// range is 1..UINT32_MAX-1.
 	if(totalReads >= (size_t)UINT32_MAX)
 	{
 		cerr << "Error: " << totalReads << " reads exceeds the 4.29 B limit "
@@ -2102,13 +1930,11 @@ static seqread* parseMmapDispatch(char* mmapBase, size_t mmapSize,
 			if(ins.second)
 			{
 				info.lastRead = partial.head;
-				info.len = partial.len;
 			}
 			else
 			{
 				reads[partial.tail].next = info.lastRead;
 				info.lastRead = partial.head;
-				if(info.len < partial.len) info.len = partial.len;
 			}
 		}
 	}
@@ -2316,8 +2142,6 @@ int main(int argc, char *argv[])
 		"  Line length: no fixed limit (stdin/gzip uses getline; mmap uses memchr).\n"
 		"  Chromosome name: no fixed limit (stored as pointer+length).\n"
 		"  Weight field (BED col 4, --collapse): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
-		"  Bucket-sort path: rejects a chromosome whose chromTable would exceed\n"
-		"    --max-mem (default " + to_string(kDefaultBucketChromBudget >> 30) + " GB); use --low-mem-ssd otherwise.\n"
 		"  Read number limit: " + to_string((unsigned long long)UINT32_MAX - 1) + " (all paths).\n"};
 	app.set_version_flag("-V,--version", VERSION_STRING);
 
@@ -2325,7 +2149,6 @@ int main(int argc, char *argv[])
 	char sortMode = 's';
 	int fCollapse = 0;
 	int lowMemSSD = 0;
-	int bucketCutoff = defaultBucketCutoff;
 	int numThreads = 0;
 	bool naturalSort = false;
 	std::string maxMemStr;
@@ -2348,13 +2171,6 @@ int main(int argc, char *argv[])
 	app.add_flag("--low-mem-ssd", lowMemSSD,
 		"low-memory two-pass file mode (SSD-friendly): keeps line offsets in RAM and "
 		"sorts one chromosome at a time; slower than default but uses less peak RAM");
-	app.add_option("--bucket-cutoff", bucketCutoff,
-		"opt in to bucket sort (within the classic path) when input has "
-		"at least this many reads. 0 = always bucket sort. Default: "
-		"-1 (bucket sort disabled, classic path always uses std::sort). "
-		"Only meaningful when --low-mem-ssd is NOT set; the recommended "
-		"path (--low-mem-ssd -t N) is faster and lighter regardless.")
-		->default_val(defaultBucketCutoff);
 	app.add_option("-t,--threads", numThreads,
 		"number of threads for the classic sort path "
 		"(0 = all cores; 1 = single-threaded std::sort)")
@@ -2363,11 +2179,10 @@ int main(int argc, char *argv[])
 		"sort chromosomes in natural order (chr2 < chr10) instead of "
 		"lexicographic order (chr10 < chr2)");
 	app.add_option("--max-mem", maxMemStr,
-		"memory cap on per-chromosome scratch (e.g. 4G, 500M, 2048K, "
-		"or bare bytes). Without this, bucket-sort rejects any single "
-		"chromosome whose chromTable would exceed 4 GB and --low-mem-ssd "
-		"runs uncapped. Set this only to PREVENT OOM, not to optimise "
-		"memory.");
+		"memory cap on per-chromosome scratch in --low-mem-ssd parallel "
+		"emit (e.g. 4G, 500M, 2048K, or bare bytes). Without this, "
+		"--low-mem-ssd runs uncapped. Set only to PREVENT OOM, not to "
+		"optimise memory.");
 	app.add_flag("-v,--verbose", verbose,
 		"print parsing / sorting timing and per-chromosome length info to stderr "
 		"(default: silent)");
@@ -2579,7 +2394,6 @@ int main(int argc, char *argv[])
 	time_t tstart, tend;
 	if(verbose) time(&tstart);
 
-	int maxChrLen = 0;
 	string2chrInfoT chrInfo;
 	seqread* reads = NULL;
 
@@ -2629,10 +2443,8 @@ int main(int argc, char *argv[])
 	std::vector<std::string> chroms;
 	for(string2chrInfoT::iterator it=chrInfo.begin(); it!=chrInfo.end(); it++)
 	{
-		if(verbose) cerr << it->first << ": " << it->second.len << endl;
+		if(verbose) cerr << it->first << endl;
 		chroms.push_back(it->first);
-		if(maxChrLen < it->second.len)
-			maxChrLen = it->second.len;
 	}
 
 	if(naturalSort)
@@ -2646,246 +2458,92 @@ int main(int argc, char *argv[])
 		chrInfo.find(chroms[ci])->second.idx = ci;
 
 	size_t totalReads = readCount - 1;
-	// Bucket sort is opt-in. -1 (default) => never bucket. 0 => always.
-	// N >= 1 => bucket when totalReads >= N.
-	bool useBucketSort = (bucketCutoff >= 0) &&
-	                     (bucketCutoff == 0 || totalReads >= (size_t)bucketCutoff);
 	if(verbose)
 	{
 		cerr << "We have " << totalReads << " regions, "
-		     << chroms.size() << " chromosomes. "
-		     << (useBucketSort ? "Using bucket sort." : "Using classic sort.")
-		     << endl;
+		     << chroms.size() << " chromosomes." << endl;
 		time(&tstart);
 	}
 
-	if(!useBucketSort)
+	/*************************************************************
+	 * CLASSIC SORT PATH — index-array sort with packed-key radix
+	 *
+	 * Sort an index array (4-byte ints) rather than 24-byte seqread structs.
+	 * Steps:
+	 *  1. Walk linked lists, stamp chrIdx (reusing next's storage), build index array.
+	 *  2. radixSort64 / std::sort the index array.
+	 *  3. Linear scan to print (and optionally collapse).
+	 *************************************************************/
+
+	uint32_t* order = (uint32_t*) malloc(totalReads * sizeof(uint32_t));
+	// chromStart[ci] = start offset in order[] for chromosome ci. Used by
+	// the --sort b per-chrom radix path; harmless overhead otherwise.
+	std::vector<size_t> chromStart(chroms.size() + 1, 0);
+	size_t oi = 0;
+	for(uint32_t ci = 0; ci < (uint32_t)chroms.size(); ci++)
 	{
-		/*************************************************************
-		 * CLASSIC SORT PATH — O(n log n) comparison-based sort
-		 *
-		 * Sort an index array (4-byte ints) rather than 24-byte seqread structs.
-		 * Steps:
-		 *  1. Walk linked lists, stamp chrIdx (reusing next's storage), build index array.
-		 *  2. std::sort index array with inlined lambda comparator.
-		 *  3. Linear scan to print (and optionally collapse).
-		 *************************************************************/
-
-		uint32_t* order = (uint32_t*) malloc(totalReads * sizeof(uint32_t));
-		// chromStart[ci] = start offset in order[] for chromosome ci. Used by
-		// the --sort b per-chrom radix path; harmless overhead otherwise.
-		std::vector<size_t> chromStart(chroms.size() + 1, 0);
-		size_t oi = 0;
-		for(uint32_t ci = 0; ci < (uint32_t)chroms.size(); ci++)
+		chromStart[ci] = oi;
+		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+		uint32_t curr = cit->second.lastRead;
+		while(curr)
 		{
-			chromStart[ci] = oi;
-			string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
-			uint32_t curr = cit->second.lastRead;
-			while(curr)
-			{
-				uint32_t nxt = reads[curr].next;
-				reads[curr].chrIdx = ci;
-				order[oi++] = curr;
-				curr = nxt;
-			}
+			uint32_t nxt = reads[curr].next;
+			reads[curr].chrIdx = ci;
+			order[oi++] = curr;
+			curr = nxt;
 		}
-		chromStart[chroms.size()] = oi;
+	}
+	chromStart[chroms.size()] = oi;
 
-		// --sort s and --sort 5 use a global radix sort over packed
-		// (chrIdx, pos) 64-bit keys. --sort b's three keys (chrIdx, beg, end)
-		// don't fit in 64 bits without lossy squeezing, so it goes through
-		// the per-chrom radix path which sorts each chromosome's slice of
-		// order[] independently with a (beg, end) 64-bit key.
-		if(sortMode == 'b')
-			sortIndicesPerChromB(order, chromStart, reads, numThreads);
-		else
-			sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
+	// --sort s and --sort 5 use a global radix sort over packed
+	// (chrIdx, pos) 64-bit keys. --sort b's three keys (chrIdx, beg, end)
+	// don't fit in 64 bits without lossy squeezing, so it goes through
+	// the per-chrom radix path which sorts each chromosome's slice of
+	// order[] independently with a (beg, end) 64-bit key.
+	if(sortMode == 'b')
+		sortIndicesPerChromB(order, chromStart, reads, numThreads);
+	else
+		sortIndicesDispatch(order, totalReads, reads, sortMode, numThreads);
 
-		if(fCollapse)
+	if(fCollapse)
+	{
+		size_t i = 0;
+		while(i < totalReads)
 		{
-			size_t i = 0;
+			uint32_t ri = order[i];
+			uint32_t ci = reads[ri].chrIdx;
+			int pos = reads[ri].beg;
+			float sum = 0.0f;
 			while(i < totalReads)
 			{
-				uint32_t ri = order[i];
-				uint32_t ci = reads[ri].chrIdx;
-				int pos = reads[ri].beg;
-				float sum = 0.0f;
-				while(i < totalReads)
-				{
-					uint32_t rj = order[i];
-					if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
-					sum += parseWeight(reads, rj);
-					i++;
-				}
-				printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
+				uint32_t rj = order[i];
+				if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
+				sum += parseWeight(reads, rj);
+				i++;
 			}
+			printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
 		}
-		else
+	}
+	else if(useMmap)
+	{
+		for(size_t i = 0; i < totalReads; i++)
 		{
-			// Hoist fullLine outside the per-read loop so gcc fully constant-folds it.
-			if(useMmap)
-			{
-				for(size_t i = 0; i < totalReads; i++)
-				{
-					fputs_unlocked(reads[order[i]].line, stdout);
-					fputc_unlocked('\n', stdout);
-				}
-			}
-			else
-			{
-				for(size_t i = 0; i < totalReads; i++)
-				{
-					uint32_t ri = order[i];
-					writeBedLine(chroms[reads[ri].chrIdx].c_str(),
-					             reads[ri].beg, reads[ri].end,
-					             reads[ri].line, stdout);
-				}
-			}
+			fputs_unlocked(reads[order[i]].line, stdout);
+			fputc_unlocked('\n', stdout);
 		}
-		free(order);
 	}
 	else
 	{
-		/*************************************************************
-		 * BUCKET SORT PATH — O(n + m) counting/bucket sort
-		 *
-		 * Single-thread: one shared chromTable[maxChrLen+1] reused across chromosomes.
-		 * Multi-thread: chromosomes processed in parallel via std::for_each(par, ...).
-		 *   Each worker allocates its own per-chrom chromTable, writes output to an
-		 *   open_memstream buffer, then waits at a producer-consumer barrier for its
-		 *   alphabetical turn before flushing to stdout. The chromTable is freed
-		 *   BEFORE the wait so a thread holding chr1 doesn't pin ~1 GB while it waits.
-		 *************************************************************/
-		const bool fullLine = useMmap;
-
-		if(numThreads <= 1)
+		for(size_t i = 0; i < totalReads; i++)
 		{
-			// One chromTable shared across all chroms, sized to the largest.
-			// Reject before allocating if the slab would exceed the budget
-			// (--max-mem if set, else 4 GB). --low-mem-ssd handles arbitrary
-			// chromosome lengths since it never builds a per-position slab.
-			size_t slabBytes = ((size_t)maxChrLen + 1) * sizeof(int);
-			if(sortMode == 'b') slabBytes *= 2;
-			size_t bucketBudget = (maxMemBytes > 0) ? maxMemBytes : kDefaultBucketChromBudget;
-			if(slabBytes > bucketBudget)
-			{
-				cerr << "Error: largest chromosome has positions up to " << maxChrLen
-				     << ", which would require " << (slabBytes >> 30) << " GB for the "
-				     << "bucket-sort slab (budget: " << (bucketBudget >> 30) << " GB). "
-				     << "Re-run with --low-mem-ssd, or raise --max-mem." << endl;
-				exit(1);
-			}
-			uint32_t* chromTable = (uint32_t*) calloc((size_t)maxChrLen + 1, sizeof(uint32_t));
-			int* numReadsBeg = (sortMode == 'b')
-				? (int*) calloc((size_t)maxChrLen + 1, sizeof(int))
-				: NULL;
-			for(const std::string& chrom : chroms)
-			{
-				string2chrInfoT::iterator cit = chrInfo.find(chrom);
-				processChromBucket(chrom.c_str(), cit->second.len, cit->second.lastRead,
-				                   reads, sortMode, fCollapse, fullLine,
-				                   chromTable, numReadsBeg, stdout);
-			}
-			free(chromTable);
-			if(numReadsBeg) free(numReadsBeg);
-		}
-		else
-		{
-			std::vector<int> idxs(chroms.size());
-			for(size_t i = 0; i < chroms.size(); i++) idxs[i] = (int)i;
-
-			std::mutex printMtx;
-			std::condition_variable printCv;
-			int nextChromToPrint = 0;
-
-			// Optional chromTable memory-budget gate. When --max-mem is set,
-			// each task acquires `effCost` bytes from `budgetRemaining` before
-			// allocating its chromTable, and releases them after the chrom is
-			// fully processed. If a single chrom's cost exceeds the budget it
-			// runs alone (clamping its draw to the full budget).
-			std::mutex memMtx;
-			std::condition_variable memCv;
-			size_t budgetRemaining = maxMemBytes;
-
-			std::for_each(std::execution::par, idxs.begin(), idxs.end(),
-				[&](int ci) {
-					const std::string& chrom = chroms[ci];
-					string2chrInfoT::iterator cit = chrInfo.find(chrom);
-					int thisChrLen = cit->second.len;
-
-					// Cost = chromTable + (numReadsBeg if --sort b).
-					size_t cost = (size_t)(thisChrLen + 1) * sizeof(int);
-					if(sortMode == 'b') cost *= 2;
-
-					// Reject before allocating if a single chrom's slab exceeds
-					// the budget. --max-mem if set is the budget; otherwise
-					// fall back to the 4 GB default. --low-mem-ssd handles
-					// arbitrary chromosome lengths.
-					size_t bucketBudget = (maxMemBytes > 0) ? maxMemBytes : kDefaultBucketChromBudget;
-					if(cost > bucketBudget)
-					{
-						cerr << "Error: chromosome " << chrom << " has positions up to "
-						     << thisChrLen << ", which would require " << (cost >> 30)
-						     << " GB for the bucket-sort slab (budget: "
-						     << (bucketBudget >> 30) << " GB). Re-run with --low-mem-ssd, "
-						     << "or raise --max-mem." << endl;
-						exit(1);
-					}
-					size_t effCost = (maxMemBytes > 0)
-						? std::min(cost, maxMemBytes)  // a chrom bigger than the
-						                               // whole budget runs alone
-						: 0;
-
-					if(effCost > 0)
-					{
-						std::unique_lock<std::mutex> lk(memMtx);
-						memCv.wait(lk, [&]{ return budgetRemaining >= effCost; });
-						budgetRemaining -= effCost;
-					}
-
-					char* memBuf = NULL;
-					size_t memBufSz = 0;
-					FILE* sink = open_memstream(&memBuf, &memBufSz);
-					if(!sink)
-					{
-						cerr << "open_memstream failed for chrom " << chrom << endl;
-						exit(1);
-					}
-					{
-						std::vector<uint32_t> chromTable((size_t)thisChrLen + 1, 0);
-						std::vector<int> numReadsBeg;
-						if(sortMode == 'b') numReadsBeg.assign((size_t)thisChrLen + 1, 0);
-
-						processChromBucket(chrom.c_str(), thisChrLen, cit->second.lastRead,
-						                   reads, sortMode, fCollapse, fullLine,
-						                   chromTable.data(),
-						                   sortMode == 'b' ? numReadsBeg.data() : NULL,
-						                   sink);
-						// chromTable / numReadsBeg destruct here, releasing ~thisChrLen*4
-						// bytes BEFORE we block at the print barrier.
-					}
-					fclose(sink);
-
-					if(effCost > 0)
-					{
-						{
-							std::lock_guard<std::mutex> lk(memMtx);
-							budgetRemaining += effCost;
-						}
-						memCv.notify_all();
-					}
-
-					{
-						std::unique_lock<std::mutex> lk(printMtx);
-						printCv.wait(lk, [&]{ return nextChromToPrint == ci; });
-						fwrite_unlocked(memBuf, 1, memBufSz, stdout);
-						free(memBuf);
-						nextChromToPrint++;
-					}
-					printCv.notify_all();
-				});
+			uint32_t ri = order[i];
+			writeBedLine(chroms[reads[ri].chrIdx].c_str(),
+			             reads[ri].beg, reads[ri].end,
+			             reads[ri].line, stdout);
 		}
 	}
+	free(order);
+
 	if(verbose)
 	{
 		time(&tend);

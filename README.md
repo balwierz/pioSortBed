@@ -22,20 +22,11 @@ pioSortBed has two sort paths:
   mmap), not with chromosome length.
 
 - **Classic path (the default when `--low-mem-ssd` isn't set)** holds the
-  whole input in a `seqread[]` array and uses index-array `std::sort`
-  (O(n log n)). At `-t 1` it's a hand-tuned comparator; `-t > 1` uses
-  `std::sort(std::execution::par, ...)` over TBB.
-
-  *Optional, opt-in only:* `--bucket-cutoff N` switches to bucket /
-  counting sort (O(n + m), where *m* = max chromosome coordinate) when
-  the input has ≥ N reads. `--bucket-cutoff 0` forces bucket sort at any
-  size. Multi-threaded bucket sort allocates per-chromosome `chromTable`
-  slabs on each worker (fast but RAM-hungry — slabs scale with *m*, not
-  *n*); `--max-mem` (default 4 GB) caps a single chromosome's slab and
-  rejects oversized ones with a clear error. **Bucket sort is no longer
-  enabled by default**: on human-scale data the asymptotic edge doesn't
-  win until well past the practical classic-path range, and at any size
-  where it might matter `--low-mem-ssd -t N` is faster *and* lighter.
+  whole input in a `seqread[]` array and runs an LSD radix sort over
+  packed `(chrIdx, pos)` 64-bit keys (`radixSort64`), falling back to
+  comparator `std::sort` only below a small-input threshold. At `-t > 1`
+  the radix builds per-thread digit histograms in parallel and scatters
+  into disjoint output ranges (no atomics).
 
   The classic path is mainly useful at small sizes (< ~1 M reads), where
   the two-pass overhead of `--low-mem-ssd` dominates. Above that,
@@ -84,9 +75,8 @@ pioSortBed [options] -   # read from standard input
 | `-n` / `--natural-sort` | Natural chromosome order: `chr2 < chr10` (default: lexicographic) |
 | `--collapse` | Collapse overlapping regions, summing weights |
 | `--low-mem-ssd` | Two-pass mode (SSD-friendly). **Recommended fast path for any file ≥ ~1 M reads** — beats the classic path on both wall time and peak RSS at scale. Stdin and `.gz` inputs are slurped into memory first; file input is mmap'd directly. |
-| `--bucket-cutoff N` | Opt in to bucket sort (within the classic path) at ≥N reads. `0` = always bucket sort. Default: `-1` (bucket sort disabled). Only meaningful when `--low-mem-ssd` is *not* set. |
 | `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
-| `--max-mem=N[GMK]` | Memory cap on per-chromosome scratch (e.g. `4G`, `500M`). Without it, bucket-sort rejects any single chromosome whose `chromTable` would exceed 4 GB and `--low-mem-ssd` runs uncapped — usually what you want. Set this only to *prevent* OOM, not to optimise memory. See the [`--max-mem` sweep below](#--max-mem-budget-sweep-pio-lm--t-4--200m). |
+| `--max-mem=N[GMK]` | Memory cap on the `--low-mem-ssd` parallel pass-2 emit-buffer budget (e.g. `4G`, `500M`). Without it `--low-mem-ssd` runs uncapped — usually what you want. Set this only to *prevent* OOM, not to optimise memory. See the [`--max-mem` sweep below](#--max-mem-budget-sweep-pio-lm--t-4--200m). |
 | `-h` / `--help` | Show help message |
 
 BED header lines (`track`, `browser`, `#` comments) are passed through unchanged to output. Gzip-compressed input (`.gz` extension) is transparently decompressed.
@@ -173,7 +163,7 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
 
 > Sub-50 ms timings (10k–50k) bottom out at GNU `time`'s 10 ms resolution; raw 0 ms readings just mean the tool finished faster than the timer can resolve.
 >
-> `pio 4t` / `pio 8t` and `bedtools` are skipped at 100M+ because they would exceed the 30 GB RAM available on this hardware. `pio -t N` allocates a per-chromosome `chromTable` slab on each worker (chr1 alone is ~1 GB), and `bedtools` memory grows linearly with the input. Use `pioSortBed --low-mem-ssd -t 4` or `-t 8` instead at those sizes.
+> `bedtools` is skipped at 100M+ because it would exceed the 30 GB RAM available on this hardware (its memory grows linearly with the input). `pio` classic `-t 4` / `-t 8` data at ≥ 100M predates v3.2.0 (which removed the bucket-sort path); the classic path now uses `radixSort64` and is RAM-efficient at every size, but those rows in the historical table reflect the old behaviour. Use `pioSortBed --low-mem-ssd -t 4` or `-t 8` at those sizes.
 
 **Key observations:**
 - **`pioSortBed --low-mem-ssd -t 8` is the fastest configuration at every size
@@ -192,13 +182,11 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
   the whole range and stays competitive with GNU sort 8t up through 2M.
 - **`bedops sort-bed`** remains the closest single-threaded competitor and uses
   the least memory of any tool tested at small sizes.
-- The classic path's `pio -t N` numbers above for 50M reads were collected
-  on v3.0.8 when bucket sort was the default at ≥ 50M reads. From v3.0.10
-  onwards bucket sort is opt-in only (`--bucket-cutoff N`); the default
-  classic path uses index-array `std::sort` at every size. The difference
-  matters mainly at 50M+ where bucket sort's `chromTable` parallelism
-  helps `-t 8` (6.0 s here was bucket sort), but `--low-mem-ssd -t 8` is
-  faster than either at this size — see the column right next to it.
+- The classic path's `pio -t N` numbers above at 50M reads were collected
+  on v3.0.8 when bucket sort was the default. v3.2.0 removed bucket sort
+  entirely; the classic path now uses `radixSort64` at every size and is
+  RAM-bounded by `seqread[]` + the mmap'd input. `--low-mem-ssd -t 8` is
+  faster than either at 50M and above.
 
 ### Peak Memory (RSS)
 
@@ -242,18 +230,17 @@ Same colour per tool family; thread count distinguished by line style (`-t 1` so
   10.4 GB. `bedtools` and `pio -t 4 / -t 8` would have needed >32 GB.
 - **`bedops sort-bed`** uses the least memory throughout — a sensible choice
   on RAM-constrained systems where wall time isn't critical.
-- **`pioSortBed -t N` (classic)** in the table above used bucket sort at
-  ≥ 50 M reads (the default until v3.0.10). From v3.0.10 onwards bucket
-  sort is opt-in (`--bucket-cutoff N`) and the classic path defaults to
-  `std::sort` at every size. For large inputs `--low-mem-ssd -t 4` or
-  `-t 8` is strictly better on both axes anyway.
+- **`pioSortBed -t N` (classic)** in the table above used the v3.0.8
+  bucket sort at ≥ 50 M reads. From v3.2.0 bucket sort is gone and the
+  classic path uses `radixSort64` at every size; for large inputs
+  `--low-mem-ssd -t 4` or `-t 8` is strictly better on both axes anyway.
 
 ### `--max-mem` budget sweep (`pio-lm -t 4 @ 200M`)
 
-`--max-mem` caps concurrent per-chromosome `chromTable` allocations. To map
-out how it interacts with the `--low-mem-ssd -t 4` path, here's a sweep on
-the 200M-row fixture varying the budget from 256 MB to 16 GB plus an
-"uncapped" reference (no flag):
+`--max-mem` caps concurrent per-chromosome emit-buffer allocations on the
+`--low-mem-ssd` parallel pass-2 path. To map out how it interacts with
+`--low-mem-ssd -t 4`, here's a sweep on the 200M-row fixture varying the
+budget from 256 MB to 16 GB plus an "uncapped" reference (no flag):
 
 ![--max-mem budget sweep](benchmark/maxmem_sweep.png)
 
@@ -287,10 +274,11 @@ Three regimes:
    cost.
 
 **Implication**: `--max-mem` is a safety cap, not a memory optimiser. Set
-it only to *prevent* OOM on a host where the chromTable backlog could
-otherwise blow past available RAM. On a 30 GB host with this 200M-row
-fixture, the uncapped peak (15.7 GB at -t 4, 18.4 GB at -t 8) is well
-within the headroom, so `benchmark.sh` runs the headline cases uncapped.
+it only to *prevent* OOM on a host where the concurrent emit-buffer
+backlog could otherwise blow past available RAM. On a 30 GB host with
+this 200M-row fixture, the uncapped peak (15.7 GB at -t 4, 18.4 GB at
+-t 8) is well within the headroom, so `benchmark.sh` runs the headline
+cases uncapped.
 
 To reproduce the sweep: `bash benchmark/bench_max_mem.sh`. Data lives in
 `benchmark/maxmem_sweep.csv`; plot in `benchmark/plot_maxmem.gp`.
@@ -304,17 +292,10 @@ lower peak RSS — see the [`--max-mem` sweep section](#--max-mem-budget-sweep-p
 above).
 
 **Classic path** (default, no `--low-mem-ssd`):
-- Always index-array `std::sort` (O(n log n)). `-t 1` uses an inlined
-  comparator; `-t > 1` uses `std::sort(std::execution::par, ...)` over TBB.
-- *Opt-in:* `--bucket-cutoff N` switches to bucket / counting sort
-  (O(n + m), where m = max chromosome coordinate) at ≥ N reads.
-  `--bucket-cutoff 0` forces it at any size. Single-thread reuses one
-  `chromTable` across chromosomes; multi-thread allocates a per-thread
-  per-chromosome `chromTable` slab and flushes through a producer-
-  consumer barrier in alphabetical order. `--max-mem N[GMK]` caps
-  single-chromosome slab size. Bucket sort is *not* enabled by default
-  — on human-scale data the asymptotic edge doesn't win until well past
-  where the classic path is realistically used.
+- LSD radix sort (`radixSort64`) over packed `(chrIdx, pos)` 64-bit keys.
+  Falls back to `std::sort` only below a small-input threshold. `-t 1`
+  is serial radix; `-t > 1` builds per-thread digit histograms in
+  parallel and scatters into disjoint output ranges (no atomics).
 - Use cases: small inputs (< ~1 M reads, where the two-pass overhead of
   `--low-mem-ssd` dominates), and benchmarking.
 
@@ -377,9 +358,7 @@ state (also visible via `pioSortBed --help`):
 | Chromosome name length     | None — stored as pointer+length into the line |
 | Chromosome coordinate (`beg`, `end`) | Signed 32-bit ⇒ ≤ 2.15 Gbp per single coordinate |
 | Read count                 | uint32_t indices ⇒ ≤ 4.29 B reads (all sort paths) |
-| Per-chromosome bucket-sort RAM | Default 4 GB; overridden by `--max-mem N[GMK]` |
 | BED score field length (col 5) | 255 bytes; over-long values rejected with a clear error |
-| Bucket sort opt-in (within classic path) | Off by default; enable with `--bucket-cutoff N` (≥ N reads) or `--bucket-cutoff 0` (any size) |
 
 Above 2.15 Gbp per single coordinate, you'd need to widen `int beg, int end`
 in `seqread` / `lowMemNode` to `int64_t` and rebuild. Above 4.29 B reads,

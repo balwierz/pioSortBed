@@ -4,6 +4,38 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.2.0] — 2026-05-05
+
+### Removed
+- `--bucket-cutoff` flag and the entire bucket-sort emit path. Bucket sort
+  has been opt-in only since v3.0.10 and is dominated by `--low-mem-ssd`
+  on every benchmarked size; on the classic path, `radixSort64` handles
+  every input we care about. Deletes ~340 source lines:
+  - `processChromBucketTpl<bool FullLine>` (~89 lines) and
+    `processChromBucket` runtime dispatch (~12 lines).
+  - The 140-line bucket emit block in `main()` (single-thread shared-slab
+    variant + multi-thread per-chrom-slab variant with `--max-mem`
+    budget gate, condition-variable producer-consumer barrier, and
+    `open_memstream` per-chrom buffers).
+  - `sumWeightsBuf` and `sumWeightsList` helpers (only the bucket emit
+    consumed them).
+  - `kDefaultBucketChromBudget` and `defaultBucketCutoff` constants.
+  - `chrInfoT::len` and `ChunkChrPartial::len` fields plus all the
+    parse-time max-position tracking that maintained them. Removes one
+    write per parsed line on the hot path.
+  - `maxChrLen` accumulator and the per-chromosome verbose-print line.
+- The bucket-sort tests in `test/test.sh` (~31 lines, 8 checks). All 21
+  remaining tests pass.
+
+### Changed
+- `--max-mem` description updated: the flag now only caps the
+  `--low-mem-ssd` parallel pass-2 emit-buffer budget. The previous
+  bucket-sort role (single-chromosome slab cap, default 4 GB rejection
+  threshold) is gone with the bucket path.
+- README and CLAUDE.md rewritten to describe the classic path purely in
+  terms of `radixSort64`. Historical benchmark commentary that referenced
+  bucket sort retained as historical context where relevant.
+
 ## [3.1.0] — 2026-05-05
 
 ### Added

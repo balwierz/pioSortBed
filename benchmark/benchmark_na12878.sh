@@ -180,7 +180,7 @@ run_and_measure "$PIO" -t 1 "$BED_FILE"
 pio1_ms=$RESULT_MS; pio1_kb=$RESULT_KB
 printf "%-22s  %14s  %10s\n" "pioSortBed 1t" "$(fmt_time $pio1_ms)" "$(fmt_size $pio1_kb)"
 
-# pioSortBed 8-thread (≥50M reads uses bucket sort, threads have no effect)
+# pioSortBed 8-thread classic path (radixSort64 over packed (chrIdx, pos) keys)
 run_and_measure "$PIO" -t 8 "$BED_FILE"
 pio8_ms=$RESULT_MS; pio8_kb=$RESULT_KB
 printf "%-22s  %14s  %10s\n" "pioSortBed 8t" "$(fmt_time $pio8_ms)" "$(fmt_size $pio8_kb)"
