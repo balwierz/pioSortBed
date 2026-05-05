@@ -2817,7 +2817,12 @@ int main(int argc, char *argv[])
 	int fCollapse = 0;
 	int lowMemSSD = 0;
 	int extMerge = 0;
-	std::string extCodecStr = "raw";
+	// zstd default: fastest compressed codec across all builds, best
+	// compression ratio (~0.33x of text input on a synthetic BED6, ~0.45x
+	// of binary-uncompressed temps), and at 200 M records / 256 M budget
+	// it is *faster* than `raw` end-to-end (compression saves more disk
+	// I/O than its CPU costs). See benchmark/bench_extmerge.sh.
+	std::string extCodecStr = "zstd";
 	std::string extTmpDir;
 	int numThreads = 0;
 	bool naturalSort = false;
@@ -2847,9 +2852,12 @@ int main(int argc, char *argv[])
 		"merge to stdout. Use for inputs > RAM. Temp files go to --tmpdir or "
 		"$TMPDIR. (only the default coordinate sort is supported)");
 	app.add_option("--merge-codec", extCodecStr,
-		"compression codec for --external-merge temp files: raw|lz4|zstd|rans0|rans1 "
-		"(default raw; codecs landed in subsequent commits)")
-		->default_val("raw");
+		"compression codec for --external-merge temp files: raw|lz4|zstd"
+		" (rans0|rans1 also available in WITH_BAM builds). zstd is the "
+		"default — fastest compressed codec, best ratio, and at large "
+		"sizes it is faster than `raw` end-to-end because compression "
+		"saves more disk I/O than its CPU costs.")
+		->default_val("zstd");
 	app.add_option("--tmpdir", extTmpDir,
 		"temp directory for --external-merge run files (default: $TMPDIR or /tmp)");
 	app.add_option("-t,--threads", numThreads,

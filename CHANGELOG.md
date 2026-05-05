@@ -4,6 +4,66 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.3.0] — 2026-05-05
+
+### Added
+- `--external-merge` sort path for inputs > RAM. Streams the input via
+  `getline`, fills a per-run buffer up to `--max-mem` (default 1 GiB),
+  sorts each run with `radixSort64`, and writes a binary temp file to
+  `--tmpdir` (or `$TMPDIR`). Pass 2 is a k-way min-heap merge across
+  the run files, emitting BED text to stdout. zero RAM-per-record
+  scaling: peak RSS is bounded by `--max-mem` regardless of input
+  size. With `--max-mem 256M` it sorts a 200 M-record / 8 GiB BED in
+  ~62 s on the bench laptop; the same input would OOM under the mmap
+  path on a 16 GiB host.
+- Multi-codec compressed temp-file format. `--merge-codec` selects
+  the codec; **zstd is the default** — fastest compressed codec
+  available in every build, best ratio (~0.33× of text input on a
+  synthetic BED6), and at 200 M records / 256 M budget it is *faster*
+  than `raw` end-to-end (61.7 s vs 64.0 s) because the disk-I/O
+  saved by compression exceeds its CPU cost.
+
+  Codecs benchmarked on the same fixture:
+
+      codec    wall    temp_bytes  ratio_vs_raw  ratio_vs_input
+      rans0   54.6 s    4.3 GiB    0.69x          0.50x      (WITH_BAM)
+      zstd    61.7 s    2.8 GiB    0.45x          0.33x
+      raw     64.0 s    6.3 GiB    1.00x          0.73x
+      lz4     69.7 s    3.9 GiB    0.62x          0.45x
+      rans1  127.2 s    2.9 GiB    0.46x          0.34x      (WITH_BAM)
+
+  rans0 (rANS order-0, via htscodecs `rans_compress_to_4x16`) is
+  fastest in `WITH_BAM=1` builds — htscodecs' rANS uses SIMD
+  (SSE4/AVX2) and beats LZ4 on this workload despite weaker
+  compression. rans1 (order-1) ties zstd on ratio but is ~2× slower.
+  lz4 is unexpectedly slower than raw at this scale (its codec
+  overhead exceeds I/O savings on this fixture); kept for portability
+  / speed in cache-rich regimes (small inputs, tmpfs).
+
+  Run-file format documented in `src/pioSortBed.cpp` ("EXTERNAL MERGE
+  SORT PATH" banner). Header magic `PSBR`, per-block compressed
+  payload, footer magic `PSBE`. Format-version byte allows future
+  on-disk-format changes.
+- New build deps: `liblz4-dev` and `libzstd-dev` (system packages on
+  every distro). rANS comes free with `WITH_BAM=1` since the htscodecs
+  internals are already in `libhts.a`.
+- `benchmark/bench_extmerge.sh` — compares all available codecs on a
+  synthetic BED6 fixture; emits a CSV under `benchmark/`.
+- 2 new tests in `test/test.sh` (single-run + multi-run paths via
+  `--max-mem 4K`). 23 of 23 tests pass.
+
+### Changed
+- The `Makefile`'s `WITH_BAM=1` recipe now links `libhts.a` directly
+  (instead of `-lhts` against the shared lib) so that the htscodecs
+  rANS symbols (which `libhts.so` does not export) are pulled in.
+  Adds a transitive `-ldeflate` for the bgzf functions.
+
+### Restrictions in this release
+- `--external-merge` is file-input-only (no stdin/gzip), default
+  coordinate sort only (`--sort=s`). `--collapse`, `--natural-sort`,
+  and `--low-mem-ssd` are rejected with a clear error. These are
+  straightforward to lift but were out of scope for this commit.
+
 ## [3.2.0] — 2026-05-05
 
 ### Removed
