@@ -2541,155 +2541,226 @@ static int extMergeSort(const std::string& inputFile,
 	time_t tstart, tend;
 	if(verbose) time(&tstart);
 
-	FILE* in = fopen(inputFile.c_str(), "r");
-	if(!in) {
+	// mmap input. --external-merge requires regular-file input (we re-stream
+	// it during pass 1 + during merge); pipes / stdin are excluded by main().
+	int fd = open(inputFile.c_str(), O_RDONLY);
+	if(fd < 0) {
 		std::cerr << "Error: cannot open " << inputFile << ": "
 		          << strerror(errno) << std::endl;
 		return 1;
 	}
-
-	// Per-run state (resets each time we flush a run).
-	std::vector<ExtEntry> entries;
-	Arena* tailArena = new Arena(1UL << 20, 1UL << 24);
-	std::unordered_map<std::string, uint16_t> chrIdxMap;
-	std::vector<std::string> chrDict;
-	size_t bytesUsed = 0;  // approximate accounting for entries + tails
+	struct stat st;
+	if(fstat(fd, &st) != 0) {
+		std::cerr << "Error: stat failed for " << inputFile << std::endl;
+		close(fd); return 1;
+	}
+	if(!S_ISREG(st.st_mode)) {
+		std::cerr << "Error: --external-merge requires a regular file" << std::endl;
+		close(fd); return 1;
+	}
+	size_t fileSize = (size_t)st.st_size;
 	std::vector<std::string> runPaths;
-
-	auto flushRun = [&]() {
-		if(entries.empty()) return;
-		size_t n = entries.size();
-
-		// chrDict is in encounter order. Sort it (alphabetically or
-		// naturally) and remap each entry's chrIdx so that the run's
-		// local chrIdx order matches the global merge's chrIdx order.
-		// Without this, a run that saw "chr10" before "chr1" would emit
-		// chr10 records before chr1 records, breaking the k-way merge
-		// invariant ("smallest local key == smallest global key").
-		std::vector<uint32_t> sortedOrder(chrDict.size());
-		for(uint32_t i = 0; i < chrDict.size(); i++) sortedOrder[i] = i;
-		if(naturalSort) {
-			std::sort(sortedOrder.begin(), sortedOrder.end(),
-			          [&](uint32_t a, uint32_t b) {
-			              return naturalChrLess(chrDict[a], chrDict[b]);
-			          });
-		} else {
-			std::sort(sortedOrder.begin(), sortedOrder.end(),
-			          [&](uint32_t a, uint32_t b) {
-			              return chrDict[a] < chrDict[b];
-			          });
+	if(fileSize == 0) { close(fd); /* fall through to empty merge */ }
+	char* mmapBase = NULL;
+	if(fileSize > 0) {
+		mmapBase = (char*) mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+		if(mmapBase == MAP_FAILED) {
+			std::cerr << "Error: mmap failed for " << inputFile << ": "
+			          << strerror(errno) << std::endl;
+			close(fd); return 1;
 		}
-		std::vector<uint16_t> oldToNew(chrDict.size());
-		std::vector<std::string> sortedDict(chrDict.size());
-		for(uint32_t newIdx = 0; newIdx < sortedOrder.size(); newIdx++) {
-			oldToNew[sortedOrder[newIdx]] = (uint16_t)newIdx;
-			sortedDict[newIdx] = std::move(chrDict[sortedOrder[newIdx]]);
-		}
-		for(ExtEntry& e : entries) e.chrIdx = oldToNew[e.chrIdx];
+		madvise(mmapBase, fileSize, MADV_SEQUENTIAL);
+	}
+	close(fd);
 
-		std::vector<uint64_t> keys(n);
-		std::vector<uint32_t> order(n);
-		for(size_t i = 0; i < n; i++) {
-			keys[i]  = ((uint64_t)entries[i].chrIdx << 32) | (uint32_t)entries[i].beg;
-			order[i] = (uint32_t)i;
-		}
-		radixSort64(keys.data(), order.data(), n, numThreads);
+	// Skip + emit leading header lines serially.
+	size_t bodyStart = 0;
+	while(bodyStart < fileSize) {
+		const char* lineStart = mmapBase + bodyStart;
+		const char* nl = (const char*) memchr(lineStart, '\n', fileSize - bodyStart);
+		size_t lineLen = (size_t)((nl ? nl : mmapBase + fileSize) - lineStart);
+		bool isHeader = (lineLen > 0 && lineStart[0] == '#') ||
+		                (lineLen >= 6 && memcmp(lineStart, "track ",   6) == 0) ||
+		                (lineLen >= 8 && memcmp(lineStart, "browser ", 8) == 0);
+		if(!isHeader) break;
+		fwrite_unlocked(lineStart, 1, lineLen, stdout);
+		fputc_unlocked('\n', stdout);
+		bodyStart = (nl ? (size_t)(nl - mmapBase) + 1 : fileSize);
+	}
+	size_t bodySize = (fileSize > bodyStart) ? (fileSize - bodyStart) : 0;
 
-		char path[512];
-		snprintf(path, sizeof(path), "%s/piosort.run.%u.%d.tmp",
-		         tmpDir.c_str(), (unsigned)runPaths.size(), (int)getpid());
-		ExtRunWriter writer(path, codec, sortedDict, numThreads);
-		for(size_t i = 0; i < n; i++) {
-			const ExtEntry& e = entries[order[i]];
-			writer.writeRecord(e.chrIdx, e.beg, e.end, e.strand, e.tailPtr, e.tailLen);
-		}
-		writer.close();
-		runPaths.emplace_back(path);
+	// Newline-aligned chunk boundaries. Each thread builds its own runs from
+	// its chunk; per-thread memory budget is (memBudget / N).
+	int N = numThreads;
+	if(N < 1) N = 1;
+	if(bodySize > 0) {
+		size_t bytesPerChunk = 256 * 1024;
+		int byBytes = (int)((bodySize + bytesPerChunk - 1) / bytesPerChunk);
+		if(byBytes < 1) byBytes = 1;
+		if(N > byBytes) N = byBytes;
+	} else {
+		N = 1;
+	}
+	std::vector<size_t> chunkStart(N + 1);
+	chunkStart[0] = bodyStart;
+	chunkStart[N] = fileSize;
+	for(int i = 1; i < N; i++) {
+		size_t guess = bodyStart + (bodySize / (size_t)N) * (size_t)i;
+		while(guess < fileSize && mmapBase[guess] != '\n') guess++;
+		if(guess < fileSize) guess++;
+		chunkStart[i] = guess;
+	}
 
-		entries.clear();
-		entries.shrink_to_fit();
-		delete tailArena;
-		tailArena = new Arena(1UL << 20, 1UL << 24);
-		chrIdxMap.clear();
-		chrDict.clear();
-		bytesUsed = 0;
-	};
+	// Per-thread memory budget. Total stays roughly at memBudget.
+	const size_t perThreadBudget = (memBudget + (size_t)N - 1) / (size_t)N;
 
-	// Read input line by line via getline (handles arbitrary line lengths).
-	char* lineBuf = NULL;
-	size_t lineCap = 0;
-	ssize_t llen;
-	bool sawHeader = false;
-	while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
-		if(llen == 0) continue;
-		if(lineBuf[llen - 1] == '\n') { lineBuf[--llen] = '\0'; }
-		if(llen > 0 && lineBuf[llen - 1] == '\r') { lineBuf[--llen] = '\0'; }
-		// Header passthrough (only at start of file, by convention).
-		if(!sawHeader && (lineBuf[0] == '#' ||
-		   strncmp(lineBuf, "track ",   6) == 0 ||
-		   strncmp(lineBuf, "browser ", 8) == 0)) {
-			fputs_unlocked(lineBuf, stdout);
-			fputc_unlocked('\n', stdout);
-			continue;
-		}
-		sawHeader = true;
-		if(llen == 0) continue;
+	// Per-chunk run-paths accumulator (each thread writes its own runs).
+	std::vector<std::vector<std::string>> chunkRunPaths(N);
+	std::vector<bool> chunkOk(N, true);
+	std::vector<int> indices(N);
+	for(int i = 0; i < N; i++) indices[i] = i;
 
-		const char* chrPtr;
-		int chrLen;
-		int beg = 0, end = 0;
-		char weight[kWeightBufSize]; weight[0] = '0'; weight[1] = '\0';
-		char strandChar = '+';
-		const char* tailPtr = "";
-		int n = parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr);
-		if(n < 3) {
-			std::cerr << "Error in parsing line: " << lineBuf << std::endl;
-			free(lineBuf); fclose(in); return 1;
-		}
-		(void)weight; (void)strandChar;
+	std::for_each(std::execution::par, indices.begin(), indices.end(),
+		[&](int t) {
+			std::vector<ExtEntry> entries;
+			std::unordered_map<std::string, uint16_t> chrIdxMap;
+			std::vector<std::string> chrDict;
+			Arena* tailArena = new Arena(1UL << 20, 1UL << 24);
+			size_t bytesUsed = 0;
+			uint32_t runIdxLocal = 0;
 
-		// Intern chr name (per-run dictionary).
-		std::string chrName(chrPtr, chrLen);
-		uint16_t chrIdx;
-		auto it = chrIdxMap.find(chrName);
-		if(it != chrIdxMap.end()) {
-			chrIdx = it->second;
-		} else {
-			if(chrDict.size() >= 65535) {
-				std::cerr << "Error: more than 65535 distinct chromosomes per run"
-				          << std::endl;
-				return 1;
+			auto flushRunLocal = [&]() {
+				if(entries.empty()) return;
+				size_t n = entries.size();
+
+				// Sort chr-dict alphabetically (or naturally) and remap entries.
+				std::vector<uint32_t> sortedOrder(chrDict.size());
+				for(uint32_t i = 0; i < chrDict.size(); i++) sortedOrder[i] = i;
+				if(naturalSort) {
+					std::sort(sortedOrder.begin(), sortedOrder.end(),
+					          [&](uint32_t a, uint32_t b) {
+					              return naturalChrLess(chrDict[a], chrDict[b]);
+					          });
+				} else {
+					std::sort(sortedOrder.begin(), sortedOrder.end(),
+					          [&](uint32_t a, uint32_t b) {
+					              return chrDict[a] < chrDict[b];
+					          });
+				}
+				std::vector<uint16_t> oldToNew(chrDict.size());
+				std::vector<std::string> sortedDict(chrDict.size());
+				for(uint32_t newIdx = 0; newIdx < sortedOrder.size(); newIdx++) {
+					oldToNew[sortedOrder[newIdx]] = (uint16_t)newIdx;
+					sortedDict[newIdx] = std::move(chrDict[sortedOrder[newIdx]]);
+				}
+				for(ExtEntry& e : entries) e.chrIdx = oldToNew[e.chrIdx];
+
+				std::vector<uint64_t> keys(n);
+				std::vector<uint32_t> order(n);
+				for(size_t i = 0; i < n; i++) {
+					keys[i]  = ((uint64_t)entries[i].chrIdx << 32)
+					         | (uint32_t)entries[i].beg;
+					order[i] = (uint32_t)i;
+				}
+				// Per-thread serial radix — we're already inside a parallel
+				// for_each, so each thread spawning T workers would oversubscribe.
+				radixSort64(keys.data(), order.data(), n, 1);
+
+				char path[512];
+				snprintf(path, sizeof(path), "%s/piosort.run.%d.%u.%d.tmp",
+				         tmpDir.c_str(), t, runIdxLocal, (int)getpid());
+				ExtRunWriter writer(path, codec, sortedDict, 1);
+				for(size_t i = 0; i < n; i++) {
+					const ExtEntry& e = entries[order[i]];
+					writer.writeRecord(e.chrIdx, e.beg, e.end, e.strand,
+					                   e.tailPtr, e.tailLen);
+				}
+				writer.close();
+				chunkRunPaths[t].emplace_back(path);
+				runIdxLocal++;
+
+				entries.clear();
+				entries.shrink_to_fit();
+				delete tailArena;
+				tailArena = new Arena(1UL << 20, 1UL << 24);
+				chrIdxMap.clear();
+				chrDict.clear();
+				bytesUsed = 0;
+			};
+
+			const char* p  = mmapBase + chunkStart[t];
+			const char* pe = mmapBase + chunkStart[t + 1];
+			while(p < pe) {
+				const char* nl = (const char*) memchr(p, '\n', (size_t)(pe - p));
+				const char* lineEnd = nl ? nl : pe;
+				size_t lineLen = (size_t)(lineEnd - p);
+				if(lineLen > 0) {
+					const char* chrPtr; int chrLen;
+					int beg = 0, end = 0;
+					const char* tailPtr = "";
+					if(parseBedLine3(p, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+						chunkOk[t] = false;
+						break;
+					}
+
+					std::string chrName(chrPtr, chrLen);
+					uint16_t chrIdx;
+					auto it = chrIdxMap.find(chrName);
+					if(it != chrIdxMap.end()) chrIdx = it->second;
+					else {
+						if(chrDict.size() >= 65535) {
+							chunkOk[t] = false;
+							break;
+						}
+						chrIdx = (uint16_t)chrDict.size();
+						chrDict.push_back(chrName);
+						chrIdxMap[chrName] = chrIdx;
+					}
+
+					// Tail is everything after chr/beg/end. Locate it within
+					// this line (parseBedLine3 already wrote tailPtr but it
+					// points past whatever \t was; we want bytes up to lineEnd).
+					size_t tailLen = 0;
+					const char* tailCopy = "";
+					if(tailPtr && tailPtr < lineEnd) {
+						tailLen = (size_t)(lineEnd - tailPtr);
+						// strip trailing \r if present
+						if(tailLen > 0 && tailPtr[tailLen - 1] == '\r') tailLen--;
+						if(tailLen > 65535) { chunkOk[t] = false; break; }
+						tailCopy = (tailLen > 0) ? tailArena->alloc(tailPtr, tailLen) : "";
+					}
+
+					ExtEntry e;
+					e.chrIdx  = chrIdx;
+					e.beg     = beg;
+					e.end     = end;
+					e.strand  = '+';
+					e.tailLen = (uint16_t)tailLen;
+					e.tailPtr = tailCopy;
+					entries.push_back(e);
+
+					bytesUsed += sizeof(ExtEntry) + tailLen + 2;
+					if(bytesUsed >= perThreadBudget) flushRunLocal();
+				}
+				p = nl ? nl + 1 : pe;
 			}
-			chrIdx = (uint16_t)chrDict.size();
-			chrDict.push_back(chrName);
-			chrIdxMap[chrName] = chrIdx;
-		}
+			flushRunLocal();
+			delete tailArena;
+		});
 
-		// Append tail to the arena.
-		size_t tailLen = strlen(tailPtr);
-		if(tailLen > 65535) {
-			std::cerr << "Error: BED line tail exceeds 64 KB" << std::endl;
+	for(int t = 0; t < N; t++) {
+		if(!chunkOk[t]) {
+			std::cerr << "Error: parse failure or chr-dict overflow in chunk "
+			          << t << std::endl;
+			if(mmapBase) munmap(mmapBase, fileSize);
 			return 1;
 		}
-		const char* tailCopy = (tailLen > 0) ? tailArena->alloc(tailPtr, tailLen) : "";
-
-		ExtEntry e;
-		e.chrIdx  = chrIdx;
-		e.beg     = beg;
-		e.end     = end;
-		e.strand  = (uint8_t)strandChar;
-		e.tailLen = (uint16_t)tailLen;
-		e.tailPtr = tailCopy;
-		entries.push_back(e);
-
-		bytesUsed += sizeof(ExtEntry) + tailLen + 2;
-		if(bytesUsed >= memBudget) flushRun();
+		runPaths.insert(runPaths.end(),
+		                chunkRunPaths[t].begin(),
+		                chunkRunPaths[t].end());
 	}
-	free(lineBuf);
-	fclose(in);
-	flushRun();
-	delete tailArena;
-	tailArena = NULL;
+	if(mmapBase) munmap(mmapBase, fileSize);
+	mmapBase = NULL;
 
 	if(verbose) {
 		time(&tend);
@@ -2824,88 +2895,187 @@ static int multiPassSort(const std::string& inputFile,
 	time_t tstart, tend;
 	if(verbose) time(&tstart);
 
-	// ----- Pass 1: histogram -----
-	FILE* in = fopen(inputFile.c_str(), "r");
-	if(!in) {
+	// mmap input. --multi-pass requires regular-file input (we re-stream
+	// it K+1 times); pipes / stdin are excluded by the dispatch in main().
+	int fd = open(inputFile.c_str(), O_RDONLY);
+	if(fd < 0) {
 		std::cerr << "Error: cannot open " << inputFile << ": "
 		          << strerror(errno) << std::endl;
 		return 1;
 	}
-
-	std::unordered_map<std::string, uint32_t> chrEncMap;
-	std::vector<std::string> chrNamesEnc;
-	std::unordered_map<uint64_t, PromHistEntry> hist;
-
-	char* lineBuf = NULL;
-	size_t lineCap = 0;
-	ssize_t llen;
-	bool sawHeader = false;
-	uint64_t totalLines = 0;
-	uint64_t totalBytes = 0;
-
-	while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
-		if(llen == 0) continue;
-		size_t sz = (size_t)llen;
-		if(lineBuf[sz-1] == '\n') { lineBuf[--sz] = '\0'; }
-		if(sz > 0 && lineBuf[sz-1] == '\r') { lineBuf[--sz] = '\0'; }
-		if(sz == 0) continue;
-		if(!sawHeader && (lineBuf[0] == '#' ||
-		    strncmp(lineBuf, "track ",   6) == 0 ||
-		    strncmp(lineBuf, "browser ", 8) == 0)) {
-			fputs_unlocked(lineBuf, stdout);
-			fputc_unlocked('\n', stdout);
-			continue;
-		}
-		sawHeader = true;
-
-		const char* chrPtr;
-		int chrLen;
-		int beg = 0, end = 0;
-		const char* tailPtr = "";
-		if(parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
-			std::cerr << "Error in parsing line: " << lineBuf << std::endl;
-			free(lineBuf); fclose(in); return 1;
-		}
-		std::string chrName(chrPtr, chrLen);
-		uint32_t encIdx;
-		auto it = chrEncMap.find(chrName);
-		if(it != chrEncMap.end()) {
-			encIdx = it->second;
-		} else {
-			encIdx = (uint32_t)chrNamesEnc.size();
-			chrNamesEnc.push_back(chrName);
-			chrEncMap[chrName] = encIdx;
-		}
-		uint64_t bid = ((uint64_t)encIdx << 32) | (uint32_t)(beg >> kPromBucketShift);
-		PromHistEntry& e = hist[bid];
-		e.bytes   += (uint64_t)sz + 1;  // include line terminator
-		e.records += 1;
-		totalLines += 1;
-		totalBytes += (uint64_t)sz + 1;
+	struct stat st;
+	if(fstat(fd, &st) != 0) {
+		std::cerr << "Error: stat failed for " << inputFile << std::endl;
+		close(fd); return 1;
 	}
-	free(lineBuf);
-	fclose(in);
+	if(!S_ISREG(st.st_mode)) {
+		std::cerr << "Error: --multi-pass requires a regular file" << std::endl;
+		close(fd); return 1;
+	}
+	size_t fileSize = (size_t)st.st_size;
+	if(fileSize == 0) { close(fd); return 0; }
+	char* mmapBase = (char*) mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+	if(mmapBase == MAP_FAILED) {
+		std::cerr << "Error: mmap failed for " << inputFile << ": "
+		          << strerror(errno) << std::endl;
+		close(fd); return 1;
+	}
+	close(fd);
+	madvise(mmapBase, fileSize, MADV_SEQUENTIAL);
 
-	// Sort chr names alphabetically (or naturally) to match the global emit order.
-	std::vector<uint32_t> sortOrder(chrNamesEnc.size());
+	// Skip + emit leading header lines serially (BED convention is leading).
+	size_t bodyStart = 0;
+	while(bodyStart < fileSize) {
+		const char* lineStart = mmapBase + bodyStart;
+		const char* nl = (const char*) memchr(lineStart, '\n', fileSize - bodyStart);
+		size_t lineLen = (size_t)((nl ? nl : mmapBase + fileSize) - lineStart);
+		bool isHeader = (lineLen > 0 && lineStart[0] == '#') ||
+		                (lineLen >= 6 && memcmp(lineStart, "track ",   6) == 0) ||
+		                (lineLen >= 8 && memcmp(lineStart, "browser ", 8) == 0);
+		if(!isHeader) break;
+		fwrite_unlocked(lineStart, 1, lineLen, stdout);
+		fputc_unlocked('\n', stdout);
+		bodyStart = (nl ? (size_t)(nl - mmapBase) + 1 : fileSize);
+	}
+	size_t bodySize = fileSize - bodyStart;
+	if(bodySize == 0) { munmap(mmapBase, fileSize); return 0; }
+
+	// Newline-aligned chunk boundaries within [bodyStart, fileSize).
+	int N = numThreads;
+	if(N < 1) N = 1;
+	{
+		size_t bytesPerChunk = 256 * 1024;
+		int byBytes = (int)((bodySize + bytesPerChunk - 1) / bytesPerChunk);
+		if(byBytes < 1) byBytes = 1;
+		if(N > byBytes) N = byBytes;
+	}
+	std::vector<size_t> chunkStart(N + 1);
+	chunkStart[0] = bodyStart;
+	chunkStart[N] = fileSize;
+	for(int i = 1; i < N; i++) {
+		size_t guess = bodyStart + (bodySize / (size_t)N) * (size_t)i;
+		while(guess < fileSize && mmapBase[guess] != '\n') guess++;
+		if(guess < fileSize) guess++;
+		chunkStart[i] = guess;
+	}
+	std::vector<int> indices(N);
+	for(int i = 0; i < N; i++) indices[i] = i;
+
+	// ----- Pass 1: parallel histogram + chr-name dictionary per chunk -----
+	struct ChunkPass1 {
+		std::unordered_map<std::string, uint32_t> chrMap;
+		std::vector<std::string> chrNames;
+		std::unordered_map<uint64_t, PromHistEntry> hist;
+		uint64_t lines = 0;
+		uint64_t bytes = 0;
+		bool ok = true;
+	};
+	std::vector<ChunkPass1> chunkP1(N);
+
+	std::for_each(std::execution::par, indices.begin(), indices.end(),
+		[&](int t) {
+			ChunkPass1& cp = chunkP1[t];
+			const char* p  = mmapBase + chunkStart[t];
+			const char* pe = mmapBase + chunkStart[t + 1];
+			while(p < pe) {
+				const char* nl = (const char*) memchr(p, '\n', (size_t)(pe - p));
+				const char* lineEnd = nl ? nl : pe;
+				size_t lineLen = (size_t)(lineEnd - p);
+				if(lineLen > 0) {
+					const char* chrPtr; int chrLen;
+					int beg = 0, end = 0;
+					const char* tailPtr = "";
+					if(parseBedLine3(p, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+						cp.ok = false;
+						break;
+					}
+					std::string chrName(chrPtr, chrLen);
+					uint32_t encIdx;
+					auto it = cp.chrMap.find(chrName);
+					if(it != cp.chrMap.end()) encIdx = it->second;
+					else {
+						encIdx = (uint32_t)cp.chrNames.size();
+						cp.chrNames.push_back(chrName);
+						cp.chrMap[chrName] = encIdx;
+					}
+					uint64_t bid = ((uint64_t)encIdx << 32)
+					             | (uint32_t)(beg >> kPromBucketShift);
+					PromHistEntry& he = cp.hist[bid];
+					he.bytes   += (uint64_t)lineLen + 1;
+					he.records += 1;
+					cp.lines   += 1;
+					cp.bytes   += (uint64_t)lineLen + 1;
+				}
+				p = nl ? nl + 1 : pe;
+			}
+		});
+
+	for(int t = 0; t < N; t++)
+		if(!chunkP1[t].ok) {
+			std::cerr << "Error: parse failure in chunk " << t << std::endl;
+			munmap(mmapBase, fileSize); return 1;
+		}
+
+	// Merge per-chunk dictionaries + histograms into global ones.
+	std::unordered_map<std::string, uint32_t> globalChrMap;
+	std::vector<std::string> globalChrNames;
+	std::unordered_map<uint64_t, PromHistEntry> globalHist;
+	std::vector<std::vector<uint32_t>> chunkLocalToGlobal(N);
+	uint64_t totalLines = 0, totalBytes = 0;
+	for(int t = 0; t < N; t++) {
+		ChunkPass1& cp = chunkP1[t];
+		chunkLocalToGlobal[t].resize(cp.chrNames.size());
+		for(uint32_t li = 0; li < cp.chrNames.size(); li++) {
+			const std::string& nm = cp.chrNames[li];
+			auto it = globalChrMap.find(nm);
+			uint32_t gi;
+			if(it != globalChrMap.end()) gi = it->second;
+			else {
+				gi = (uint32_t)globalChrNames.size();
+				globalChrNames.push_back(nm);
+				globalChrMap[nm] = gi;
+			}
+			chunkLocalToGlobal[t][li] = gi;
+		}
+		for(auto& kv : cp.hist) {
+			uint32_t li = (uint32_t)(kv.first >> 32);
+			uint64_t bid = ((uint64_t)chunkLocalToGlobal[t][li] << 32)
+			             | (uint32_t)kv.first;
+			PromHistEntry& g = globalHist[bid];
+			g.bytes   += kv.second.bytes;
+			g.records += kv.second.records;
+		}
+		totalLines += cp.lines;
+		totalBytes += cp.bytes;
+	}
+
+	// Sort chr names (alphabetically or naturally), build encGlobal->sortedIdx.
+	std::vector<uint32_t> sortOrder(globalChrNames.size());
 	for(uint32_t i = 0; i < sortOrder.size(); i++) sortOrder[i] = i;
 	if(naturalSort) std::sort(sortOrder.begin(), sortOrder.end(),
-	    [&](uint32_t a, uint32_t b) { return naturalChrLess(chrNamesEnc[a], chrNamesEnc[b]); });
+	    [&](uint32_t a, uint32_t b) { return naturalChrLess(globalChrNames[a], globalChrNames[b]); });
 	else std::sort(sortOrder.begin(), sortOrder.end(),
-	    [&](uint32_t a, uint32_t b) { return chrNamesEnc[a] < chrNamesEnc[b]; });
-
-	std::vector<uint32_t> encToSorted(chrNamesEnc.size());
+	    [&](uint32_t a, uint32_t b) { return globalChrNames[a] < globalChrNames[b]; });
+	std::vector<uint32_t> globalToSorted(globalChrNames.size());
 	for(uint32_t i = 0; i < sortOrder.size(); i++)
-		encToSorted[sortOrder[i]] = i;
+		globalToSorted[sortOrder[i]] = i;
 
-	// Remap histogram keys (encChr -> sortedChr) and sort buckets in
+	// Per-chunk localIdx -> sortedIdx fast-lookup, used in pass 2..K+1.
+	std::vector<std::vector<uint32_t>> chunkLocalToSorted(N);
+	for(int t = 0; t < N; t++) {
+		chunkLocalToSorted[t].resize(chunkLocalToGlobal[t].size());
+		for(size_t li = 0; li < chunkLocalToGlobal[t].size(); li++)
+			chunkLocalToSorted[t][li] = globalToSorted[chunkLocalToGlobal[t][li]];
+	}
+
+	// Remap histogram keys (encGlobal -> sortedIdx) and sort buckets in
 	// global sort order.
 	struct Bucket { uint64_t bid; uint64_t bytes; uint64_t records; };
 	std::vector<Bucket> buckets;
-	buckets.reserve(hist.size());
-	for(auto& kv : hist) {
+	buckets.reserve(globalHist.size());
+	for(auto& kv : globalHist) {
 		uint32_t encIdx = (uint32_t)(kv.first >> 32);
-		uint64_t newBid = ((uint64_t)encToSorted[encIdx] << 32) | (uint32_t)kv.first;
+		uint64_t newBid = ((uint64_t)globalToSorted[encIdx] << 32) | (uint32_t)kv.first;
 		buckets.push_back({newBid, kv.second.bytes, kv.second.records});
 	}
 	std::sort(buckets.begin(), buckets.end(),
@@ -2915,9 +3085,6 @@ static int multiPassSort(const std::string& inputFile,
 	struct Group { uint64_t startBid; uint64_t endBid; uint64_t bytes; uint64_t records; };
 	std::vector<Group> groups;
 	if(!buckets.empty()) {
-		// Per-record overhead estimate for ExtEntry + arena fragmentation:
-		// ~20 bytes / record beyond the line itself. Account for this so
-		// the group's true peak RAM stays within budget.
 		const uint64_t perRecOverhead = 20;
 		uint64_t curStart = buckets[0].bid;
 		uint64_t curBytes = 0;
@@ -2932,6 +3099,7 @@ static int multiPassSort(const std::string& inputFile,
 				          << bytesWithOverhead << "), exceeding --max-mem "
 				          << budget << ". Raise --max-mem or use --external-merge."
 				          << std::endl;
+				munmap(mmapBase, fileSize);
 				return 1;
 			}
 			if(curBytes + bytesWithOverhead > budget) {
@@ -2943,7 +3111,6 @@ static int multiPassSort(const std::string& inputFile,
 			curBytes += bytesWithOverhead;
 			curRecords += buckets[i].records;
 		}
-		// Close last group (use last bucket's bid + 1 as exclusive end).
 		uint64_t endBid = buckets.back().bid + 1;
 		groups.push_back({curStart, endBid, curBytes, curRecords});
 	}
@@ -2956,80 +3123,79 @@ static int multiPassSort(const std::string& inputFile,
 		          << "total_bytes=" << totalBytes
 		          << " ("
 		          << ((double)totalBytes / (1024.0 * 1024.0 * 1024.0))
-		          << " GiB), "
+		          << " GiB), threads=" << N << ", "
 		          << (long)(tend - tstart) << " s" << std::endl;
 		time(&tstart);
 	}
 
-	// ----- Passes 2..K+1: re-stream input per group, sort, emit -----
-	std::vector<ExtEntry> entries;
-	Arena* arena = new Arena(1UL << 20, 1UL << 24);
-
+	// ----- Passes 2..K+1: per group, parallel filter + central sort + emit -----
 	for(size_t gi = 0; gi < groups.size(); gi++) {
 		Group& g = groups[gi];
-		entries.clear();
-		entries.reserve(g.records);
-		delete arena;
-		arena = new Arena(1UL << 20, 1UL << 24);
 
-		in = fopen(inputFile.c_str(), "r");
-		if(!in) {
-			std::cerr << "Error: cannot reopen " << inputFile << std::endl;
-			delete arena; return 1;
+		// Per-thread arena + entries vector — built in parallel, no shared
+		// state across threads except read-only mmap and chunkLocalToSorted.
+		std::vector<std::vector<ExtEntry>> chunkEntries(N);
+		std::vector<Arena*> chunkArena(N, NULL);
+
+		std::for_each(std::execution::par, indices.begin(), indices.end(),
+			[&](int t) {
+				const std::vector<uint32_t>& l2s = chunkLocalToSorted[t];
+				const std::unordered_map<std::string, uint32_t>& cmap = chunkP1[t].chrMap;
+				Arena* arena = new Arena(1UL << 20, 1UL << 24);
+				std::vector<ExtEntry>& entries = chunkEntries[t];
+				const char* p  = mmapBase + chunkStart[t];
+				const char* pe = mmapBase + chunkStart[t + 1];
+				while(p < pe) {
+					const char* nl = (const char*) memchr(p, '\n', (size_t)(pe - p));
+					const char* lineEnd = nl ? nl : pe;
+					size_t lineLen = (size_t)(lineEnd - p);
+					if(lineLen > 0) {
+						const char* chrPtr; int chrLen;
+						int beg = 0, end = 0;
+						const char* tailPtr = "";
+						if(parseBedLine3(p, &chrPtr, &chrLen, &beg, &end, &tailPtr) >= 3) {
+							std::string chrName(chrPtr, chrLen);
+							auto it = cmap.find(chrName);
+							if(it != cmap.end()) {
+								uint32_t sortedIdx = l2s[it->second];
+								uint64_t bid = ((uint64_t)sortedIdx << 32)
+								             | (uint32_t)(beg >> kPromBucketShift);
+								if(bid >= g.startBid && bid < g.endBid) {
+									// strip trailing \r if present
+									size_t copyLen = lineLen;
+									if(copyLen > 0 && p[copyLen - 1] == '\r') copyLen--;
+									const char* lineCopy = arena->alloc(p, copyLen);
+									ExtEntry e;
+									e.chrIdx  = (uint16_t)sortedIdx;
+									e.beg     = beg;
+									e.end     = end;
+									e.strand  = '+';
+									e.tailLen = (uint16_t)copyLen;
+									e.tailPtr = lineCopy;
+									entries.push_back(e);
+								}
+							}
+						}
+					}
+					p = nl ? nl + 1 : pe;
+				}
+				chunkArena[t] = arena;
+			});
+
+		// Concatenate per-chunk entries into one global vector.
+		size_t total = 0;
+		for(int t = 0; t < N; t++) total += chunkEntries[t].size();
+		std::vector<ExtEntry> entries;
+		entries.reserve(total);
+		for(int t = 0; t < N; t++) {
+			entries.insert(entries.end(),
+			               chunkEntries[t].begin(),
+			               chunkEntries[t].end());
+			chunkEntries[t].clear();
+			chunkEntries[t].shrink_to_fit();
 		}
 
-		lineBuf = NULL; lineCap = 0;
-		bool seenBody = false;
-		while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
-			if(llen == 0) continue;
-			size_t sz = (size_t)llen;
-			if(lineBuf[sz-1] == '\n') { lineBuf[--sz] = '\0'; }
-			if(sz > 0 && lineBuf[sz-1] == '\r') { lineBuf[--sz] = '\0'; }
-			if(sz == 0) continue;
-			if(!seenBody && (lineBuf[0] == '#' ||
-			    strncmp(lineBuf, "track ",   6) == 0 ||
-			    strncmp(lineBuf, "browser ", 8) == 0)) {
-				continue;  // already emitted in pass 1
-			}
-			seenBody = true;
-
-			const char* chrPtr;
-			int chrLen;
-			int beg = 0, end = 0;
-			const char* tailPtr = "";
-			if(parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
-				std::cerr << "Error in parsing line: " << lineBuf << std::endl;
-				free(lineBuf); fclose(in); delete arena; return 1;
-			}
-			std::string chrName(chrPtr, chrLen);
-			auto it = chrEncMap.find(chrName);
-			if(it == chrEncMap.end()) {
-				std::cerr << "Error: chromosome '" << chrName
-				          << "' appeared in pass " << (gi + 2)
-				          << " but not in pass 1 (input changed during sort?)"
-				          << std::endl;
-				free(lineBuf); fclose(in); delete arena; return 1;
-			}
-			uint32_t sortedIdx = encToSorted[it->second];
-			uint64_t bid = ((uint64_t)sortedIdx << 32)
-			             | (uint32_t)(beg >> kPromBucketShift);
-			if(bid < g.startBid || bid >= g.endBid) continue;
-
-			// Match: copy full line text into arena.
-			const char* lineCopy = arena->alloc(lineBuf, sz);
-			ExtEntry e;
-			e.chrIdx  = (uint16_t)sortedIdx;
-			e.beg     = beg;
-			e.end     = end;
-			e.strand  = '+';
-			e.tailLen = (uint16_t)sz;     // re-use tailLen as "full line length"
-			e.tailPtr = lineCopy;          // tailPtr points at the entire line
-			entries.push_back(e);
-		}
-		free(lineBuf);
-		fclose(in);
-
-		// Sort group entries by (chrIdx, beg) and emit.
+		// Sort by (sortedChrIdx<<32 | beg).
 		size_t n = entries.size();
 		std::vector<uint64_t> keys(n);
 		std::vector<uint32_t> order(n);
@@ -3044,6 +3210,9 @@ static int multiPassSort(const std::string& inputFile,
 			fputc_unlocked('\n', stdout);
 		}
 
+		// Free per-chunk arenas now that emit is done.
+		for(int t = 0; t < N; t++) { delete chunkArena[t]; chunkArena[t] = NULL; }
+
 		if(verbose) {
 			time(&tend);
 			std::cerr << "Pass " << (gi + 2) << "/" << (groups.size() + 1)
@@ -3054,7 +3223,7 @@ static int multiPassSort(const std::string& inputFile,
 		}
 	}
 
-	delete arena;
+	munmap(mmapBase, fileSize);
 	return 0;
 }
 

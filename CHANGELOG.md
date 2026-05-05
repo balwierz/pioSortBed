@@ -4,6 +4,50 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.5.0] — 2026-05-06
+
+### Changed
+- Both `--external-merge` and `--multi-pass` now do **parallel
+  mmap-chunked parsing** — `-t N` actually saturates cores. Previously
+  the radix sort was the only parallel part, dwarfed by serial
+  `getline + parseBedLine3` which dominated wall time.
+
+  At 200 M records / 4 GiB cap on the bench laptop:
+
+      path / threads     wall_s    speedup_vs_t1   speedup_vs_v3.4.0
+      --external-merge  -t 1   111      1.0x          1.07x
+      --external-merge  -t 4    53      2.1x          2.21x
+      --external-merge  -t 8    49      2.3x          2.39x
+      --multi-pass      -t 1   127      1.0x          0.88x  (regression)
+      --multi-pass      -t 4    58      2.2x          1.93x
+      --multi-pass      -t 8    51      2.5x          2.20x
+
+  At -t 1, multipass regresses 14 % vs v3.4.0 because each line now
+  pays the per-chunk-bookkeeping cost (only one chunk at -t 1, but
+  the dispatch cost remains). Net positive at any -t > 1, which is
+  the default.
+
+  Implementation: each thread parses a newline-aligned slice of the
+  mmap'd input. `--external-merge` threads each build their own runs
+  independently (so we end up with N×K runs instead of K — the merge
+  phase already handles arbitrary chr-dicts per run). `--multi-pass`
+  threads each build a per-chunk histogram + chr dictionary in pass 1,
+  merged after the parallel block; pass-2..K+1 filter+sort+emit
+  similarly fans out across threads with a per-thread arena and
+  entries vector, concatenated before the central radix sort.
+
+  Pre-requisite: the input must be a regular file (mmap-able). Pipes
+  / stdin / gzip would still need the serial getline path; both
+  external-merge and multi-pass already restrict to file input only.
+
+### Note on peak RSS
+- mmap'd input now contributes to the RSS reported by `getrusage`
+  (~14 GiB for the 8 GiB bench fixture, vs ~6 GiB previously when we
+  used `fopen + getline`). The pages are file-backed and evictable
+  under memory pressure; the increase is mostly an accounting
+  artefact, not new memory pressure. On a 16 GiB host with a 16 GiB
+  cap, this can show up as RSS climbing to system RAM minus headroom.
+
 ## [3.4.0] — 2026-05-05
 
 ### Added
