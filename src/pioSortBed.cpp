@@ -32,6 +32,17 @@
 #ifdef WITH_RANS
 #include <htscodecs/rANS_static4x16.h>
 #endif
+#ifdef WITH_LOCISS
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/properties.h>
+#include <parquet/types.h>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#endif
 #include <lz4.h>
 #include <zstd.h>
 
@@ -3227,6 +3238,318 @@ static int multiPassSort(const std::string& inputFile,
 	return 0;
 }
 
+#ifdef WITH_LOCISS
+// ============================================================================
+// LOCISSD OUTPUT (--lociss-output, opt-in at build time via WITH_LOCISS)
+// ----------------------------------------------------------------------------
+// Streaming Parquet writer for the LociSSD v2 format spec
+// (FORMAT_SPEC.md): single-file Parquet with schema (Chromosome string,
+// Start int64, End int64, MaxEndSoFar int64), sorted by (chr, start, end),
+// MaxEndSoFar = per-chromosome cumulative max of End, manifest JSON in the
+// Parquet file-level KV metadata under key "lociSSD_manifest".
+//
+// Records arrive in sorted order from any sort path; we just buffer them
+// into Arrow column builders, flush every kRowGroupSize rows as a Table,
+// and at finish() emit the manifest + atomic-rename. MaxEndSoFar is tracked
+// inline as a running max within each chromosome run (resets at chrom
+// boundary).
+//
+// Round-1 schema is the minimum required by the spec — no Score/Strand
+// columns; BED tails are dropped. Future commits will add tail
+// passthrough (Name/Score/Strand for BED6).
+// ============================================================================
+
+class LocissSink {
+public:
+	LocissSink(const std::string& path)
+		: finalPath_(path),
+		  tmpPath_(path + ".tmp"),
+		  totalRows_(0),
+		  rowsInBatch_(0),
+		  haveCurChrom_(false),
+		  curRunMaxEnd_(INT64_MIN)
+	{}
+
+	~LocissSink() {
+		// Best-effort cleanup if finish() was not called (writer abandoned).
+		if(writer_ || outStream_) {
+			(void)closeWriter();
+			::unlink(tmpPath_.c_str());
+		}
+	}
+
+	// Open the writer and prepare the Arrow schema. Must be called before
+	// any writeRecord(). Returns 0 on success, nonzero error code on failure.
+	int open() {
+		auto chromField = arrow::field("Chromosome",  arrow::utf8(),  /*nullable=*/false);
+		auto startField = arrow::field("Start",       arrow::int64(), /*nullable=*/false);
+		auto endField   = arrow::field("End",         arrow::int64(), /*nullable=*/false);
+		auto maxField   = arrow::field("MaxEndSoFar", arrow::int64(), /*nullable=*/false);
+		schema_ = arrow::schema({chromField, startField, endField, maxField});
+
+		auto fileResult = arrow::io::FileOutputStream::Open(tmpPath_);
+		if(!fileResult.ok()) {
+			std::cerr << "Error: cannot open " << tmpPath_ << " for writing: "
+			          << fileResult.status().ToString() << std::endl;
+			return 1;
+		}
+		outStream_ = *fileResult;
+
+		auto props = parquet::WriterProperties::Builder()
+			.version(parquet::ParquetVersion::PARQUET_2_6)
+			->data_page_version(parquet::ParquetDataPageVersion::V2)
+			->compression(parquet::Compression::ZSTD)
+			->compression_level(3)
+			->enable_statistics()
+			->enable_write_page_index()
+			->enable_dictionary("Chromosome")
+			->max_row_group_length(kRowGroupSize)
+			->build();
+		auto arrowProps = parquet::ArrowWriterProperties::Builder()
+			.store_schema()
+			->build();
+
+		auto wResult = parquet::arrow::FileWriter::Open(
+			*schema_, arrow::default_memory_pool(),
+			outStream_, props, arrowProps);
+		if(!wResult.ok()) {
+			std::cerr << "Error: parquet::arrow::FileWriter::Open failed: "
+			          << wResult.status().ToString() << std::endl;
+			return 1;
+		}
+		writer_ = std::move(*wResult);
+		return 0;
+	}
+
+	// Append one record. Records MUST arrive in (chrom, beg, end) sort order.
+	// Returns 0 on success, nonzero on error.
+	int writeRecord(const char* chrom, int chrLen, int32_t beg, int32_t end) {
+		// Detect chromosome run boundary.
+		std::string chrName(chrom, chrLen);
+		if(!haveCurChrom_ || chrName != curChromName_) {
+			finalizeChrom();
+			curChromName_   = chrName;
+			haveCurChrom_   = true;
+			curRunRowsBegin_= totalRows_;
+			curRunMinStart_ = beg;
+			curRunMaxStart_ = beg;
+			curRunMaxEnd_   = (int64_t)end;
+		} else {
+			if(beg < curRunMinStart_) curRunMinStart_ = beg;
+			if(beg > curRunMaxStart_) curRunMaxStart_ = beg;
+			if((int64_t)end > curRunMaxEnd_) curRunMaxEnd_ = (int64_t)end;
+		}
+
+		auto s1 = chromBuilder_.Append(chrom, chrLen);
+		auto s2 = startBuilder_.Append((int64_t)beg);
+		auto s3 = endBuilder_.Append((int64_t)end);
+		auto s4 = maxEndBuilder_.Append(curRunMaxEnd_);
+		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok()) {
+			std::cerr << "Error: arrow builder append failed" << std::endl;
+			return 1;
+		}
+		totalRows_++;
+		rowsInBatch_++;
+		if(rowsInBatch_ >= kRowGroupSize) return flushBatch();
+		return 0;
+	}
+
+	// Flush remaining records, write manifest, close, atomic-rename to final path.
+	int finish(const std::string& writerVersion) {
+		if(rowsInBatch_ > 0) {
+			int rc = flushBatch();
+			if(rc) return rc;
+		}
+		finalizeChrom();
+
+		// Build manifest JSON and attach as Parquet KV metadata before close.
+		std::string manifest = buildManifestJson(writerVersion);
+		auto kvm = std::make_shared<arrow::KeyValueMetadata>();
+		kvm->Append("lociSSD_manifest", manifest);
+		auto addStatus = writer_->AddKeyValueMetadata(kvm);
+		if(!addStatus.ok()) {
+			std::cerr << "Error: AddKeyValueMetadata failed: "
+			          << addStatus.ToString() << std::endl;
+			return 1;
+		}
+
+		int rc = closeWriter();
+		if(rc) return rc;
+
+		// fsync + atomic rename.
+		int fd = ::open(tmpPath_.c_str(), O_RDONLY);
+		if(fd >= 0) { fsync(fd); close(fd); }
+		if(::rename(tmpPath_.c_str(), finalPath_.c_str()) != 0) {
+			std::cerr << "Error: rename(" << tmpPath_ << " -> "
+			          << finalPath_ << ") failed: "
+			          << strerror(errno) << std::endl;
+			return 1;
+		}
+		return 0;
+	}
+
+private:
+	static constexpr int64_t kRowGroupSize = 65536;
+
+	struct ChromStat {
+		std::string name;
+		int64_t  rows;
+		int64_t  rowOffset;
+		int64_t  minStart;
+		int64_t  maxStart;
+		int64_t  maxEnd;
+	};
+
+	int flushBatch() {
+		std::shared_ptr<arrow::Array> chromArr, startArr, endArr, maxArr;
+		auto sa = chromBuilder_.Finish(&chromArr);
+		auto sb = startBuilder_.Finish(&startArr);
+		auto sc = endBuilder_.Finish(&endArr);
+		auto sd = maxEndBuilder_.Finish(&maxArr);
+		if(!sa.ok() || !sb.ok() || !sc.ok() || !sd.ok()) {
+			std::cerr << "Error: arrow builder Finish failed" << std::endl;
+			return 1;
+		}
+		auto table = arrow::Table::Make(schema_,
+			{chromArr, startArr, endArr, maxArr}, rowsInBatch_);
+		auto wStatus = writer_->WriteTable(*table, rowsInBatch_);
+		if(!wStatus.ok()) {
+			std::cerr << "Error: parquet WriteTable failed: "
+			          << wStatus.ToString() << std::endl;
+			return 1;
+		}
+		rowsInBatch_ = 0;
+		return 0;
+	}
+
+	int closeWriter() {
+		if(writer_) {
+			auto s = writer_->Close();
+			writer_.reset();
+			if(!s.ok()) {
+				std::cerr << "Error: parquet writer close failed: "
+				          << s.ToString() << std::endl;
+				return 1;
+			}
+		}
+		if(outStream_) {
+			auto s = outStream_->Close();
+			outStream_.reset();
+			if(!s.ok()) {
+				std::cerr << "Error: file stream close failed: "
+				          << s.ToString() << std::endl;
+				return 1;
+			}
+		}
+		return 0;
+	}
+
+	void finalizeChrom() {
+		if(!haveCurChrom_) return;
+		ChromStat cs;
+		cs.name      = curChromName_;
+		cs.rowOffset = (int64_t)curRunRowsBegin_;
+		cs.rows      = (int64_t)(totalRows_ - curRunRowsBegin_);
+		cs.minStart  = (int64_t)curRunMinStart_;
+		cs.maxStart  = (int64_t)curRunMaxStart_;
+		cs.maxEnd    = curRunMaxEnd_;
+		chromStats_.push_back(std::move(cs));
+		haveCurChrom_ = false;
+	}
+
+	static void jsonEscape(std::ostream& os, const std::string& s) {
+		os << '"';
+		for(char c : s) {
+			switch(c) {
+				case '"':  os << "\\\""; break;
+				case '\\': os << "\\\\"; break;
+				case '\b': os << "\\b";  break;
+				case '\f': os << "\\f";  break;
+				case '\n': os << "\\n";  break;
+				case '\r': os << "\\r";  break;
+				case '\t': os << "\\t";  break;
+				default:
+					if((unsigned char)c < 0x20) {
+						char buf[8];
+						snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)(unsigned char)c);
+						os << buf;
+					} else {
+						os << c;
+					}
+			}
+		}
+		os << '"';
+	}
+
+	std::string buildManifestJson(const std::string& writerVersion) const {
+		std::ostringstream o;
+		// ISO 8601 UTC timestamp
+		std::time_t now = std::time(nullptr);
+		std::tm tm{};
+		gmtime_r(&now, &tm);
+		char ts[32];
+		strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S+00:00", &tm);
+
+		o << "{";
+		o << "\"format_version\":2,";
+		o << "\"writer_version\":"; jsonEscape(o, writerVersion); o << ",";
+		o << "\"created_utc\":"; jsonEscape(o, ts); o << ",";
+		o << "\"row_count\":" << totalRows_ << ",";
+		o << "\"chromosomes\":[";
+		for(size_t i = 0; i < chromStats_.size(); i++) {
+			const ChromStat& c = chromStats_[i];
+			if(i) o << ",";
+			o << "{\"name\":"; jsonEscape(o, c.name);
+			o << ",\"rows\":"       << c.rows;
+			o << ",\"row_offset\":" << c.rowOffset;
+			o << ",\"min_start\":"  << c.minStart;
+			o << ",\"max_start\":"  << c.maxStart;
+			o << ",\"max_end\":"    << c.maxEnd << "}";
+		}
+		o << "],";
+		o << "\"schema_columns\":[";
+		o << "{\"name\":\"Chromosome\",\"arrow_type\":\"string\","
+		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		o << "{\"name\":\"Start\",\"arrow_type\":\"int64\","
+		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		o << "{\"name\":\"End\",\"arrow_type\":\"int64\","
+		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		o << "{\"name\":\"MaxEndSoFar\",\"arrow_type\":\"int64\","
+		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":true}";
+		o << "],";
+		o << "\"sort_keys\":[\"Chromosome\",\"Start\",\"End\"],";
+		o << "\"row_group_size\":" << kRowGroupSize << ",";
+		o << "\"data_page_version\":\"2.0\",";
+		o << "\"default_compression\":[\"zstd\",3]";
+		o << "}";
+		return o.str();
+	}
+
+	std::string finalPath_;
+	std::string tmpPath_;
+	std::shared_ptr<arrow::io::FileOutputStream> outStream_;
+	std::unique_ptr<parquet::arrow::FileWriter> writer_;
+	std::shared_ptr<arrow::Schema> schema_;
+
+	arrow::StringBuilder chromBuilder_;
+	arrow::Int64Builder  startBuilder_;
+	arrow::Int64Builder  endBuilder_;
+	arrow::Int64Builder  maxEndBuilder_;
+
+	std::vector<ChromStat> chromStats_;
+
+	uint64_t totalRows_;
+	int64_t  rowsInBatch_;
+
+	bool        haveCurChrom_;
+	std::string curChromName_;
+	uint64_t    curRunRowsBegin_;
+	int64_t     curRunMinStart_;
+	int64_t     curRunMaxStart_;
+	int64_t     curRunMaxEnd_;
+};
+#endif // WITH_LOCISS
+
 // ============================================================================
 // CLI / MAIN
 // ----------------------------------------------------------------------------
@@ -3283,6 +3606,7 @@ int main(int argc, char *argv[])
 	int lowMemSSD = 0;
 	int extMerge = 0;
 	int multiPass = 0;
+	std::string locissOutput;
 	// zstd default: fastest compressed codec across all builds, best
 	// compression ratio (~0.33x of text input on a synthetic BED6, ~0.45x
 	// of binary-uncompressed temps), and at 200 M records / 256 M budget
@@ -3348,6 +3672,15 @@ int main(int argc, char *argv[])
 	app.add_flag("-v,--verbose", verbose,
 		"print parsing / sorting timing and per-chromosome length info to stderr "
 		"(default: silent)");
+#ifdef WITH_LOCISS
+	app.add_option("--lociss-output", locissOutput,
+		"write a LociSSD v2 Parquet file to FILE instead of BED text on "
+		"stdout. Schema: Chromosome (string), Start (int64), End (int64), "
+		"MaxEndSoFar (int64); zstd-3 compression; manifest JSON in the "
+		"Parquet file-level KV metadata. Atomic write (tmp + rename). "
+		"Currently supported only on the classic sort path (default; not "
+		"--low-mem-ssd / --multi-pass / --external-merge).");
+#endif
 
 	CLI11_PARSE(app, argc, argv);
 	const size_t maxMemBytes = parseMemSize(maxMemStr);
@@ -3369,6 +3702,26 @@ int main(int argc, char *argv[])
 	// BED-specific machinery below (stdout freopen, mmap, lowMemSortMmap,
 	// bucket sort, etc.) applies — the BAM path opens outputFile directly via
 	// sam_open instead of going through stdout.
+#ifdef WITH_LOCISS
+	// --lociss-output is currently supported only on the classic sort path
+	// (which lands at the useMmap=true emit branch). Reject combinations
+	// that would silently ignore the flag.
+	if(!locissOutput.empty()) {
+		if(lowMemSSD || extMerge || multiPass || fCollapse || sortMode != 's') {
+			cerr << "Error: --lociss-output is currently supported only on "
+			        "the default classic sort path. Drop --low-mem-ssd / "
+			        "--multi-pass / --external-merge / --collapse / "
+			        "--sort=b|5 to use it." << endl;
+			return 1;
+		}
+		if(!outputFile.empty()) {
+			cerr << "Error: --lociss-output and -o/--output are mutually "
+			        "exclusive (LociSSD writes its own file directly)." << endl;
+			return 1;
+		}
+	}
+#endif
+
 #ifdef WITH_BAM
 	if(inputFile.size() > 4 &&
 	   (inputFile.compare(inputFile.size() - 4, 4, ".bam") == 0 ||
@@ -3747,6 +4100,23 @@ int main(int argc, char *argv[])
 			printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
 		}
 	}
+#ifdef WITH_LOCISS
+	else if(!locissOutput.empty())
+	{
+		LocissSink sink(locissOutput);
+		if(sink.open() != 0) { free(order); return 1; }
+		for(size_t i = 0; i < totalReads; i++) {
+			uint32_t ri = order[i];
+			const std::string& chr = chroms[reads[ri].chrIdx];
+			if(sink.writeRecord(chr.c_str(), (int)chr.size(),
+			                    reads[ri].beg, reads[ri].end) != 0) {
+				free(order); return 1;
+			}
+		}
+		std::string wv = std::string("pioSortBed ") + VERSION_STRING;
+		if(sink.finish(wv) != 0) { free(order); return 1; }
+	}
+#endif
 	else if(useMmap)
 	{
 		for(size_t i = 0; i < totalReads; i++)

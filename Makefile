@@ -32,6 +32,18 @@ ifneq ($(WITH_BAM),)
   LDFLAGS += $(HTSLIB)/libhts.a -lz -lpthread -ldeflate
 endif
 
+# Optional LociSSD output (Parquet writer per FORMAT_SPEC.md). Build with:
+#   make WITH_LOCISS=1
+# Requires libarrow-dev + libparquet-dev (Debian/Ubuntu) or equivalent.
+# Adds the --lociss-output FILE CLI option that emits a v2 LociSSD
+# Parquet file instead of (or alongside) BED text. Default `make` (no
+# WITH_LOCISS) has zero Arrow/Parquet dependency.
+WITH_LOCISS ?=
+ifneq ($(WITH_LOCISS),)
+  CFLAGS  += -DWITH_LOCISS
+  LDFLAGS += -lparquet -larrow
+endif
+
 src/pioSortBed.o: src/pioSortBed.cpp $(DEPS)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
