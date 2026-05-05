@@ -24,8 +24,12 @@ ifneq ($(WITH_BAM),)
   ifeq ($(HTSLIB),)
     $(error WITH_BAM=1 requires HTSLIB=/path/to/htslib)
   endif
-  CFLAGS  += -DWITH_BAM -I$(HTSLIB)
-  LDFLAGS += -L$(HTSLIB) -Wl,-rpath,$(HTSLIB) -lhts -lz -lpthread
+  # Link libhts.a (static) so the htscodecs rANS internals (rans_compress_*,
+  # rans_uncompress_*) are pulled in — they're in libhts.a but not exported
+  # by libhts.so, so dynamic linking would only work for the public API and
+  # would not give us rANS for --merge-codec rans0/rans1.
+  CFLAGS  += -DWITH_BAM -DWITH_RANS -I$(HTSLIB) -I$(HTSLIB)/htscodecs
+  LDFLAGS += $(HTSLIB)/libhts.a -lz -lpthread -ldeflate
 endif
 
 src/pioSortBed.o: src/pioSortBed.cpp $(DEPS)

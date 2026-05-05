@@ -29,6 +29,9 @@
 #include <htslib/sam.h>
 #include <htslib/hts.h>
 #endif
+#ifdef WITH_RANS
+#include <htscodecs/rANS_static4x16.h>
+#endif
 #include <lz4.h>
 #include <zstd.h>
 
@@ -2146,8 +2149,16 @@ static int parseExtCodec(const std::string& s, ExtCodec* out) {
 	if(s == "raw")   { *out = EXT_RAW;   return 0; }
 	if(s == "lz4")   { *out = EXT_LZ4;   return 0; }
 	if(s == "zstd")  { *out = EXT_ZSTD;  return 0; }
+#ifdef WITH_RANS
 	if(s == "rans0") { *out = EXT_RANS0; return 0; }
 	if(s == "rans1") { *out = EXT_RANS1; return 0; }
+#else
+	if(s == "rans0" || s == "rans1") {
+		std::cerr << "Error: codec '" << s << "' requires a WITH_BAM=1 build "
+		          << "(htscodecs rANS is bundled into libhts.a)" << std::endl;
+		return -1;
+	}
+#endif
 	return -1;
 }
 
@@ -2192,9 +2203,25 @@ static size_t extCompressBlock(ExtCodec codec, const uint8_t* in, size_t inLen,
 			}
 			return n;
 		}
+#ifdef WITH_RANS
+		case EXT_RANS0:
+		case EXT_RANS1: {
+			int order = (codec == EXT_RANS0) ? 0 : 1;
+			unsigned int outSize = (unsigned int)maxOut;
+			unsigned char* r = rans_compress_to_4x16(
+				(unsigned char*)in, (unsigned int)inLen,
+				(unsigned char*)outBuf, &outSize, order);
+			if(!r) {
+				std::cerr << "Error: rans_compress_to_4x16 (order " << order
+				          << ") failed" << std::endl;
+				exit(1);
+			}
+			return (size_t)outSize;
+		}
+#endif
 		default:
 			std::cerr << "Error: codec " << extCodecName(codec)
-			          << " not yet implemented" << std::endl;
+			          << " not available in this build" << std::endl;
 			exit(1);
 	}
 }
@@ -2227,9 +2254,24 @@ static void extDecompressBlock(ExtCodec codec, const uint8_t* in, size_t compLen
 			}
 			return;
 		}
+#ifdef WITH_RANS
+		case EXT_RANS0:
+		case EXT_RANS1: {
+			unsigned int outSize = (unsigned int)uncompLen;
+			unsigned char* r = rans_uncompress_to_4x16(
+				(unsigned char*)in, (unsigned int)compLen,
+				(unsigned char*)out, &outSize);
+			if(!r || outSize != uncompLen) {
+				std::cerr << "Error: rans_uncompress_to_4x16 returned size "
+				          << outSize << ", expected " << uncompLen << std::endl;
+				exit(1);
+			}
+			return;
+		}
+#endif
 		default:
 			std::cerr << "Error: codec " << extCodecName(codec)
-			          << " not yet implemented" << std::endl;
+			          << " not available in this build" << std::endl;
 			exit(1);
 	}
 }
@@ -2240,6 +2282,13 @@ static size_t extCompressBound(ExtCodec codec, size_t inLen) {
 		case EXT_RAW:  return inLen;
 		case EXT_LZ4:  return (size_t)LZ4_compressBound((int)inLen);
 		case EXT_ZSTD: return ZSTD_compressBound(inLen);
+#ifdef WITH_RANS
+		case EXT_RANS0:
+		case EXT_RANS1: {
+			int order = (codec == EXT_RANS0) ? 0 : 1;
+			return (size_t)rans_compress_bound_4x16((unsigned int)inLen, order);
+		}
+#endif
 		default:       return inLen + 64 * 1024;
 	}
 }
