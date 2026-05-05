@@ -6,7 +6,11 @@ CFLAGS  = -Isrc -O3 -std=c++17 -DVERSION_STRING=\"$(VERSION)\"
 # Parallel std::sort on libstdc++ is implemented over TBB.
 # C++/GCC runtimes statically linked so stdio doesn't go through a PLT;
 # libtbb stays dynamic (no libtbb.a in Debian).
-LDFLAGS = -static-libstdc++ -static-libgcc -ltbb
+# liblz4 / libzstd back the --external-merge codecs (compressed binary temp
+# files); both ship in libfoo.{a,so} on every distro that has -dev packages
+# (`apt install liblz4-dev libzstd-dev`). Dynamic-linked here; the release
+# binary target rolls them into a static build.
+LDFLAGS = -static-libstdc++ -static-libgcc -ltbb -llz4 -lzstd
 DEPS    =
 
 # Optional BAM input via htslib. Build with:

@@ -29,6 +29,8 @@
 #include <htslib/sam.h>
 #include <htslib/hts.h>
 #endif
+#include <lz4.h>
+#include <zstd.h>
 
 // Fallback for manual compilation without -DVERSION_STRING; the Makefile
 // always injects the real version, so this only matters for one-off builds.
@@ -2163,16 +2165,33 @@ struct ExtEntry {
 	const char* tailPtr;
 };
 
-// Compress one block (placeholder: codecs added in subsequent commits).
-// Returns compressed size; writes to outBuf which must have at least 'maxOut'
-// bytes available. For EXT_RAW, copies the input.
+// Compress one block. Returns compressed size; writes to outBuf which must
+// have at least extCompressBound(codec, inLen) bytes available.
 static size_t extCompressBlock(ExtCodec codec, const uint8_t* in, size_t inLen,
                                uint8_t* outBuf, size_t maxOut) {
-	(void)maxOut;
 	switch(codec) {
 		case EXT_RAW:
 			memcpy(outBuf, in, inLen);
 			return inLen;
+		case EXT_LZ4: {
+			int n = LZ4_compress_default((const char*)in, (char*)outBuf,
+			                             (int)inLen, (int)maxOut);
+			if(n <= 0) {
+				std::cerr << "Error: LZ4_compress_default failed (in="
+				          << inLen << ", maxOut=" << maxOut << ")" << std::endl;
+				exit(1);
+			}
+			return (size_t)n;
+		}
+		case EXT_ZSTD: {
+			size_t n = ZSTD_compress(outBuf, maxOut, in, inLen, 1);
+			if(ZSTD_isError(n)) {
+				std::cerr << "Error: ZSTD_compress failed: "
+				          << ZSTD_getErrorName(n) << std::endl;
+				exit(1);
+			}
+			return n;
+		}
 		default:
 			std::cerr << "Error: codec " << extCodecName(codec)
 			          << " not yet implemented" << std::endl;
@@ -2190,6 +2209,24 @@ static void extDecompressBlock(ExtCodec codec, const uint8_t* in, size_t compLen
 			}
 			memcpy(out, in, uncompLen);
 			return;
+		case EXT_LZ4: {
+			int n = LZ4_decompress_safe((const char*)in, (char*)out,
+			                            (int)compLen, (int)uncompLen);
+			if(n != (int)uncompLen) {
+				std::cerr << "Error: LZ4_decompress_safe returned " << n
+				          << ", expected " << uncompLen << std::endl;
+				exit(1);
+			}
+			return;
+		}
+		case EXT_ZSTD: {
+			size_t n = ZSTD_decompress(out, uncompLen, in, compLen);
+			if(ZSTD_isError(n) || n != uncompLen) {
+				std::cerr << "Error: ZSTD_decompress failed" << std::endl;
+				exit(1);
+			}
+			return;
+		}
 		default:
 			std::cerr << "Error: codec " << extCodecName(codec)
 			          << " not yet implemented" << std::endl;
@@ -2197,12 +2234,13 @@ static void extDecompressBlock(ExtCodec codec, const uint8_t* in, size_t compLen
 	}
 }
 
-// Worst-case compressed-output size estimate; codec-specific wrappers fill
-// this in. For EXT_RAW the bound is exactly the input size.
+// Worst-case compressed-output size estimate.
 static size_t extCompressBound(ExtCodec codec, size_t inLen) {
 	switch(codec) {
-		case EXT_RAW: return inLen;
-		default:     return inLen + 64 * 1024;  // generous fallback
+		case EXT_RAW:  return inLen;
+		case EXT_LZ4:  return (size_t)LZ4_compressBound((int)inLen);
+		case EXT_ZSTD: return ZSTD_compressBound(inLen);
+		default:       return inLen + 64 * 1024;
 	}
 }
 
@@ -2583,7 +2621,15 @@ static int extMergeSort(const std::string& inputFile,
 
 	if(verbose) {
 		time(&tend);
-		std::cerr << "Pass 1: " << runPaths.size() << " runs in "
+		uint64_t totalTempBytes = 0;
+		for(const std::string& p : runPaths) {
+			struct stat st;
+			if(stat(p.c_str(), &st) == 0) totalTempBytes += (uint64_t)st.st_size;
+		}
+		std::cerr << "Pass 1: " << runPaths.size() << " runs, "
+		          << "temp_bytes=" << totalTempBytes
+		          << " (" << ((double)totalTempBytes / (1024.0 * 1024.0)) << " MiB), "
+		          << "codec=" << extCodecName(codec) << ", "
 		          << (long)(tend - tstart) << " s" << std::endl;
 		time(&tstart);
 	}
