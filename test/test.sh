@@ -182,6 +182,18 @@ check_eq "low-mem-ssd sort" "$got_lm" "$want_s"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "--- External merge sort (--external-merge) ---"
+
+# Generous budget — single run.
+got_em=$("$PIO" --external-merge "$BED3" 2>/dev/null | canon)
+check_eq "external-merge single run" "$got_em" "$want_s"
+
+# Tight budget forces multiple runs + k-way merge.
+got_em_multi=$("$PIO" --external-merge --max-mem 4K "$BED3" 2>/dev/null | canon)
+check_eq "external-merge multi run" "$got_em_multi" "$want_s"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "--- Empty file ---"
 
 EMPTY="$TMPDIR_BASE/empty.bed"

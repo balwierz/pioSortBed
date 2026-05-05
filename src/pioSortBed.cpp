@@ -11,9 +11,14 @@
 #include <cstdint>
 #include <execution>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <time.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <errno.h>
 #include <tbb/global_control.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -2096,6 +2101,573 @@ static int bamSortAndEmit(const std::string& inputFile,
 #endif // WITH_BAM
 
 // ============================================================================
+// EXTERNAL MERGE SORT PATH (--external-merge)
+// ----------------------------------------------------------------------------
+// Streaming sort for inputs > RAM. Pass 1 reads the file in chunks, fills an
+// in-RAM run buffer up to a memory budget, sorts with radixSort64, and writes
+// a binary run file to a temp directory. Pass 2 (merge) opens all run files,
+// maintains a min-heap of (key, runIdx), pops + emits + refills.
+//
+// Run-file format (codec=0=raw — compression codecs added in later commits):
+//   Header:
+//     magic "PSBR" (4 B), version u8 (=1), codec u8, flags u16,
+//     chrCount u32, chrs: [u16 nameLen | nameLen bytes] × chrCount
+//   Blocks (sequential, one or more):
+//     u32 uncompLen, u32 compLen, u32 numRecords, payload (compLen bytes)
+//   Footer:
+//     magic "PSBE" (4 B), u32 blockCount, u64 totalRecords, u32 padding
+// Each block payload is a sequence of records:
+//     u16 chrIdx, i32 beg, i32 end, u8 strand, u16 tailLen, tailLen bytes tail
+// Tail = BED fields 4+ (no chr name; chrIdx indexes into the run's chr dict).
+// ============================================================================
+
+enum ExtCodec : uint8_t {
+	EXT_RAW  = 0,
+	EXT_LZ4  = 1,
+	EXT_ZSTD = 2,
+	EXT_RANS0 = 3,
+	EXT_RANS1 = 4,
+};
+
+static const char* extCodecName(ExtCodec c) {
+	switch(c) {
+		case EXT_RAW:   return "raw";
+		case EXT_LZ4:   return "lz4";
+		case EXT_ZSTD:  return "zstd";
+		case EXT_RANS0: return "rans0";
+		case EXT_RANS1: return "rans1";
+	}
+	return "?";
+}
+
+static int parseExtCodec(const std::string& s, ExtCodec* out) {
+	if(s == "raw")   { *out = EXT_RAW;   return 0; }
+	if(s == "lz4")   { *out = EXT_LZ4;   return 0; }
+	if(s == "zstd")  { *out = EXT_ZSTD;  return 0; }
+	if(s == "rans0") { *out = EXT_RANS0; return 0; }
+	if(s == "rans1") { *out = EXT_RANS1; return 0; }
+	return -1;
+}
+
+constexpr size_t kExtBlockTargetBytes = 64 * 1024;  // 64 KB uncompressed block target
+
+// One parsed record in the in-RAM run buffer. Tail bytes live in a separate
+// Arena (allocated via Arena::alloc which returns a pointer); the entry just
+// holds the pointer + length so the array stays cheap to sort.
+struct ExtEntry {
+	uint16_t    chrIdx;
+	int32_t     beg;
+	int32_t     end;
+	uint8_t     strand;
+	uint16_t    tailLen;
+	const char* tailPtr;
+};
+
+// Compress one block (placeholder: codecs added in subsequent commits).
+// Returns compressed size; writes to outBuf which must have at least 'maxOut'
+// bytes available. For EXT_RAW, copies the input.
+static size_t extCompressBlock(ExtCodec codec, const uint8_t* in, size_t inLen,
+                               uint8_t* outBuf, size_t maxOut) {
+	(void)maxOut;
+	switch(codec) {
+		case EXT_RAW:
+			memcpy(outBuf, in, inLen);
+			return inLen;
+		default:
+			std::cerr << "Error: codec " << extCodecName(codec)
+			          << " not yet implemented" << std::endl;
+			exit(1);
+	}
+}
+
+static void extDecompressBlock(ExtCodec codec, const uint8_t* in, size_t compLen,
+                               uint8_t* out, size_t uncompLen) {
+	switch(codec) {
+		case EXT_RAW:
+			if(compLen != uncompLen) {
+				std::cerr << "Error: raw block size mismatch" << std::endl;
+				exit(1);
+			}
+			memcpy(out, in, uncompLen);
+			return;
+		default:
+			std::cerr << "Error: codec " << extCodecName(codec)
+			          << " not yet implemented" << std::endl;
+			exit(1);
+	}
+}
+
+// Worst-case compressed-output size estimate; codec-specific wrappers fill
+// this in. For EXT_RAW the bound is exactly the input size.
+static size_t extCompressBound(ExtCodec codec, size_t inLen) {
+	switch(codec) {
+		case EXT_RAW: return inLen;
+		default:     return inLen + 64 * 1024;  // generous fallback
+	}
+}
+
+// Sequential run-file writer. Buffers records into uncompressed blocks of
+// ~kExtBlockTargetBytes, flushes one block at a time through the codec.
+class ExtRunWriter {
+public:
+	ExtRunWriter(const char* path, ExtCodec codec,
+	             const std::vector<std::string>& chrDict)
+		: codec_(codec), totalRecords_(0), numBlocks_(0), numBlockRecords_(0)
+	{
+		fp_ = fopen(path, "wb");
+		if(!fp_) { std::cerr << "Error: cannot create run file " << path
+		                     << ": " << strerror(errno) << std::endl; exit(1); }
+		uint8_t hdr[8];
+		memcpy(hdr, "PSBR", 4);
+		hdr[4] = 1;
+		hdr[5] = (uint8_t)codec;
+		hdr[6] = 0;
+		hdr[7] = 0;
+		fwrite(hdr, 1, 8, fp_);
+		uint32_t chrCount = (uint32_t)chrDict.size();
+		fwrite(&chrCount, sizeof(uint32_t), 1, fp_);
+		for(const std::string& s : chrDict) {
+			uint16_t len = (uint16_t)s.size();
+			fwrite(&len, sizeof(uint16_t), 1, fp_);
+			fwrite(s.data(), 1, len, fp_);
+		}
+		blockBuf_.reserve(kExtBlockTargetBytes + 1024);
+	}
+
+	void writeRecord(uint16_t chrIdx, int32_t beg, int32_t end,
+	                 uint8_t strand, const char* tail, uint16_t tailLen)
+	{
+		const size_t need = 13 + (size_t)tailLen;
+		if(!blockBuf_.empty() && blockBuf_.size() + need > kExtBlockTargetBytes)
+			flushBlock();
+		size_t off = blockBuf_.size();
+		blockBuf_.resize(off + need);
+		uint8_t* p = blockBuf_.data() + off;
+		memcpy(p, &chrIdx, 2);
+		memcpy(p + 2, &beg,  4);
+		memcpy(p + 6, &end,  4);
+		p[10] = strand;
+		memcpy(p + 11, &tailLen, 2);
+		if(tailLen) memcpy(p + 13, tail, tailLen);
+		numBlockRecords_++;
+		totalRecords_++;
+	}
+
+	void close() {
+		flushBlock();
+		uint8_t footer[20];
+		memcpy(footer, "PSBE", 4);
+		memcpy(footer + 4, &numBlocks_, sizeof(uint32_t));
+		memcpy(footer + 8, &totalRecords_, sizeof(uint64_t));
+		memset(footer + 16, 0, 4);
+		fwrite(footer, 1, 20, fp_);
+		fclose(fp_);
+		fp_ = NULL;
+	}
+
+	~ExtRunWriter() { if(fp_) fclose(fp_); }
+
+private:
+	void flushBlock() {
+		if(blockBuf_.empty()) return;
+		uint32_t uncompLen = (uint32_t)blockBuf_.size();
+		size_t maxComp = extCompressBound(codec_, uncompLen);
+		std::vector<uint8_t> compBuf(maxComp);
+		uint32_t compLen = (uint32_t)extCompressBlock(codec_,
+			blockBuf_.data(), uncompLen, compBuf.data(), maxComp);
+		uint32_t hdr[3] = { uncompLen, compLen, numBlockRecords_ };
+		fwrite(hdr, sizeof(uint32_t), 3, fp_);
+		fwrite(compBuf.data(), 1, compLen, fp_);
+		blockBuf_.clear();
+		numBlockRecords_ = 0;
+		numBlocks_++;
+	}
+
+	FILE* fp_;
+	ExtCodec codec_;
+	std::vector<uint8_t> blockBuf_;
+	uint64_t totalRecords_;
+	uint32_t numBlocks_;
+	uint32_t numBlockRecords_;
+};
+
+// One-record-at-a-time reader. peek() returns the next record's key/data;
+// advance() consumes it and lazily refills the block buffer when exhausted.
+class ExtRunReader {
+public:
+	bool eof;
+	uint16_t chrIdx;
+	int32_t  beg;
+	int32_t  end;
+	uint8_t  strand;
+	uint16_t tailLen;
+	const uint8_t* tailPtr;
+	std::vector<std::string> chrDict;
+
+	ExtRunReader(const std::string& path)
+		: eof(false), chrIdx(0), beg(0), end(0), strand('+'), tailLen(0), tailPtr(NULL),
+		  blockPos_(0), blockEnd_(0), blocksRemaining_(0)
+	{
+		fp_ = fopen(path.c_str(), "rb");
+		if(!fp_) { std::cerr << "Error: cannot open run file " << path
+		                     << ": " << strerror(errno) << std::endl; exit(1); }
+		uint8_t hdr[8];
+		if(fread(hdr, 1, 8, fp_) != 8 || memcmp(hdr, "PSBR", 4) != 0) {
+			std::cerr << "Error: bad run-file header in " << path << std::endl;
+			exit(1);
+		}
+		if(hdr[4] != 1) {
+			std::cerr << "Error: unsupported run-file version " << (int)hdr[4]
+			          << " in " << path << std::endl;
+			exit(1);
+		}
+		codec_ = (ExtCodec)hdr[5];
+		uint32_t chrCount;
+		fread(&chrCount, sizeof(uint32_t), 1, fp_);
+		chrDict.reserve(chrCount);
+		for(uint32_t i = 0; i < chrCount; i++) {
+			uint16_t len;
+			fread(&len, sizeof(uint16_t), 1, fp_);
+			std::string s(len, '\0');
+			fread(s.data(), 1, len, fp_);
+			chrDict.push_back(std::move(s));
+		}
+		// Read footer to learn block count, then rewind to the first block.
+		long blocksStart = ftell(fp_);
+		fseek(fp_, -20, SEEK_END);
+		uint8_t footer[20];
+		fread(footer, 1, 20, fp_);
+		if(memcmp(footer, "PSBE", 4) != 0) {
+			std::cerr << "Error: bad run-file footer in " << path << std::endl;
+			exit(1);
+		}
+		memcpy(&blocksRemaining_, footer + 4, sizeof(uint32_t));
+		fseek(fp_, blocksStart, SEEK_SET);
+		advance();
+	}
+
+	~ExtRunReader() { if(fp_) fclose(fp_); }
+
+	void advance() {
+		if(blockPos_ >= blockEnd_) {
+			if(!loadNextBlock()) { eof = true; tailPtr = NULL; return; }
+		}
+		const uint8_t* p = blockBuf_.data() + blockPos_;
+		memcpy(&chrIdx, p, 2);
+		memcpy(&beg,  p + 2, 4);
+		memcpy(&end,  p + 6, 4);
+		strand = p[10];
+		memcpy(&tailLen, p + 11, 2);
+		tailPtr = p + 13;
+		blockPos_ += 13 + tailLen;
+	}
+
+private:
+	bool loadNextBlock() {
+		if(blocksRemaining_ == 0) return false;
+		uint32_t hdr[3];
+		if(fread(hdr, sizeof(uint32_t), 3, fp_) != 3) return false;
+		uint32_t uncompLen = hdr[0];
+		uint32_t compLen   = hdr[1];
+		blockBuf_.resize(uncompLen);
+		if(uncompLen == compLen && codec_ == EXT_RAW) {
+			fread(blockBuf_.data(), 1, uncompLen, fp_);
+		} else {
+			std::vector<uint8_t> compBuf(compLen);
+			fread(compBuf.data(), 1, compLen, fp_);
+			extDecompressBlock(codec_, compBuf.data(), compLen,
+			                   blockBuf_.data(), uncompLen);
+		}
+		blockPos_ = 0;
+		blockEnd_ = uncompLen;
+		blocksRemaining_--;
+		return true;
+	}
+
+	FILE* fp_;
+	ExtCodec codec_;
+	std::vector<uint8_t> blockBuf_;
+	size_t blockPos_;
+	size_t blockEnd_;
+	uint32_t blocksRemaining_;
+};
+
+// ============================================================================
+// External merge driver
+// ============================================================================
+//
+// Pass 1: stream the input via fread; for each line, parse with
+// parseBedLineFull; assign chrIdx (per-run dictionary, intern via map);
+// store a per-line ExtEntry plus the tail bytes in a per-run Arena. When the
+// arena+entry footprint hits the budget, sort entries with radixSort64 over
+// packed (chrIdx<<32 | beg) keys and flush a run file. Repeat.
+//
+// Merge: open all run files; build a min-heap of (key, runIdx); pop, emit
+// to stdout (reconstruct chr + write tab-separated text), advance that run.
+//
+// chrIdx assignment is per-run during pass 1. Each run ships its own chr
+// dictionary in its header. The merge phase remaps each run's chr-name back
+// to the global sorted dictionary built across all runs.
+//
+// The chr-name compare in the heap is done via a precomputed
+// runChrToGlobal[runIdx][localChrIdx] -> globalChrIdx table, and the heap
+// key is (globalChrIdx, beg) packed. Output emits each line as
+// global_chr_name + "\t" + beg + "\t" + end + tail.
+
+static int extMergeSort(const std::string& inputFile,
+                        size_t memBudget,
+                        ExtCodec codec,
+                        const std::string& tmpDirOpt,
+                        bool naturalSort,
+                        bool verbose)
+{
+	if(memBudget == 0) memBudget = 1ULL << 30;  // default 1 GB
+	std::string tmpDir = tmpDirOpt;
+	if(tmpDir.empty()) {
+		const char* envTmp = getenv("TMPDIR");
+		tmpDir = envTmp ? envTmp : "/tmp";
+	}
+
+	time_t tstart, tend;
+	if(verbose) time(&tstart);
+
+	FILE* in = fopen(inputFile.c_str(), "r");
+	if(!in) {
+		std::cerr << "Error: cannot open " << inputFile << ": "
+		          << strerror(errno) << std::endl;
+		return 1;
+	}
+
+	// Per-run state (resets each time we flush a run).
+	std::vector<ExtEntry> entries;
+	Arena* tailArena = new Arena(1UL << 20, 1UL << 24);
+	std::unordered_map<std::string, uint16_t> chrIdxMap;
+	std::vector<std::string> chrDict;
+	size_t bytesUsed = 0;  // approximate accounting for entries + tails
+	std::vector<std::string> runPaths;
+
+	auto flushRun = [&]() {
+		if(entries.empty()) return;
+		size_t n = entries.size();
+
+		// chrDict is in encounter order. Sort it (alphabetically or
+		// naturally) and remap each entry's chrIdx so that the run's
+		// local chrIdx order matches the global merge's chrIdx order.
+		// Without this, a run that saw "chr10" before "chr1" would emit
+		// chr10 records before chr1 records, breaking the k-way merge
+		// invariant ("smallest local key == smallest global key").
+		std::vector<uint32_t> sortedOrder(chrDict.size());
+		for(uint32_t i = 0; i < chrDict.size(); i++) sortedOrder[i] = i;
+		if(naturalSort) {
+			std::sort(sortedOrder.begin(), sortedOrder.end(),
+			          [&](uint32_t a, uint32_t b) {
+			              return naturalChrLess(chrDict[a], chrDict[b]);
+			          });
+		} else {
+			std::sort(sortedOrder.begin(), sortedOrder.end(),
+			          [&](uint32_t a, uint32_t b) {
+			              return chrDict[a] < chrDict[b];
+			          });
+		}
+		std::vector<uint16_t> oldToNew(chrDict.size());
+		std::vector<std::string> sortedDict(chrDict.size());
+		for(uint32_t newIdx = 0; newIdx < sortedOrder.size(); newIdx++) {
+			oldToNew[sortedOrder[newIdx]] = (uint16_t)newIdx;
+			sortedDict[newIdx] = std::move(chrDict[sortedOrder[newIdx]]);
+		}
+		for(ExtEntry& e : entries) e.chrIdx = oldToNew[e.chrIdx];
+
+		std::vector<uint64_t> keys(n);
+		std::vector<uint32_t> order(n);
+		for(size_t i = 0; i < n; i++) {
+			keys[i]  = ((uint64_t)entries[i].chrIdx << 32) | (uint32_t)entries[i].beg;
+			order[i] = (uint32_t)i;
+		}
+		radixSort64(keys.data(), order.data(), n, 1);
+
+		char path[512];
+		snprintf(path, sizeof(path), "%s/piosort.run.%u.%d.tmp",
+		         tmpDir.c_str(), (unsigned)runPaths.size(), (int)getpid());
+		ExtRunWriter writer(path, codec, sortedDict);
+		for(size_t i = 0; i < n; i++) {
+			const ExtEntry& e = entries[order[i]];
+			writer.writeRecord(e.chrIdx, e.beg, e.end, e.strand, e.tailPtr, e.tailLen);
+		}
+		writer.close();
+		runPaths.emplace_back(path);
+
+		entries.clear();
+		entries.shrink_to_fit();
+		delete tailArena;
+		tailArena = new Arena(1UL << 20, 1UL << 24);
+		chrIdxMap.clear();
+		chrDict.clear();
+		bytesUsed = 0;
+	};
+
+	// Read input line by line via getline (handles arbitrary line lengths).
+	char* lineBuf = NULL;
+	size_t lineCap = 0;
+	ssize_t llen;
+	bool sawHeader = false;
+	while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
+		if(llen == 0) continue;
+		if(lineBuf[llen - 1] == '\n') { lineBuf[--llen] = '\0'; }
+		if(llen > 0 && lineBuf[llen - 1] == '\r') { lineBuf[--llen] = '\0'; }
+		// Header passthrough (only at start of file, by convention).
+		if(!sawHeader && (lineBuf[0] == '#' ||
+		   strncmp(lineBuf, "track ",   6) == 0 ||
+		   strncmp(lineBuf, "browser ", 8) == 0)) {
+			fputs_unlocked(lineBuf, stdout);
+			fputc_unlocked('\n', stdout);
+			continue;
+		}
+		sawHeader = true;
+		if(llen == 0) continue;
+
+		const char* chrPtr;
+		int chrLen;
+		int beg = 0, end = 0;
+		char weight[kWeightBufSize]; weight[0] = '0'; weight[1] = '\0';
+		char strandChar = '+';
+		const char* tailPtr = "";
+		int n = parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr);
+		if(n < 3) {
+			std::cerr << "Error in parsing line: " << lineBuf << std::endl;
+			free(lineBuf); fclose(in); return 1;
+		}
+		(void)weight; (void)strandChar;
+
+		// Intern chr name (per-run dictionary).
+		std::string chrName(chrPtr, chrLen);
+		uint16_t chrIdx;
+		auto it = chrIdxMap.find(chrName);
+		if(it != chrIdxMap.end()) {
+			chrIdx = it->second;
+		} else {
+			if(chrDict.size() >= 65535) {
+				std::cerr << "Error: more than 65535 distinct chromosomes per run"
+				          << std::endl;
+				return 1;
+			}
+			chrIdx = (uint16_t)chrDict.size();
+			chrDict.push_back(chrName);
+			chrIdxMap[chrName] = chrIdx;
+		}
+
+		// Append tail to the arena.
+		size_t tailLen = strlen(tailPtr);
+		if(tailLen > 65535) {
+			std::cerr << "Error: BED line tail exceeds 64 KB" << std::endl;
+			return 1;
+		}
+		const char* tailCopy = (tailLen > 0) ? tailArena->alloc(tailPtr, tailLen) : "";
+
+		ExtEntry e;
+		e.chrIdx  = chrIdx;
+		e.beg     = beg;
+		e.end     = end;
+		e.strand  = (uint8_t)strandChar;
+		e.tailLen = (uint16_t)tailLen;
+		e.tailPtr = tailCopy;
+		entries.push_back(e);
+
+		bytesUsed += sizeof(ExtEntry) + tailLen + 2;
+		if(bytesUsed >= memBudget) flushRun();
+	}
+	free(lineBuf);
+	fclose(in);
+	flushRun();
+	delete tailArena;
+	tailArena = NULL;
+
+	if(verbose) {
+		time(&tend);
+		std::cerr << "Pass 1: " << runPaths.size() << " runs in "
+		          << (long)(tend - tstart) << " s" << std::endl;
+		time(&tstart);
+	}
+
+	// ----- Merge phase -----
+	// Open all runs; build global chr dictionary from union of per-run dicts;
+	// remap each run's local chrIdx to global.
+	std::vector<std::unique_ptr<ExtRunReader>> readers;
+	readers.reserve(runPaths.size());
+	for(const std::string& p : runPaths) {
+		readers.emplace_back(std::make_unique<ExtRunReader>(p));
+	}
+
+	// Build global chr dictionary (sorted lex or natural).
+	std::vector<std::string> globalChroms;
+	{
+		std::unordered_set<std::string> seen;
+		for(auto& r : readers) {
+			for(const std::string& c : r->chrDict) {
+				if(seen.insert(c).second) globalChroms.push_back(c);
+			}
+		}
+		if(naturalSort) std::sort(globalChroms.begin(), globalChroms.end(), naturalChrLess);
+		else            std::sort(globalChroms.begin(), globalChroms.end());
+	}
+	std::unordered_map<std::string, uint32_t> globalIdxMap;
+	for(uint32_t i = 0; i < globalChroms.size(); i++) globalIdxMap[globalChroms[i]] = i;
+
+	// Per-run remap tables: run-local chrIdx -> global chrIdx.
+	std::vector<std::vector<uint32_t>> remap(readers.size());
+	for(size_t r = 0; r < readers.size(); r++) {
+		remap[r].resize(readers[r]->chrDict.size());
+		for(size_t i = 0; i < readers[r]->chrDict.size(); i++)
+			remap[r][i] = globalIdxMap[readers[r]->chrDict[i]];
+	}
+
+	// Min-heap of (globalKey, runIdx). globalKey = (globalChrIdx<<32) | beg.
+	struct HeapElem { uint64_t key; uint32_t runIdx; };
+	auto heapCmp = [](const HeapElem& a, const HeapElem& b) {
+		return a.key > b.key;  // min-heap
+	};
+	std::priority_queue<HeapElem, std::vector<HeapElem>, decltype(heapCmp)> heap(heapCmp);
+	for(uint32_t r = 0; r < readers.size(); r++) {
+		if(!readers[r]->eof) {
+			uint64_t k = ((uint64_t)remap[r][readers[r]->chrIdx] << 32)
+			           | (uint32_t)readers[r]->beg;
+			heap.push({k, r});
+		}
+	}
+
+	// Output buffer (8 MiB) is set up by main(); we reuse stdout.
+	char numBuf[32];
+	while(!heap.empty()) {
+		HeapElem top = heap.top(); heap.pop();
+		ExtRunReader* rd = readers[top.runIdx].get();
+		const std::string& chr = globalChroms[(uint32_t)(top.key >> 32)];
+		fputs_unlocked(chr.c_str(), stdout);
+		fputc_unlocked('\t', stdout);
+		int n = writeUInt(numBuf, rd->beg);
+		numBuf[n++] = '\t';
+		n += writeUInt(numBuf + n, rd->end);
+		fwrite_unlocked(numBuf, 1, n, stdout);
+		if(rd->tailLen) fwrite_unlocked(rd->tailPtr, 1, rd->tailLen, stdout);
+		fputc_unlocked('\n', stdout);
+		rd->advance();
+		if(!rd->eof) {
+			uint64_t k = ((uint64_t)remap[top.runIdx][rd->chrIdx] << 32)
+			           | (uint32_t)rd->beg;
+			heap.push({k, top.runIdx});
+		}
+	}
+
+	// Cleanup.
+	readers.clear();
+	for(const std::string& p : runPaths) unlink(p.c_str());
+
+	if(verbose) {
+		time(&tend);
+		std::cerr << "Merge: " << (long)(tend - tstart) << " s" << std::endl;
+	}
+	return 0;
+}
+
+// ============================================================================
 // CLI / MAIN
 // ----------------------------------------------------------------------------
 // CLI11 option parsing, input dispatch (file mmap / stdin slurp / gzip
@@ -2149,6 +2721,9 @@ int main(int argc, char *argv[])
 	char sortMode = 's';
 	int fCollapse = 0;
 	int lowMemSSD = 0;
+	int extMerge = 0;
+	std::string extCodecStr = "raw";
+	std::string extTmpDir;
 	int numThreads = 0;
 	bool naturalSort = false;
 	std::string maxMemStr;
@@ -2171,6 +2746,17 @@ int main(int argc, char *argv[])
 	app.add_flag("--low-mem-ssd", lowMemSSD,
 		"low-memory two-pass file mode (SSD-friendly): keeps line offsets in RAM and "
 		"sorts one chromosome at a time; slower than default but uses less peak RAM");
+	app.add_flag("--external-merge", extMerge,
+		"external merge sort: stream the input, build sorted runs in RAM up to "
+		"--max-mem (default 1G), spill each run as a binary temp file, k-way "
+		"merge to stdout. Use for inputs > RAM. Temp files go to --tmpdir or "
+		"$TMPDIR. (only the default coordinate sort is supported)");
+	app.add_option("--merge-codec", extCodecStr,
+		"compression codec for --external-merge temp files: raw|lz4|zstd|rans0|rans1 "
+		"(default raw; codecs landed in subsequent commits)")
+		->default_val("raw");
+	app.add_option("--tmpdir", extTmpDir,
+		"temp directory for --external-merge run files (default: $TMPDIR or /tmp)");
 	app.add_option("-t,--threads", numThreads,
 		"number of threads for the classic sort path "
 		"(0 = all cores; 1 = single-threaded std::sort)")
@@ -2222,6 +2808,40 @@ int main(int argc, char *argv[])
 		return bamSortAndEmit(inputFile, outputFile, numThreads, verbose);
 	}
 #endif
+
+	// External merge sort dispatch. Fires before mmap/slurp and bypasses the
+	// normal input pipeline — extMergeSort opens the input file directly via
+	// fread and writes its own output stream.
+	if(extMerge)
+	{
+		if(fCollapse || lowMemSSD || sortMode != 's')
+		{
+			cerr << "Error: --external-merge only supports the default "
+			        "coordinate sort (--sort=s); --collapse / --low-mem-ssd / "
+			        "--sort=b|5 are not yet implemented in this path" << endl;
+			return 1;
+		}
+		if(inputFile == "-") {
+			cerr << "Error: --external-merge does not yet support stdin "
+			        "input (would defeat the streaming-from-disk design); "
+			        "pass a file path." << endl;
+			return 1;
+		}
+		ExtCodec codec;
+		if(parseExtCodec(extCodecStr, &codec) != 0) {
+			cerr << "Error: unknown --merge-codec value '" << extCodecStr
+			     << "' (valid: raw|lz4|zstd|rans0|rans1)" << endl;
+			return 1;
+		}
+		if(!outputFile.empty()) {
+			if(!freopen(outputFile.c_str(), "w", stdout)) {
+				cerr << "Error: cannot open " << outputFile << " for writing" << endl;
+				return 1;
+			}
+		}
+		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
+		                    naturalSort, verbose);
+	}
 
 	// -o/--output redirects stdout to the named file. All downstream data
 	// emit (fputs_unlocked, fwrite_unlocked, printf in collapse mode) goes
