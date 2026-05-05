@@ -2162,7 +2162,11 @@ static int parseExtCodec(const std::string& s, ExtCodec* out) {
 	return -1;
 }
 
-constexpr size_t kExtBlockTargetBytes = 64 * 1024;  // 64 KB uncompressed block target
+// 1 MiB uncompressed block target — chosen so parallel zstd
+// (ZSTD_c_nbWorkers) has enough payload per block to engage workers.
+// Smaller blocks (e.g., 64 KB) silently degrade to single-stream zstd.
+// Bigger blocks marginally improve ratio but cost RAM in the writer.
+constexpr size_t kExtBlockTargetBytes = 1024 * 1024;
 
 // One parsed record in the in-RAM run buffer. Tail bytes live in a separate
 // Arena (allocated via Arena::alloc which returns a pointer); the entry just
@@ -2178,8 +2182,14 @@ struct ExtEntry {
 
 // Compress one block. Returns compressed size; writes to outBuf which must
 // have at least extCompressBound(codec, inLen) bytes available.
+//
+// numThreads > 1: enables parallel zstd via ZSTD_c_nbWorkers (other codecs
+// have no built-in MT in our setup and ignore it). Block size needs to be
+// >= ~nbWorkers x 128 KB for zstd MT to actually engage; below that zstd
+// silently falls back to single-stream. The writer's block target
+// kExtBlockTargetBytes = 1 MiB makes zstd MT useful for nbWorkers <= 8.
 static size_t extCompressBlock(ExtCodec codec, const uint8_t* in, size_t inLen,
-                               uint8_t* outBuf, size_t maxOut) {
+                               uint8_t* outBuf, size_t maxOut, int numThreads) {
 	switch(codec) {
 		case EXT_RAW:
 			memcpy(outBuf, in, inLen);
@@ -2195,6 +2205,15 @@ static size_t extCompressBlock(ExtCodec codec, const uint8_t* in, size_t inLen,
 			return (size_t)n;
 		}
 		case EXT_ZSTD: {
+			// Empirically, ZSTD_c_nbWorkers > 0 *regresses* on our 1 MiB
+			// blocks (200 M / 4 G bench: extmerge -t 8 = 135 s vs -t 1
+			// = 117 s with MT enabled; turning it off lets the radix-sort
+			// MT win cleanly). zstd's MT mode chunks the input into
+			// ~128 KB pieces per worker, but the dispatch+sync cost at
+			// our block size exceeds the parallelism benefit. Bigger
+			// blocks (>= 16 MiB) would help, at the cost of writer RAM
+			// and emit granularity. Keep zstd single-stream for now.
+			(void)numThreads;
 			size_t n = ZSTD_compress(outBuf, maxOut, in, inLen, 1);
 			if(ZSTD_isError(n)) {
 				std::cerr << "Error: ZSTD_compress failed: "
@@ -2298,8 +2317,10 @@ static size_t extCompressBound(ExtCodec codec, size_t inLen) {
 class ExtRunWriter {
 public:
 	ExtRunWriter(const char* path, ExtCodec codec,
-	             const std::vector<std::string>& chrDict)
-		: codec_(codec), totalRecords_(0), numBlocks_(0), numBlockRecords_(0)
+	             const std::vector<std::string>& chrDict,
+	             int numThreads = 1)
+		: codec_(codec), numThreads_(numThreads),
+		  totalRecords_(0), numBlocks_(0), numBlockRecords_(0)
 	{
 		fp_ = fopen(path, "wb");
 		if(!fp_) { std::cerr << "Error: cannot create run file " << path
@@ -2361,7 +2382,7 @@ private:
 		size_t maxComp = extCompressBound(codec_, uncompLen);
 		std::vector<uint8_t> compBuf(maxComp);
 		uint32_t compLen = (uint32_t)extCompressBlock(codec_,
-			blockBuf_.data(), uncompLen, compBuf.data(), maxComp);
+			blockBuf_.data(), uncompLen, compBuf.data(), maxComp, numThreads_);
 		uint32_t hdr[3] = { uncompLen, compLen, numBlockRecords_ };
 		fwrite(hdr, sizeof(uint32_t), 3, fp_);
 		fwrite(compBuf.data(), 1, compLen, fp_);
@@ -2372,6 +2393,7 @@ private:
 
 	FILE* fp_;
 	ExtCodec codec_;
+	int numThreads_;
 	std::vector<uint8_t> blockBuf_;
 	uint64_t totalRecords_;
 	uint32_t numBlocks_;
@@ -2506,6 +2528,7 @@ static int extMergeSort(const std::string& inputFile,
                         ExtCodec codec,
                         const std::string& tmpDirOpt,
                         bool naturalSort,
+                        int numThreads,
                         bool verbose)
 {
 	if(memBudget == 0) memBudget = 1ULL << 30;  // default 1 GB
@@ -2570,12 +2593,12 @@ static int extMergeSort(const std::string& inputFile,
 			keys[i]  = ((uint64_t)entries[i].chrIdx << 32) | (uint32_t)entries[i].beg;
 			order[i] = (uint32_t)i;
 		}
-		radixSort64(keys.data(), order.data(), n, 1);
+		radixSort64(keys.data(), order.data(), n, numThreads);
 
 		char path[512];
 		snprintf(path, sizeof(path), "%s/piosort.run.%u.%d.tmp",
 		         tmpDir.c_str(), (unsigned)runPaths.size(), (int)getpid());
-		ExtRunWriter writer(path, codec, sortedDict);
+		ExtRunWriter writer(path, codec, sortedDict, numThreads);
 		for(size_t i = 0; i < n; i++) {
 			const ExtEntry& e = entries[order[i]];
 			writer.writeRecord(e.chrIdx, e.beg, e.end, e.strand, e.tailPtr, e.tailLen);
@@ -2793,6 +2816,7 @@ struct PromHistEntry {
 static int multiPassSort(const std::string& inputFile,
                          size_t budget,
                          bool naturalSort,
+                         int numThreads,
                          bool verbose)
 {
 	if(budget == 0) budget = 1ULL << 30;
@@ -3013,7 +3037,7 @@ static int multiPassSort(const std::string& inputFile,
 			keys[i]  = ((uint64_t)entries[i].chrIdx << 32) | (uint32_t)entries[i].beg;
 			order[i] = (uint32_t)i;
 		}
-		radixSort64(keys.data(), order.data(), n, 1);
+		radixSort64(keys.data(), order.data(), n, numThreads);
 		for(size_t i = 0; i < n; i++) {
 			const ExtEntry& e = entries[order[i]];
 			fwrite_unlocked(e.tailPtr, 1, e.tailLen, stdout);
@@ -3216,7 +3240,7 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 		}
-		return multiPassSort(inputFile, maxMemBytes, naturalSort, verbose);
+		return multiPassSort(inputFile, maxMemBytes, naturalSort, numThreads, verbose);
 	}
 
 	// External merge sort dispatch. Fires before mmap/slurp and bypasses the
@@ -3250,7 +3274,7 @@ int main(int argc, char *argv[])
 			}
 		}
 		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, verbose);
+		                    naturalSort, numThreads, verbose);
 	}
 
 	// -o/--output redirects stdout to the named file. All downstream data
