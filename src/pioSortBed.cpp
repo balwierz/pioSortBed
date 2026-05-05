@@ -4103,6 +4103,25 @@ int main(int argc, char *argv[])
 #ifdef WITH_LOCISS
 	else if(!locissOutput.empty())
 	{
+		// Detect BED4+ tail on the first emitted record and warn once.
+		// Round-1 LocissSink only writes the four required columns
+		// (Chromosome, Start, End, MaxEndSoFar); columns 4+ are dropped.
+		// Catch silent data loss before it surprises a user.
+		if(totalReads > 0) {
+			const char* p = reads[order[0]].line;
+			int tabs = 0;
+			while(*p) {
+				if(*p == '\t' && ++tabs >= 3) {
+					std::cerr << "Warning: --lociss-output is dropping BED "
+					             "columns 4+ (Name / Score / Strand / etc.); "
+					             "tail passthrough is not yet implemented in "
+					             "this build. Output will contain only "
+					             "Chromosome, Start, End, MaxEndSoFar." << std::endl;
+					break;
+				}
+				p++;
+			}
+		}
 		LocissSink sink(locissOutput);
 		if(sink.open() != 0) { free(order); return 1; }
 		for(size_t i = 0; i < totalReads; i++) {
