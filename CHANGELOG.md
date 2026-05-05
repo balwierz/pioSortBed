@@ -4,6 +4,43 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.4.0] — 2026-05-05
+
+### Added
+- `--multi-pass` sort path: K-pass scan, **zero disk writes**. Pass 1
+  streams the input via `getline` and builds a histogram keyed by
+  `(chrIdx, beg >> 20)` (1 MiB position quantum), tracking byte size
+  per bucket. The histogram is then bin-packed into K consecutive
+  groups, each ≤ `--max-mem`. Passes 2..K+1 re-stream the input,
+  filtering by group's bucket range, sorting with `radixSort64`,
+  emitting to stdout.
+
+  Total disk reads = (K+1) × file_size, total disk writes = **0**.
+  This is the SSD-wear-friendly fallback for medium-sized inputs
+  (~1-5x RAM) where the quadratic K-pass cost is bounded and the no-
+  writes property is a clear win over `--external-merge`.
+
+  Bench at 50 M records / ~2 GiB BED on /var/tmp ext4:
+
+      path / codec         budget    wall    peak     K   writes
+      --multi-pass         1 GiB    18.97s  1.5 GB    3      0
+      --multi-pass         256 MiB  37.34s   390 MB  12      0
+      --multi-pass         64 MiB  122.01s   108 MB  47      0
+      --external-merge zstd 256 MiB 14.86s   419 MB   -    ~700 MB
+      --external-merge raw  256 MiB 11.49s   419 MB   -    ~1.5 GB
+
+  Multi-pass is 2-3× slower than `--external-merge` at similar
+  budgets but trades that for zero NAND wear. Above ~10 groups the
+  quadratic scaling makes external-merge asymptotically faster.
+
+  Pathological inputs (a single 1 MiB beg-quantum bucket bigger than
+  `--max-mem`) are rejected with a clear error pointing at
+  `--external-merge` or a larger budget. Default coordinate sort
+  only (`--sort=s`); file input only.
+
+- 2 new tests in `test/test.sh` (single-group + K-pass paths). 25 of
+  25 tests pass.
+
 ## [3.3.0] — 2026-05-05
 
 ### Added

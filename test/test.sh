@@ -194,6 +194,19 @@ check_eq "external-merge multi run" "$got_em_multi" "$want_s"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "--- Multi-pass no-writes sort (--multi-pass) ---"
+
+# Generous budget — single group.
+got_mp=$("$PIO" --multi-pass "$BED3" 2>/dev/null | canon)
+check_eq "multi-pass single group" "$got_mp" "$want_s"
+
+# Tight budget forces multiple K-passes (one bucket = ~24 KB; 64 KB
+# budget forces ~one chrom per pass on the BED3 fixture).
+got_mp_multi=$("$PIO" --multi-pass --max-mem 64K "$BED3" 2>/dev/null | canon)
+check_eq "multi-pass K-pass" "$got_mp_multi" "$want_s"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "--- Empty file ---"
 
 EMPTY="$TMPDIR_BASE/empty.bed"

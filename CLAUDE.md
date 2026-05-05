@@ -50,6 +50,7 @@ Options:
 - `--collapse` — sum weights of regions sharing (chr, start)
 - `--low-mem-ssd` — two-pass mode, **recommended fast path** for any input ≥ ~1 M reads
 - `--external-merge` — streaming external sort for inputs > RAM (file input only). Pass 1 fills runs up to `--max-mem`, sorts each with `radixSort64`, writes binary compressed temp files; pass 2 k-way merges. Peak RSS bounded by `--max-mem`.
+- `--multi-pass` — K-pass scan, **zero disk writes**. Pass 1 builds a `(chr, 1 MiB-quantum)` histogram + bin-packs into K groups ≤ `--max-mem`; passes 2..K+1 re-stream the input, filtering by group, sort + emit. Use for medium inputs (~1-5× RAM) where SSD-wear matters and you can afford `(K+1)×` reads. (file input only)
 - `--merge-codec=raw|lz4|zstd|rans0|rans1` — temp-file codec for `--external-merge` (default zstd; rans0/rans1 require `WITH_BAM=1`)
 - `--tmpdir=PATH` — temp-file location for `--external-merge` (default: `$TMPDIR` or `/tmp`)
 - `-t N` / `--threads N` — worker pool size (`0` = all cores, default; `1` = serial)
@@ -61,13 +62,14 @@ BED header lines (`#`, `track `, `browser `) pass through unchanged.
 
 ## Architecture
 
-Single source file (`src/pioSortBed.cpp`, ~3200 lines). Section banners divide it into:
-**CORE TYPES & ALLOCATOR** / **PARSERS** / **LOW-MEMORY SSD PATH** / **CLASSIC SORT PATH** / **Parallel mmap parsing** / **EXTERNAL MERGE SORT PATH** / **CLI / MAIN**. Grep `^// =\+$` to jump between sections.
+Single source file (`src/pioSortBed.cpp`, ~3500 lines). Section banners divide it into:
+**CORE TYPES & ALLOCATOR** / **PARSERS** / **LOW-MEMORY SSD PATH** / **CLASSIC SORT PATH** / **Parallel mmap parsing** / **EXTERNAL MERGE SORT PATH** / **MULTI-PASS NO-WRITES PATH** / **CLI / MAIN**. Grep `^// =\+$` to jump between sections.
 
-Three sort paths:
+Four sort paths:
 
 - **`--low-mem-ssd`** (recommended for inputs that fit in RAM, ≥ ~1 M reads): two-pass over a flat 16 B-per-read index (`lowMemNode`), with parallel chromosome-level processing in pass 2.
 - **Classic** (default): loads input into a `seqread[]` array, sorts an index array with `radixSort64` over packed `(chrIdx, pos)` 64-bit keys, falls back to `std::sort` below a small-input threshold.
+- **`--multi-pass`** (zero writes, ~1-5× RAM regime): pass 1 streams via `getline`, builds a `(chr, beg-quantum)` histogram, bin-packs into K consecutive groups ≤ `--max-mem`. Passes 2..K+1 re-stream filtering by group, sort + emit. Total reads = (K+1)×file, total writes = 0. SSD-wear-friendly fallback when you don't want temp files.
 - **`--external-merge`** (for inputs > RAM): pass 1 streams via `getline`, fills a per-run buffer up to `--max-mem`, sorts with `radixSort64`, writes a binary compressed temp file (codec via `--merge-codec`, default zstd). Pass 2 is a k-way min-heap merge over all run files. Peak RSS bounded by `--max-mem` regardless of input size. zstd is fastest at scale even vs uncompressed temps because the I/O saved exceeds the compression CPU cost; rans0 (htscodecs, `WITH_BAM=1` only) is even faster on this workload thanks to SIMD-vectorised rANS.
 
 ### Input dispatch

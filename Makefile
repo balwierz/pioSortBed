@@ -1,4 +1,4 @@
-VERSION  = 3.3.0
+VERSION  = 3.4.0
 PREFIX  ?= /usr/local
 
 CC      = g++
@@ -63,7 +63,8 @@ release-binary: src/pioSortBed.o
 		exit 1; \
 	fi
 	$(CC) -o pioSortBed-linux-x86_64 src/pioSortBed.o $(CFLAGS) \
-	    -static-libstdc++ -static-libgcc "$(TBB_LIB)" -lpthread
+	    -static-libstdc++ -static-libgcc "$(TBB_LIB)" \
+	    -Wl,-Bstatic -llz4 -lzstd -Wl,-Bdynamic -lpthread
 
 clean:
 	rm -f src/pioSortBed.o pioSortBed pioSortBed-linux-x86_64

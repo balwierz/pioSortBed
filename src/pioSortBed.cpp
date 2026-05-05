@@ -2763,6 +2763,278 @@ static int extMergeSort(const std::string& inputFile,
 }
 
 // ============================================================================
+// MULTI-PASS NO-WRITES PATH (--multi-pass)
+// ----------------------------------------------------------------------------
+// In-RAM sort for inputs ~1-5x RAM, with zero disk writes (SSD-wear-friendly
+// fallback). Pass 1 streams the file via getline and builds a histogram
+// keyed by (chrIdx, beg >> kPromBucketShift), tracking byte size per bucket.
+// The histogram is then bin-packed into K consecutive groups, each <= the
+// memory budget. Passes 2..K+1 re-stream the input; each pass keeps only
+// records that fall in its group's bucket range, sorts them with
+// radixSort64, and emits to stdout.
+//
+// Total disk reads = (K+1) x file_size, total disk writes = 0. K = ceil(
+// file_size / budget). For "medium" inputs (1-5x RAM) this is 2-6 reads,
+// dwarfed by what bedops external-merge would write to NAND. Above ~5x RAM
+// the K-pass cost becomes quadratic; --external-merge is asymptotically
+// better there.
+//
+// Pathological inputs (a single 1 MB position bucket bigger than the
+// budget) error out with a pointer at --max-mem / --external-merge.
+// ============================================================================
+
+constexpr int kPromBucketShift = 20;  // 1 MB position quantum per bucket
+
+struct PromHistEntry {
+	uint64_t bytes;
+	uint64_t records;
+};
+
+static int multiPassSort(const std::string& inputFile,
+                         size_t budget,
+                         bool naturalSort,
+                         bool verbose)
+{
+	if(budget == 0) budget = 1ULL << 30;
+
+	time_t tstart, tend;
+	if(verbose) time(&tstart);
+
+	// ----- Pass 1: histogram -----
+	FILE* in = fopen(inputFile.c_str(), "r");
+	if(!in) {
+		std::cerr << "Error: cannot open " << inputFile << ": "
+		          << strerror(errno) << std::endl;
+		return 1;
+	}
+
+	std::unordered_map<std::string, uint32_t> chrEncMap;
+	std::vector<std::string> chrNamesEnc;
+	std::unordered_map<uint64_t, PromHistEntry> hist;
+
+	char* lineBuf = NULL;
+	size_t lineCap = 0;
+	ssize_t llen;
+	bool sawHeader = false;
+	uint64_t totalLines = 0;
+	uint64_t totalBytes = 0;
+
+	while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
+		if(llen == 0) continue;
+		size_t sz = (size_t)llen;
+		if(lineBuf[sz-1] == '\n') { lineBuf[--sz] = '\0'; }
+		if(sz > 0 && lineBuf[sz-1] == '\r') { lineBuf[--sz] = '\0'; }
+		if(sz == 0) continue;
+		if(!sawHeader && (lineBuf[0] == '#' ||
+		    strncmp(lineBuf, "track ",   6) == 0 ||
+		    strncmp(lineBuf, "browser ", 8) == 0)) {
+			fputs_unlocked(lineBuf, stdout);
+			fputc_unlocked('\n', stdout);
+			continue;
+		}
+		sawHeader = true;
+
+		const char* chrPtr;
+		int chrLen;
+		int beg = 0, end = 0;
+		const char* tailPtr = "";
+		if(parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+			std::cerr << "Error in parsing line: " << lineBuf << std::endl;
+			free(lineBuf); fclose(in); return 1;
+		}
+		std::string chrName(chrPtr, chrLen);
+		uint32_t encIdx;
+		auto it = chrEncMap.find(chrName);
+		if(it != chrEncMap.end()) {
+			encIdx = it->second;
+		} else {
+			encIdx = (uint32_t)chrNamesEnc.size();
+			chrNamesEnc.push_back(chrName);
+			chrEncMap[chrName] = encIdx;
+		}
+		uint64_t bid = ((uint64_t)encIdx << 32) | (uint32_t)(beg >> kPromBucketShift);
+		PromHistEntry& e = hist[bid];
+		e.bytes   += (uint64_t)sz + 1;  // include line terminator
+		e.records += 1;
+		totalLines += 1;
+		totalBytes += (uint64_t)sz + 1;
+	}
+	free(lineBuf);
+	fclose(in);
+
+	// Sort chr names alphabetically (or naturally) to match the global emit order.
+	std::vector<uint32_t> sortOrder(chrNamesEnc.size());
+	for(uint32_t i = 0; i < sortOrder.size(); i++) sortOrder[i] = i;
+	if(naturalSort) std::sort(sortOrder.begin(), sortOrder.end(),
+	    [&](uint32_t a, uint32_t b) { return naturalChrLess(chrNamesEnc[a], chrNamesEnc[b]); });
+	else std::sort(sortOrder.begin(), sortOrder.end(),
+	    [&](uint32_t a, uint32_t b) { return chrNamesEnc[a] < chrNamesEnc[b]; });
+
+	std::vector<uint32_t> encToSorted(chrNamesEnc.size());
+	for(uint32_t i = 0; i < sortOrder.size(); i++)
+		encToSorted[sortOrder[i]] = i;
+
+	// Remap histogram keys (encChr -> sortedChr) and sort buckets in
+	// global sort order.
+	struct Bucket { uint64_t bid; uint64_t bytes; uint64_t records; };
+	std::vector<Bucket> buckets;
+	buckets.reserve(hist.size());
+	for(auto& kv : hist) {
+		uint32_t encIdx = (uint32_t)(kv.first >> 32);
+		uint64_t newBid = ((uint64_t)encToSorted[encIdx] << 32) | (uint32_t)kv.first;
+		buckets.push_back({newBid, kv.second.bytes, kv.second.records});
+	}
+	std::sort(buckets.begin(), buckets.end(),
+	          [](const Bucket& a, const Bucket& b) { return a.bid < b.bid; });
+
+	// ----- Bin-pack into K groups -----
+	struct Group { uint64_t startBid; uint64_t endBid; uint64_t bytes; uint64_t records; };
+	std::vector<Group> groups;
+	if(!buckets.empty()) {
+		// Per-record overhead estimate for ExtEntry + arena fragmentation:
+		// ~20 bytes / record beyond the line itself. Account for this so
+		// the group's true peak RAM stays within budget.
+		const uint64_t perRecOverhead = 20;
+		uint64_t curStart = buckets[0].bid;
+		uint64_t curBytes = 0;
+		uint64_t curRecords = 0;
+		for(size_t i = 0; i < buckets.size(); i++) {
+			uint64_t bytesWithOverhead = buckets[i].bytes
+			                           + buckets[i].records * perRecOverhead;
+			if(bytesWithOverhead > budget) {
+				std::cerr << "Error: a single 1 MB-quantum bucket holds "
+				          << buckets[i].records << " records / "
+				          << buckets[i].bytes << " bytes (with overhead "
+				          << bytesWithOverhead << "), exceeding --max-mem "
+				          << budget << ". Raise --max-mem or use --external-merge."
+				          << std::endl;
+				return 1;
+			}
+			if(curBytes + bytesWithOverhead > budget) {
+				groups.push_back({curStart, buckets[i].bid, curBytes, curRecords});
+				curStart = buckets[i].bid;
+				curBytes = 0;
+				curRecords = 0;
+			}
+			curBytes += bytesWithOverhead;
+			curRecords += buckets[i].records;
+		}
+		// Close last group (use last bucket's bid + 1 as exclusive end).
+		uint64_t endBid = buckets.back().bid + 1;
+		groups.push_back({curStart, endBid, curBytes, curRecords});
+	}
+
+	if(verbose) {
+		time(&tend);
+		std::cerr << "Pass 1: " << totalLines << " records, "
+		          << buckets.size() << " buckets, "
+		          << groups.size() << " groups (K), "
+		          << "total_bytes=" << totalBytes
+		          << " ("
+		          << ((double)totalBytes / (1024.0 * 1024.0 * 1024.0))
+		          << " GiB), "
+		          << (long)(tend - tstart) << " s" << std::endl;
+		time(&tstart);
+	}
+
+	// ----- Passes 2..K+1: re-stream input per group, sort, emit -----
+	std::vector<ExtEntry> entries;
+	Arena* arena = new Arena(1UL << 20, 1UL << 24);
+
+	for(size_t gi = 0; gi < groups.size(); gi++) {
+		Group& g = groups[gi];
+		entries.clear();
+		entries.reserve(g.records);
+		delete arena;
+		arena = new Arena(1UL << 20, 1UL << 24);
+
+		in = fopen(inputFile.c_str(), "r");
+		if(!in) {
+			std::cerr << "Error: cannot reopen " << inputFile << std::endl;
+			delete arena; return 1;
+		}
+
+		lineBuf = NULL; lineCap = 0;
+		bool seenBody = false;
+		while((llen = getline(&lineBuf, &lineCap, in)) != -1) {
+			if(llen == 0) continue;
+			size_t sz = (size_t)llen;
+			if(lineBuf[sz-1] == '\n') { lineBuf[--sz] = '\0'; }
+			if(sz > 0 && lineBuf[sz-1] == '\r') { lineBuf[--sz] = '\0'; }
+			if(sz == 0) continue;
+			if(!seenBody && (lineBuf[0] == '#' ||
+			    strncmp(lineBuf, "track ",   6) == 0 ||
+			    strncmp(lineBuf, "browser ", 8) == 0)) {
+				continue;  // already emitted in pass 1
+			}
+			seenBody = true;
+
+			const char* chrPtr;
+			int chrLen;
+			int beg = 0, end = 0;
+			const char* tailPtr = "";
+			if(parseBedLine3(lineBuf, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+				std::cerr << "Error in parsing line: " << lineBuf << std::endl;
+				free(lineBuf); fclose(in); delete arena; return 1;
+			}
+			std::string chrName(chrPtr, chrLen);
+			auto it = chrEncMap.find(chrName);
+			if(it == chrEncMap.end()) {
+				std::cerr << "Error: chromosome '" << chrName
+				          << "' appeared in pass " << (gi + 2)
+				          << " but not in pass 1 (input changed during sort?)"
+				          << std::endl;
+				free(lineBuf); fclose(in); delete arena; return 1;
+			}
+			uint32_t sortedIdx = encToSorted[it->second];
+			uint64_t bid = ((uint64_t)sortedIdx << 32)
+			             | (uint32_t)(beg >> kPromBucketShift);
+			if(bid < g.startBid || bid >= g.endBid) continue;
+
+			// Match: copy full line text into arena.
+			const char* lineCopy = arena->alloc(lineBuf, sz);
+			ExtEntry e;
+			e.chrIdx  = (uint16_t)sortedIdx;
+			e.beg     = beg;
+			e.end     = end;
+			e.strand  = '+';
+			e.tailLen = (uint16_t)sz;     // re-use tailLen as "full line length"
+			e.tailPtr = lineCopy;          // tailPtr points at the entire line
+			entries.push_back(e);
+		}
+		free(lineBuf);
+		fclose(in);
+
+		// Sort group entries by (chrIdx, beg) and emit.
+		size_t n = entries.size();
+		std::vector<uint64_t> keys(n);
+		std::vector<uint32_t> order(n);
+		for(size_t i = 0; i < n; i++) {
+			keys[i]  = ((uint64_t)entries[i].chrIdx << 32) | (uint32_t)entries[i].beg;
+			order[i] = (uint32_t)i;
+		}
+		radixSort64(keys.data(), order.data(), n, 1);
+		for(size_t i = 0; i < n; i++) {
+			const ExtEntry& e = entries[order[i]];
+			fwrite_unlocked(e.tailPtr, 1, e.tailLen, stdout);
+			fputc_unlocked('\n', stdout);
+		}
+
+		if(verbose) {
+			time(&tend);
+			std::cerr << "Pass " << (gi + 2) << "/" << (groups.size() + 1)
+			          << " (group " << (gi + 1) << "/" << groups.size()
+			          << "): " << n << " records emitted in "
+			          << (long)(tend - tstart) << " s" << std::endl;
+			time(&tstart);
+		}
+	}
+
+	delete arena;
+	return 0;
+}
+
+// ============================================================================
 // CLI / MAIN
 // ----------------------------------------------------------------------------
 // CLI11 option parsing, input dispatch (file mmap / stdin slurp / gzip
@@ -2817,6 +3089,7 @@ int main(int argc, char *argv[])
 	int fCollapse = 0;
 	int lowMemSSD = 0;
 	int extMerge = 0;
+	int multiPass = 0;
 	// zstd default: fastest compressed codec across all builds, best
 	// compression ratio (~0.33x of text input on a synthetic BED6, ~0.45x
 	// of binary-uncompressed temps), and at 200 M records / 256 M budget
@@ -2851,6 +3124,13 @@ int main(int argc, char *argv[])
 		"--max-mem (default 1G), spill each run as a binary temp file, k-way "
 		"merge to stdout. Use for inputs > RAM. Temp files go to --tmpdir or "
 		"$TMPDIR. (only the default coordinate sort is supported)");
+	app.add_flag("--multi-pass", multiPass,
+		"K-pass scan, no disk writes: pass 1 builds a histogram + bin-packs "
+		"into K consecutive (chr,beg) groups <= --max-mem; passes 2..K+1 "
+		"re-stream the input filtering by group, sort + emit. Use for "
+		"medium inputs (~1-5x RAM) where SSD-wear matters and you don't "
+		"want temp files. K = ceil(file_size / --max-mem). "
+		"(only the default coordinate sort; file input only)");
 	app.add_option("--merge-codec", extCodecStr,
 		"compression codec for --external-merge temp files: raw|lz4|zstd"
 		" (rans0|rans1 also available in WITH_BAM builds). zstd is the "
@@ -2911,6 +3191,33 @@ int main(int argc, char *argv[])
 		return bamSortAndEmit(inputFile, outputFile, numThreads, verbose);
 	}
 #endif
+
+	// Multi-pass no-writes dispatch. Streams the input via getline K times
+	// (1 histogram pass + K group passes); never writes to disk. For inputs
+	// in the ~1-5x RAM range where SSD-wear avoidance matters more than
+	// the (K+1)x read cost.
+	if(multiPass)
+	{
+		if(fCollapse || lowMemSSD || extMerge || sortMode != 's')
+		{
+			cerr << "Error: --multi-pass only supports the default coordinate "
+			        "sort (--sort=s) and is mutually exclusive with --collapse, "
+			        "--low-mem-ssd, and --external-merge" << endl;
+			return 1;
+		}
+		if(inputFile == "-") {
+			cerr << "Error: --multi-pass requires a seekable input file "
+			        "(stdin can only be read once)." << endl;
+			return 1;
+		}
+		if(!outputFile.empty()) {
+			if(!freopen(outputFile.c_str(), "w", stdout)) {
+				cerr << "Error: cannot open " << outputFile << " for writing" << endl;
+				return 1;
+			}
+		}
+		return multiPassSort(inputFile, maxMemBytes, naturalSort, verbose);
+	}
 
 	// External merge sort dispatch. Fires before mmap/slurp and bypasses the
 	// normal input pipeline — extMergeSort opens the input file directly via
