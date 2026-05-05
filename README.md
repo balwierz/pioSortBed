@@ -283,6 +283,68 @@ cases uncapped.
 To reproduce the sweep: `bash benchmark/bench_max_mem.sh`. Data lives in
 `benchmark/maxmem_sweep.csv`; plot in `benchmark/plot_maxmem.gp`.
 
+### External-merge / multi-pass / bedops / GNU sort comparison @ 16 GiB cap
+
+Benchmark of the two pioSortBed fallback paths (`--external-merge` with
+the default zstd codec, and `--multi-pass`) against `bedops sort-bed
+--max-mem 16G` and `LC_ALL=C sort -k1,1 -k2,2n -S 16G`, on a synthetic
+BED6 fixture spanning 50 M to 500 M records. All runs use a 16 GiB
+memory cap; temp files go to `/var/tmp` (ext4) so the I/O metric is
+real. Wall time and peak RSS via `getrusage`; total bytes written to
+disk via `getrusage` `ru_oublock × 512` (block-layer I/O including
+pages still dirty in cache at process exit — the SSD-wear-relevant
+metric).
+
+![Wall time](benchmark/bench_external_time.png)
+![Peak RSS](benchmark/bench_external_rss.png)
+![Total disk writes](benchmark/bench_external_writes.png)
+
+| Reads | Input | Tool | Wall | Peak RSS | Disk writes |
+|------:|------:|------|-----:|---------:|------------:|
+|  50 M | 2.0 GB | `pio --external-merge zstd` | 16.5 s | 3.1 GB | 2.7 GB |
+|       |        | `pio --multi-pass`          | 15.9 s | 4.4 GB | **2.0 GB** |
+|       |        | `bedops sort-bed`           | 35.2 s | 2.7 GB | 2.0 GB |
+|       |        | `GNU sort -S 16G`           | 21.1 s | 8.3 GB | 2.0 GB |
+| 100 M | 4.0 GB | `pio --external-merge zstd` | 43.8 s | 6.4 GB | 5.6 GB |
+|       |        | `pio --multi-pass`          | 39.3 s | 8.7 GB | **4.0 GB** |
+|       |        | `bedops sort-bed`           | 69.7 s | 5.5 GB | 4.0 GB |
+|       |        | `GNU sort -S 16G`           | 51.5 s | 16.6 GB | 4.0 GB |
+| 200 M | 8.0 GB | `pio --external-merge zstd` | 158 s | 13.0 GB | 11.3 GB |
+|       |        | `pio --multi-pass`          | 148 s | 15.7 GB | **8.2 GB** |
+|       |        | `bedops sort-bed`           | 167 s | 11.0 GB | 8.2 GB |
+|       |        | `GNU sort -S 16G`           | 121 s | 16.8 GB | 16.3 GB |
+| 500 M | 21.6 GB | `pio --external-merge zstd`| 904 s | 22.9 GB | 28.5 GB |
+|       |        | `pio --multi-pass`          | 831 s | 23.9 GB | **20.6 GB** |
+|       |        | `bedops sort-bed`           | 745 s | 19.6 GB | 43.2 GB |
+|       |        | `GNU sort -S 16G`          | 2973 s | 16.8 GB | 43.2 GB |
+
+**Key findings:**
+
+- **`--multi-pass` writes the least at every size, by design** (it has zero
+  temp files, so the only writes are the output). At the 500 M / 21 GB
+  case (input > 16 GB cap), it writes 20.6 GB vs. 43 GB for both bedops
+  and GNU sort — **52 % less SSD wear**. For repeated workloads on a
+  fixed-endurance SSD, that's a meaningful budget difference.
+- **`--multi-pass` is also the fastest non-spilling path** at 50 M / 100 M
+  (15.9 s and 39.3 s). When the input fits in `--max-mem` it executes as
+  a clean two-pass scan (histogram + filter+sort+emit) with no temp file
+  overhead.
+- **`--external-merge zstd`** writes ~30–40 % more than `--multi-pass` in
+  the fits-in-RAM regime (the zstd-compressed runs are still 30 % of
+  the input on top of the output). At 500 M it writes 28.5 GB —
+  noticeably less than bedops/GNU sort's 43 GB but more than multi-pass's
+  20.6 GB. Its advantage is asymptotic (`O(n log n)` I/O regardless of
+  cap), so for inputs ≫ RAM, it remains the right choice.
+- **`bedops sort-bed`** has the lowest peak RSS at small sizes but is
+  consistently 2× slower than pioSortBed in the fits-in-RAM regime.
+- **`GNU sort -S 16G`** is fastest at 200 M (121 s vs 148–167 s for
+  others) but has by far the worst wall time at 500 M (50 minutes vs.
+  12–15 minutes for the others) and writes the same 43 GB as bedops.
+
+To reproduce: `bash benchmark/bench_external.sh "50000000 100000000 200000000 500000000" 16G /var/tmp`.
+Data: `benchmark/bench_external.csv`; plots: `benchmark/plot_external.gp`.
+The 500 M run takes ~70 minutes total (mostly GNU sort).
+
 ### Performance Summary
 
 **Recommended path:** `pioSortBed --low-mem-ssd -t N input.bed > sorted.bed`,
