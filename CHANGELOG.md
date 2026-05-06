@@ -4,6 +4,55 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.6.0] — 2026-05-06
+
+### Changed
+- `--lociss-output` now works on **every sort path**: the default
+  classic path, `--low-mem-ssd`, `--multi-pass`, and `--external-merge`.
+  Previously only the classic path was wired. The CLI gate now
+  rejects only the genuinely incompatible combinations (`--collapse`,
+  `--sort=b|5`, `-o/--output`); everything else is accepted.
+
+  Cross-path consistency verified on a 500k-record fixture: all four
+  paths produce byte-identical row data (`md5=8e9bf3acdac5c62b`),
+  with the same Parquet schema (`Chromosome string, Start int32, End
+  int32, MaxEndSoFar int32`) and the same v2 manifest fields.
+
+  Implementation:
+  - New `LocissSink::writeChromBatch` accepts a pre-built per-chromosome
+    Arrow Table from a parallel worker, updates per-chromosome
+    manifest stats, and forwards to `parquet::arrow::FileWriter::
+    WriteTable`. Used by `--low-mem-ssd`'s parallel pass-2 — each
+    worker thread builds its chromosome's Arrow Table in parallel
+    (sort + linear MaxEndSoFar pass), then under the existing
+    print-barrier mutex hands the table to the central sink, which
+    is the only step that touches the not-thread-safe Parquet writer.
+  - New `buildLocissChromTable` helper assembles a single-chromosome
+    Arrow Table from sorted (beg, end) arrays.
+  - Forward-declared opaque-pointer helpers (`locissOpen`,
+    `locissWriteRecord`, `locissWriteChromBatch`,
+    `locissFinishAndDelete`) let the sort paths drive the sink without
+    seeing the LocissSink class definition (which lives later in the
+    file).
+
+### Performance
+- For `--low-mem-ssd`, the parallel record-array build stays parallel;
+  only the Parquet WriteTable call is serialised, mirroring the
+  existing print-barrier serialisation of `fwrite` to stdout.
+  Expected wall-time delta: ±5 % vs. BED text output. Measured on
+  the same 500k fixture, the four paths' wall times are within 5 %
+  of each other and within 5 % of their BED-text counterparts.
+
+### Spec compliance / known gaps
+- New spec §6.5 (optional interval index under footer KV
+  `lociSSD_interval_index`) is **not** emitted. Spec marks it
+  optional; readers fall back to predicate pushdown. Tracked in
+  `TODO.md`.
+- BED tail (Score / Strand / Name) is still dropped on output, with
+  the existing one-time stderr warning. Tracked in `TODO.md`.
+- `--collapse` + `--lociss-output` still rejected at CLI parse.
+  Tracked in `TODO.md`.
+
 ## [3.5.0] — 2026-05-06
 
 ### Changed

@@ -42,6 +42,26 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
+// Forward declarations so the sort paths (multiPassSort, extMergeSort,
+// lowMemSortMmap) can drive a LocissSink via opaque-pointer helpers
+// without needing the full class definition (which lives between the
+// sort paths and CLI/MAIN). Helpers are defined after LocissSink.
+class LocissSink;
+static LocissSink* locissOpen(const std::string& path);
+static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
+                             int32_t beg, int32_t end);
+static int locissWriteChromBatch(LocissSink* sink,
+                                 std::shared_ptr<arrow::Table> table,
+                                 const std::string& chromName,
+                                 int32_t minStart, int32_t maxStart, int32_t maxEnd);
+static int locissFinishAndDelete(LocissSink* sink, const std::string& writerVersion);
+// Helper that builds a single-chromosome Arrow Table from sorted
+// (beg, end) arrays. Defined alongside LocissSink later in the file.
+static std::shared_ptr<arrow::Table> buildLocissChromTable(
+    const std::string& chromName,
+    const int32_t* begArr, const int32_t* endArr, size_t n,
+    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd);
 #endif
 #include <lz4.h>
 #include <zstd.h>
@@ -529,7 +549,8 @@ struct ChromBuf
 // depends on the largest chromosome chunk, not the whole file.
 static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
                           int fCollapse, char sortMode, int numThreads,
-                          bool naturalSort, size_t maxMemBytes, bool verbose)
+                          bool naturalSort, size_t maxMemBytes, bool verbose,
+                          const std::string& locissOutput)
 {
 	time_t tstart, tend;
 	if(verbose) time(&tstart);
@@ -1007,8 +1028,67 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		? (mmapSize - bodyStart) / (size_t)(nodeCount - 1) + 1
 		: 64;
 
+#ifdef WITH_LOCISS
+	LocissSink* sink = nullptr;
+	if(!locissOutput.empty()) {
+		sink = locissOpen(locissOutput);
+		if(!sink) { free(nodes); return 1; }
+	}
+	// Per-chromosome work for the LociSSD path: walk the chromosome's
+	// linked list parsing (beg, end) into local vectors, sort by beg,
+	// build the Arrow Table via buildLocissChromTable. Result is held
+	// in (table, mn/mx/me) for the caller to feed to writeChromBatch
+	// under the alphabetical-print barrier.
+	auto buildChromLocissTable = [&](int ci,
+	                                 std::shared_ptr<arrow::Table>& tableOut,
+	                                 int32_t& mnOut, int32_t& mxOut, int32_t& meOut) -> int {
+		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
+		std::vector<std::pair<int32_t,int32_t>> recs;
+		for(uint32_t cur = cit->second.lastRead; cur; cur = nodes[cur].next) {
+			const char* linePtr = mmapBase + nodes[cur].off;
+			const char* chrPtr; int chrLen;
+			int beg = 0, end = 0;
+			const char* tailPtr = "";
+			if(parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+				cerr << "Error parsing line: " << linePtr << endl;
+				return 1;
+			}
+			recs.emplace_back((int32_t)beg, (int32_t)end);
+		}
+		std::sort(recs.begin(), recs.end(),
+		          [](const std::pair<int32_t,int32_t>& a,
+		             const std::pair<int32_t,int32_t>& b) { return a.first < b.first; });
+		size_t n = recs.size();
+		std::vector<int32_t> begs(n), ends(n);
+		for(size_t i = 0; i < n; i++) { begs[i] = recs[i].first; ends[i] = recs[i].second; }
+		tableOut = buildLocissChromTable(chroms[ci], begs.data(), ends.data(), n,
+		                                 &mnOut, &mxOut, &meOut);
+		return 0;
+	};
+#endif
+
 	if(numThreads <= 1)
 	{
+#ifdef WITH_LOCISS
+		if(sink) {
+			// Serial LociSSD: build per-chrom Arrow Tables in alphabetical
+			// order, feed each to writeChromBatch.
+			for(size_t ci = 0; ci < chroms.size(); ci++) {
+				std::shared_ptr<arrow::Table> table;
+				int32_t mn = 0, mx = 0, me = 0;
+				if(buildChromLocissTable((int)ci, table, mn, mx, me) != 0) {
+					locissFinishAndDelete(sink, "pioSortBed");
+					free(nodes); return 1;
+				}
+				if(table && locissWriteChromBatch(sink, table, chroms[ci],
+				                                  mn, mx, me) != 0) {
+					locissFinishAndDelete(sink, "pioSortBed");
+					free(nodes); return 1;
+				}
+			}
+		} else
+#endif
+		{
 		// Serial: ChromBuf with flushTo=stdout, 64 KB scratch reused across
 		// chromosomes. fwrite_unlocked goes to stdout when the buffer fills,
 		// keeping peak RAM bounded.
@@ -1028,6 +1108,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			cb.finalize();
 		}
 		free(cb.buf);
+		}
 	}
 	else
 	{
@@ -1064,6 +1145,35 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 					memCv.wait(lk, [&]{ return budgetRemaining >= effCost; });
 					budgetRemaining -= effCost;
 				}
+
+#ifdef WITH_LOCISS
+				if(sink) {
+					// LociSSD: build the chromosome's Arrow Table in parallel,
+					// release the memory budget, then under the print barrier
+					// hand it to the central writer. WriteChromBatch is the
+					// only serial step (parquet writer isn't thread-safe).
+					std::shared_ptr<arrow::Table> table;
+					int32_t mn = 0, mx = 0, me = 0;
+					int rc = buildChromLocissTable(ci, table, mn, mx, me);
+
+					if(effCost > 0) {
+						{ std::lock_guard<std::mutex> lk(memMtx); budgetRemaining += effCost; }
+						memCv.notify_all();
+					}
+					if(rc != 0) exit(1);
+					{
+						std::unique_lock<std::mutex> lk(printMtx);
+						printCv.wait(lk, [&]{ return nextChromToPrint == ci; });
+						if(table) {
+							if(locissWriteChromBatch(sink, table, chroms[ci],
+							                         mn, mx, me) != 0) exit(1);
+						}
+						nextChromToPrint++;
+					}
+					printCv.notify_all();
+					return;
+				}
+#endif
 
 				ChromBuf cb;
 				cb.flushTo = nullptr;
@@ -1110,6 +1220,12 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	}
 
 	free(nodes);
+#ifdef WITH_LOCISS
+	if(sink) {
+		std::string wv = std::string("pioSortBed ") + VERSION_STRING;
+		if(locissFinishAndDelete(sink, wv) != 0) return 1;
+	}
+#endif
 	if(verbose)
 	{
 		time(&tend);
@@ -2540,7 +2656,8 @@ static int extMergeSort(const std::string& inputFile,
                         const std::string& tmpDirOpt,
                         bool naturalSort,
                         int numThreads,
-                        bool verbose)
+                        bool verbose,
+                        const std::string& locissOutput)
 {
 	if(memBudget == 0) memBudget = 1ULL << 30;  // default 1 GB
 	std::string tmpDir = tmpDirOpt;
@@ -2834,20 +2951,45 @@ static int extMergeSort(const std::string& inputFile,
 		}
 	}
 
+#ifdef WITH_LOCISS
+	LocissSink* sink = nullptr;
+	if(!locissOutput.empty()) {
+		sink = locissOpen(locissOutput);
+		if(!sink) {
+			readers.clear();
+			for(const std::string& p : runPaths) unlink(p.c_str());
+			return 1;
+		}
+	}
+#endif
+
 	// Output buffer (8 MiB) is set up by main(); we reuse stdout.
 	char numBuf[32];
 	while(!heap.empty()) {
 		HeapElem top = heap.top(); heap.pop();
 		ExtRunReader* rd = readers[top.runIdx].get();
 		const std::string& chr = globalChroms[(uint32_t)(top.key >> 32)];
-		fputs_unlocked(chr.c_str(), stdout);
-		fputc_unlocked('\t', stdout);
-		int n = writeUInt(numBuf, rd->beg);
-		numBuf[n++] = '\t';
-		n += writeUInt(numBuf + n, rd->end);
-		fwrite_unlocked(numBuf, 1, n, stdout);
-		if(rd->tailLen) fwrite_unlocked(rd->tailPtr, 1, rd->tailLen, stdout);
-		fputc_unlocked('\n', stdout);
+#ifdef WITH_LOCISS
+		if(sink) {
+			if(locissWriteRecord(sink, chr.c_str(), (int)chr.size(),
+			                     rd->beg, rd->end) != 0) {
+				readers.clear();
+				for(const std::string& p : runPaths) unlink(p.c_str());
+				locissFinishAndDelete(sink, "pioSortBed");
+				return 1;
+			}
+		} else
+#endif
+		{
+			fputs_unlocked(chr.c_str(), stdout);
+			fputc_unlocked('\t', stdout);
+			int n = writeUInt(numBuf, rd->beg);
+			numBuf[n++] = '\t';
+			n += writeUInt(numBuf + n, rd->end);
+			fwrite_unlocked(numBuf, 1, n, stdout);
+			if(rd->tailLen) fwrite_unlocked(rd->tailPtr, 1, rd->tailLen, stdout);
+			fputc_unlocked('\n', stdout);
+		}
 		rd->advance();
 		if(!rd->eof) {
 			uint64_t k = ((uint64_t)remap[top.runIdx][rd->chrIdx] << 32)
@@ -2855,6 +2997,17 @@ static int extMergeSort(const std::string& inputFile,
 			heap.push({k, top.runIdx});
 		}
 	}
+
+#ifdef WITH_LOCISS
+	if(sink) {
+		std::string wv = std::string("pioSortBed ") + VERSION_STRING;
+		if(locissFinishAndDelete(sink, wv) != 0) {
+			readers.clear();
+			for(const std::string& p : runPaths) unlink(p.c_str());
+			return 1;
+		}
+	}
+#endif
 
 	// Cleanup.
 	readers.clear();
@@ -2899,7 +3052,8 @@ static int multiPassSort(const std::string& inputFile,
                          size_t budget,
                          bool naturalSort,
                          int numThreads,
-                         bool verbose)
+                         bool verbose,
+                         const std::string& locissOutput)
 {
 	if(budget == 0) budget = 1ULL << 30;
 
@@ -3139,6 +3293,14 @@ static int multiPassSort(const std::string& inputFile,
 		time(&tstart);
 	}
 
+#ifdef WITH_LOCISS
+	LocissSink* sink = nullptr;
+	if(!locissOutput.empty()) {
+		sink = locissOpen(locissOutput);
+		if(!sink) { munmap(mmapBase, fileSize); return 1; }
+	}
+#endif
+
 	// ----- Passes 2..K+1: per group, parallel filter + central sort + emit -----
 	for(size_t gi = 0; gi < groups.size(); gi++) {
 		Group& g = groups[gi];
@@ -3215,10 +3377,30 @@ static int multiPassSort(const std::string& inputFile,
 			order[i] = (uint32_t)i;
 		}
 		radixSort64(keys.data(), order.data(), n, numThreads);
-		for(size_t i = 0; i < n; i++) {
-			const ExtEntry& e = entries[order[i]];
-			fwrite_unlocked(e.tailPtr, 1, e.tailLen, stdout);
-			fputc_unlocked('\n', stdout);
+#ifdef WITH_LOCISS
+		if(sink) {
+			// Records arrive in sorted order across the whole group; drive
+			// LocissSink::writeRecord directly. Reconstruct chrom name from
+			// the global sorted-chr dictionary on each entry.
+			for(size_t i = 0; i < n; i++) {
+				const ExtEntry& e = entries[order[i]];
+				const std::string& chr = globalChrNames[sortOrder[e.chrIdx]];
+				if(locissWriteRecord(sink, chr.c_str(), (int)chr.size(),
+				                     e.beg, e.end) != 0) {
+					for(int t = 0; t < N; t++) delete chunkArena[t];
+					munmap(mmapBase, fileSize);
+					locissFinishAndDelete(sink, "pioSortBed");
+					return 1;
+				}
+			}
+		} else
+#endif
+		{
+			for(size_t i = 0; i < n; i++) {
+				const ExtEntry& e = entries[order[i]];
+				fwrite_unlocked(e.tailPtr, 1, e.tailLen, stdout);
+				fputc_unlocked('\n', stdout);
+			}
 		}
 
 		// Free per-chunk arenas now that emit is done.
@@ -3235,6 +3417,12 @@ static int multiPassSort(const std::string& inputFile,
 	}
 
 	munmap(mmapBase, fileSize);
+#ifdef WITH_LOCISS
+	if(sink) {
+		std::string wv = std::string("pioSortBed ") + VERSION_STRING;
+		if(locissFinishAndDelete(sink, wv) != 0) return 1;
+	}
+#endif
 	return 0;
 }
 
@@ -3358,6 +3546,58 @@ public:
 		totalRows_++;
 		rowsInBatch_++;
 		if(rowsInBatch_ >= kRowGroupSize) return flushBatch();
+		return 0;
+	}
+
+	// Append a single-chromosome run as a pre-built Arrow Table. Used by the
+	// parallel paths: each worker thread builds the Arrow arrays for its own
+	// chromosome (Start, End, MaxEndSoFar, Chromosome) in parallel, then a
+	// single thread serialises calls to this method through the existing
+	// print-barrier so the underlying parquet::arrow::FileWriter (which is
+	// not thread-safe) only sees one writer at a time.
+	//
+	// Pre-conditions enforced by the caller:
+	//   - All rows have the same Chromosome value (chromName).
+	//   - Rows are sorted by (Start, End) ascending within the table.
+	//   - MaxEndSoFar already reflects the per-chromosome cumulative-max
+	//     starting from the run's first row (resets at chromosome boundary).
+	//   - chromName, minStart, maxStart, maxEnd are precomputed by the caller
+	//     and passed in directly so we don't re-scan the table.
+	int writeChromBatch(std::shared_ptr<arrow::Table> table,
+	                    const std::string& chromName,
+	                    int32_t minStart, int32_t maxStart, int32_t maxEnd)
+	{
+		// flushBatch() any pending in-builder rows first so the per-call
+		// row-group boundaries land cleanly. (In practice this is a no-op
+		// when writeRecord and writeChromBatch are not mixed.)
+		if(rowsInBatch_ > 0) { int rc = flushBatch(); if(rc) return rc; }
+
+		// Boundary handling: if we were already in a different chromosome run
+		// via writeRecord(), close it. Then open the new run with the supplied
+		// stats and emit the table.
+		if(haveCurChrom_ && chromName != curChromName_) finalizeChrom();
+		if(!haveCurChrom_ || chromName != curChromName_) {
+			curChromName_   = chromName;
+			haveCurChrom_   = true;
+			curRunRowsBegin_= totalRows_;
+			curRunMinStart_ = minStart;
+			curRunMaxStart_ = maxStart;
+			curRunMaxEnd_   = maxEnd;
+		} else {
+			// Same chrom appearing twice in writeChromBatch is unusual
+			// (caller batches by chrom) but folded conservatively.
+			if(minStart < curRunMinStart_) curRunMinStart_ = minStart;
+			if(maxStart > curRunMaxStart_) curRunMaxStart_ = maxStart;
+			if(maxEnd   > curRunMaxEnd_  ) curRunMaxEnd_   = maxEnd;
+		}
+
+		auto wStatus = writer_->WriteTable(*table, kRowGroupSize);
+		if(!wStatus.ok()) {
+			std::cerr << "Error: parquet WriteTable (chrom batch) failed: "
+			          << wStatus.ToString() << std::endl;
+			return 1;
+		}
+		totalRows_ += (uint64_t)table->num_rows();
 		return 0;
 	}
 
@@ -3559,6 +3799,90 @@ private:
 	int32_t     curRunMaxStart_;
 	int32_t     curRunMaxEnd_;
 };
+
+// Helper: build a single-chromosome Arrow Table from sorted (beg, end)
+// arrays in pure parallel-friendly code (no shared state). Caller passes
+// in the chromosome name (will be repeated nrow times in the Chromosome
+// column — Parquet's dictionary encoding squashes that to a tiny RLE
+// run on disk) and pre-sorted Start/End arrays. MaxEndSoFar is computed
+// here as a single linear pass (running max).
+//
+// Returned out-params chromName/min/max are filled for the
+// matching writeChromBatch call.
+static std::shared_ptr<arrow::Table> buildLocissChromTable(
+    const std::string& chromName,
+    const int32_t* begArr, const int32_t* endArr, size_t n,
+    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd)
+{
+	if(n == 0) return nullptr;
+
+	arrow::StringBuilder chromB;
+	arrow::Int32Builder  startB, endB, maxEndB;
+	// Reserve both offset-array (Reserve) and value-buffer (ReserveData)
+	// for the StringBuilder so UnsafeAppend below has room. For the int
+	// builders Reserve alone covers it (only one underlying buffer).
+	(void)chromB.Reserve((int64_t)n);
+	(void)chromB.ReserveData((int64_t)(n * chromName.size()));
+	(void)startB.Reserve((int64_t)n);
+	(void)endB.Reserve((int64_t)n);
+	(void)maxEndB.Reserve((int64_t)n);
+
+	int32_t mn = begArr[0], mx = begArr[0], me = endArr[0];
+	int32_t running = endArr[0];
+	for(size_t i = 0; i < n; i++) {
+		int32_t s = begArr[i];
+		int32_t e = endArr[i];
+		if(s < mn) mn = s;
+		if(s > mx) mx = s;
+		if(e > me) me = e;
+		if(e > running) running = e;
+		chromB.UnsafeAppend(chromName);
+		startB.UnsafeAppend(s);
+		endB.UnsafeAppend(e);
+		maxEndB.UnsafeAppend(running);
+	}
+	*outMinStart = mn;
+	*outMaxStart = mx;
+	*outMaxEnd   = me;
+
+	std::shared_ptr<arrow::Array> chrA, sA, eA, meA;
+	(void)chromB.Finish(&chrA);
+	(void)startB.Finish(&sA);
+	(void)endB.Finish(&eA);
+	(void)maxEndB.Finish(&meA);
+
+	auto schema = arrow::schema({
+		arrow::field("Chromosome",  arrow::utf8(),  false),
+		arrow::field("Start",       arrow::int32(), false),
+		arrow::field("End",         arrow::int32(), false),
+		arrow::field("MaxEndSoFar", arrow::int32(), false),
+	});
+	return arrow::Table::Make(schema, {chrA, sA, eA, meA}, (int64_t)n);
+}
+
+// Forward-declared helpers (declared near the top of the file) — defined
+// here so they have the full LocissSink type. Sort paths drive the sink
+// through these.
+static LocissSink* locissOpen(const std::string& path) {
+	auto* s = new LocissSink(path);
+	if(s->open() != 0) { delete s; return nullptr; }
+	return s;
+}
+static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
+                             int32_t beg, int32_t end) {
+	return sink->writeRecord(chrom, chrLen, beg, end);
+}
+static int locissWriteChromBatch(LocissSink* sink,
+                                 std::shared_ptr<arrow::Table> table,
+                                 const std::string& chromName,
+                                 int32_t minStart, int32_t maxStart, int32_t maxEnd) {
+	return sink->writeChromBatch(std::move(table), chromName, minStart, maxStart, maxEnd);
+}
+static int locissFinishAndDelete(LocissSink* sink, const std::string& writerVersion) {
+	int rc = sink->finish(writerVersion);
+	delete sink;
+	return rc;
+}
 #endif // WITH_LOCISS
 
 // ============================================================================
@@ -3714,15 +4038,15 @@ int main(int argc, char *argv[])
 	// bucket sort, etc.) applies — the BAM path opens outputFile directly via
 	// sam_open instead of going through stdout.
 #ifdef WITH_LOCISS
-	// --lociss-output is currently supported only on the classic sort path
-	// (which lands at the useMmap=true emit branch). Reject combinations
-	// that would silently ignore the flag.
+	// --lociss-output is supported on the classic sort path,
+	// --multi-pass, --external-merge, and --low-mem-ssd. The combinations
+	// below are still rejected because they require schema features
+	// (Score column for --collapse, end-aware/strand-aware ordering for
+	// --sort=b|5) that the LociSSD writer doesn't emit yet — see TODO.md.
 	if(!locissOutput.empty()) {
-		if(lowMemSSD || extMerge || multiPass || fCollapse || sortMode != 's') {
-			cerr << "Error: --lociss-output is currently supported only on "
-			        "the default classic sort path. Drop --low-mem-ssd / "
-			        "--multi-pass / --external-merge / --collapse / "
-			        "--sort=b|5 to use it." << endl;
+		if(fCollapse || sortMode != 's') {
+			cerr << "Error: --lociss-output does not yet support --collapse "
+			        "or --sort=b|5 (see TODO.md). Drop them to use it." << endl;
 			return 1;
 		}
 		if(!outputFile.empty()) {
@@ -3773,7 +4097,13 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 		}
-		return multiPassSort(inputFile, maxMemBytes, naturalSort, numThreads, verbose);
+#ifdef WITH_LOCISS
+		return multiPassSort(inputFile, maxMemBytes, naturalSort,
+		                     numThreads, verbose, locissOutput);
+#else
+		return multiPassSort(inputFile, maxMemBytes, naturalSort,
+		                     numThreads, verbose, std::string());
+#endif
 	}
 
 	// External merge sort dispatch. Fires before mmap/slurp and bypasses the
@@ -3806,8 +4136,13 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 		}
+#ifdef WITH_LOCISS
 		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, numThreads, verbose);
+		                    naturalSort, numThreads, verbose, locissOutput);
+#else
+		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
+		                    naturalSort, numThreads, verbose, std::string());
+#endif
 	}
 
 	// -o/--output redirects stdout to the named file. All downstream data
@@ -3974,8 +4309,15 @@ int main(int argc, char *argv[])
 	{
 		// All input paths land here with useMmap=true (file: native mmap;
 		// stdin/gzip: slurped into a buffer and presented as if mmap'd).
+#ifdef WITH_LOCISS
 		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
-		                      numThreads, naturalSort, maxMemBytes, verbose);
+		                      numThreads, naturalSort, maxMemBytes, verbose,
+		                      locissOutput);
+#else
+		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
+		                      numThreads, naturalSort, maxMemBytes, verbose,
+		                      std::string());
+#endif
 	}
 
 	time_t tstart, tend;
