@@ -294,35 +294,42 @@ memory caps:
 - **4 GiB cap**, sizes 10 M – 200 M reads. Spill is triggered for every
   tool at 100 M+ where the 4 GB input matches the cap.
 
-Temp files go to `/var/tmp` (ext4) so the I/O metric is real. Wall time
-and peak RSS via `getrusage`; total bytes written to disk via `getrusage`
+All tools run with the same explicit thread count (`-t 8` for pioSortBed
+and `--parallel=8` for GNU sort; `bedops sort-bed` is single-threaded
+by design — the table notes that as `T=1`). Temp files go to `/var/tmp`
+(ext4) so the I/O metric is real. Wall time and peak RSS via
+`getrusage`; total bytes written to disk via `getrusage`
 `ru_oublock × 512` (block-layer I/O including pages still dirty in cache
 at process exit — the SSD-wear-relevant metric).
 
-#### 4 GiB cap
+#### 4 GiB cap, 8 threads
 
-![Wall time @ 4G](benchmark/bench_external_4G_time.png)
-![Peak RSS @ 4G](benchmark/bench_external_4G_rss.png)
-![Total disk writes @ 4G](benchmark/bench_external_4G_writes.png)
+![Wall time @ 4G / -t 8](benchmark/bench_external_4G_t8_time.png)
+![Peak RSS @ 4G / -t 8](benchmark/bench_external_4G_t8_rss.png)
+![Total disk writes @ 4G / -t 8](benchmark/bench_external_4G_t8_writes.png)
 
-| Reads | Input | Tool | Wall | Peak RSS | Disk writes |
-|------:|------:|------|-----:|---------:|------------:|
-|  10 M | 0.4 GB | `pio --external-merge zstd` | 3.0 s | 638 MB | 0.5 GB |
-|       |        | `pio --multi-pass`          | 2.2 s | 868 MB | **0.4 GB** |
-|       |        | `bedops sort-bed`           | 6.6 s | 548 MB | 0.4 GB |
-|       |        | `GNU sort -S 4G`            | 3.5 s | 1.6 GB | 0.4 GB |
-|  50 M | 2.0 GB | `pio --external-merge zstd` | 16.1 s | 3.2 GB | 2.7 GB |
-|       |        | `pio --multi-pass`          | 14.8 s | 4.4 GB | **2.0 GB** |
-|       |        | `bedops sort-bed`           | 35.4 s | 2.7 GB | 2.0 GB |
-|       |        | `GNU sort -S 4G`            | 22.5 s | 4.2 GB | 4.2 GB |
-| 100 M | 4.0 GB | `pio --external-merge zstd` | 42.6 s | 6.3 GB | 5.6 GB |
-|       |        | `pio --multi-pass`          | 36.0 s | 6.0 GB | **4.2 GB** |
-|       |        | `bedops sort-bed`           | 120 s  | 4.9 GB | 8.5 GB |
-|       |        | `GNU sort -S 4G`            | 52.6 s | 4.2 GB | 8.5 GB |
-| 200 M | 8.0 GB | `pio --external-merge zstd` | 78.5 s | 6.3 GB | 11.3 GB |
-|       |        | `pio --multi-pass`          | 101 s  | 6.0 GB | **8.6 GB** |
-|       |        | `bedops sort-bed`           | 243 s  | 4.9 GB | 17.1 GB |
-|       |        | `GNU sort -S 4G`            | 126 s  | 4.2 GB | 17.1 GB |
+| Reads | Input | Tool | T | Wall | Peak RSS | Disk writes |
+|------:|------:|------|--:|-----:|---------:|------------:|
+|  10 M | 0.4 GB | `pio --external-merge zstd` | 8 | 1.2 s  | 1.0 GB | 0.5 GB |
+|       |        | `pio --multi-pass`          | 8 | 1.3 s  | 1.3 GB | **0.4 GB** |
+|       |        | `bedops sort-bed`           | 1 | 6.4 s  | 0.5 GB | 0.4 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 3.6 s  | 1.6 GB | 0.4 GB |
+|  50 M | 2.0 GB | `pio --external-merge zstd` | 8 | **6.0 s** | 5.1 GB | 2.7 GB |
+|       |        | `pio --multi-pass`          | 8 | 7.2 s  | 6.4 GB | **2.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 35.5 s | 2.7 GB | 2.0 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 23.2 s | 4.2 GB | 4.2 GB |
+| 100 M | 4.0 GB | `pio --external-merge zstd` | 8 | **14.7 s** | 8.8 GB | 5.4 GB |
+|       |        | `pio --multi-pass`          | 8 | 17.4 s | 10.2 GB | **4.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 125 s  | 4.9 GB | 8.5 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 54.4 s | 4.2 GB | 8.5 GB |
+| 200 M | 8.0 GB | `pio --external-merge zstd` | 8 | **30.2 s** | 13.2 GB | 10.9 GB |
+|       |        | `pio --multi-pass`          | 8 | 33.9 s | 14.6 GB | **8.2 GB** |
+|       |        | `bedops sort-bed`           | 1 | 242 s  | 4.9 GB | 17.1 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 121 s  | 4.2 GB | 17.1 GB |
+
+> **Note** — the 16 GiB-cap table below was collected on v3.4.0 before
+> parallel parsing landed; pio's wall-times in that table do **not**
+> reflect the v3.5.0 speedup and will be re-run.
 
 #### 16 GiB cap
 
@@ -349,31 +356,26 @@ at process exit — the SSD-wear-relevant metric).
 |       |        | `bedops sort-bed`           | 745 s | 19.6 GB | 43.2 GB |
 |       |        | `GNU sort -S 16G`          | 2973 s | 16.8 GB | 43.2 GB |
 
-**Key findings:**
+**Key findings (4 GiB cap, 8 threads):**
 
-- **`--multi-pass` writes the least at every size and budget, by design**
-  (zero temp files, so writes = output bytes only). The win compounds
-  at the tighter 4 GiB cap: at 200 M / 4 GiB, multi-pass writes
-  8.6 GB vs 17.1 GB for bedops and GNU sort — **50 % less NAND wear**.
-  At the 16 GiB / 500 M case (input ≫ cap), multi-pass writes 20.6 GB
-  vs 43.2 GB — same 50 % saving.
-- **Tighter budget is sometimes *faster*** for pio at large sizes:
-  `pio --external-merge` runs 200 M in 78 s with a 4 GiB cap vs. 158 s
-  with a 16 GiB cap. The tighter cap keeps the working set well below
-  RAM, avoiding swap pressure that hurts the looser-budget runs once
-  total RSS approaches system RAM (30 GiB on the bench laptop).
-- **`pio --external-merge zstd`** writes ~30–40 % more than
-  `--multi-pass` (the zstd-compressed temp runs are still ~30 % of the
-  input). It is asymptotically better for inputs ≫ RAM (`O(n log n)`
-  I/O regardless of cap), so for very large inputs where multi-pass's
-  `(K+1)×file` reads become quadratic, external-merge takes the lead.
-- **`bedops sort-bed`** has the lowest peak RSS but is consistently
-  2–3× slower than pioSortBed and writes 2× more than `--multi-pass`
+- **`pio --external-merge -t 8`** is the **fastest** at every size:
+  4–7× faster than bedops (single-threaded by design) and 3–4× faster
+  than `GNU sort --parallel=8`. Its zstd-compressed temp runs cost a
+  ~30 % write overhead vs. multi-pass (zstd packs the binary records
+  to ~0.45× of input size) but it scales asymptotically as input ≫
+  cap.
+- **`pio --multi-pass -t 8`** writes the **least** at every size, by
+  design (zero temp files; writes = output bytes only). At
+  200 M / 4 GiB cap (input 2× cap) it writes 8.2 GB vs 17.1 GB for
+  bedops and GNU sort — **52 % less NAND wear** — and is still the
+  second-fastest tool at this scale, only ~12 % slower than
+  `--external-merge`.
+- **`bedops sort-bed`** is single-threaded; it is consistently 4–8×
+  slower than the parallel pio paths at sizes ≥ 50 M. Lowest peak RSS
+  among the four (~5 GB at 200 M).
+- **`GNU sort --parallel=8`** is the parallel pio paths' closest
+  competitor on wall time but writes 2× more than `--multi-pass`
   whenever it spills (every 100 M+ run at 4 GiB cap).
-- **`GNU sort -S <cap>`** is competitive on time when the input fits
-  in budget but is catastrophically slow when it spills hard — 50 min
-  on 500 M / 16 GiB cap vs 12–15 min for the others. Its writes match
-  bedops's (output + full input as temp).
 
 To reproduce:
 ```bash
