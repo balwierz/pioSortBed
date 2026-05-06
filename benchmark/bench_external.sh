@@ -1,14 +1,22 @@
 #!/bin/bash
 # Benchmark pioSortBed --external-merge and --multi-pass against bedops
-# sort-bed and GNU sort, with a fixed memory cap (default 16 GiB), as a
-# function of input size. Reports wall time, peak RSS, and total bytes
-# written to disk (via /proc/PID/io write_bytes).
+# sort-bed and GNU sort, with a fixed memory cap and a fixed thread
+# count, as a function of input size. Reports wall time, peak RSS, and
+# total bytes written to disk (via getrusage ru_oublock).
+#
+# Tools differ in how they consume the thread count:
+#   pio --external-merge / --multi-pass  -t N           (parallel)
+#   GNU sort                              --parallel=N  (parallel)
+#   bedops sort-bed                       (always 1 core; inherently serial)
+# The CSV records `threads` = N for every row so the reader can tell
+# which run is which; bedops reports its actual core count (1) too.
 #
 # Usage:
-#   bash benchmark/bench_external.sh "<sizes>" <budget> <tmpdir>
+#   bash benchmark/bench_external.sh "<sizes>" <budget> <tmpdir> <threads>
 # Defaults: sizes "10000000 50000000 100000000 200000000 500000000"
 #           budget 16G
 #           tmpdir /var/tmp
+#           threads 8
 
 set -e
 cd "$(dirname "$0")/.."
@@ -16,6 +24,7 @@ cd "$(dirname "$0")/.."
 SIZES="${1:-10000000 50000000 100000000 200000000 500000000}"
 BUDGET="${2:-16G}"
 TMPDIR_BENCH="${3:-/var/tmp}"
+THREADS="${4:-8}"
 
 PIO=./pioSortBed
 RUN_TMP="$TMPDIR_BENCH/extbench_runs"
@@ -28,9 +37,9 @@ if [[ ! -x "$PIO" ]]; then
     exit 1
 fi
 
-# Per-budget CSV file so multiple runs don't clobber each other.
-CSV="benchmark/bench_external_${BUDGET}.csv"
-echo "tool,reads,input_bytes,wall_s,peak_rss_kb,fs_writes_blocks_512,fs_reads_blocks_512,fs_writes_bytes,fs_reads_bytes" > "$CSV"
+# Per-budget × per-threads CSV file so multiple runs don't clobber each other.
+CSV="benchmark/bench_external_${BUDGET}_t${THREADS}.csv"
+echo "tool,threads,reads,input_bytes,wall_s,peak_rss_kb,fs_writes_blocks_512,fs_reads_blocks_512,fs_writes_bytes,fs_reads_bytes" > "$CSV"
 
 # Run a command, capture wall, peak RSS, and File system inputs/outputs
 # via /usr/bin/time -v. ru_oublock / ru_inblock count block-level I/O
@@ -90,13 +99,14 @@ for i in range(n):
     fi
     INPUT_BYTES=$(stat -c '%s' "$BENCH_FILE")
     echo ""
-    echo "=== reads=$n input=$(numfmt --to=iec --suffix=B $INPUT_BYTES) budget=$BUDGET ==="
-    printf "%-22s  %8s  %10s  %14s  %14s\n" \
-        "tool" "wall_s" "peak_RSS" "fs_writes_MB" "fs_reads_MB"
-    printf "%s\n" "----------------------  --------  ----------  --------------  --------------"
+    echo "=== reads=$n input=$(numfmt --to=iec --suffix=B $INPUT_BYTES) budget=$BUDGET threads=$THREADS ==="
+    printf "%-22s  %3s  %8s  %10s  %14s  %14s\n" \
+        "tool" "T" "wall_s" "peak_RSS" "fs_writes_MB" "fs_reads_MB"
+    printf "%s\n" "----------------------  ---  --------  ----------  --------------  --------------"
 
     run_one() {
-        local label="$1" csv_label="$2"; shift 2
+        # $1 label, $2 csv_label, $3 threads_actual (1 for bedops, $THREADS otherwise), then cmd
+        local label="$1" csv_label="$2" tactual="$3"; shift 3
         drop_fcache "$BENCH_FILE"
         rm -f "$RUN_TMP"/piosort.run.*.tmp 2>/dev/null
         local res wall peak wb rb
@@ -106,22 +116,22 @@ for i in range(n):
         local rb_bytes=$((rb * 512))
         local wb_mb=$(awk -v b=$wb_bytes 'BEGIN{printf "%.1f", b/1048576}')
         local rb_mb=$(awk -v b=$rb_bytes 'BEGIN{printf "%.1f", b/1048576}')
-        printf "%-22s  %8.2f  %8s KB  %14s  %14s\n" "$label" "$wall" "$peak" "$wb_mb" "$rb_mb"
-        echo "$csv_label,$n,$INPUT_BYTES,$wall,$peak,$wb,$rb,$wb_bytes,$rb_bytes" >> "$CSV"
+        printf "%-22s  %3s  %8.2f  %8s KB  %14s  %14s\n" "$label" "$tactual" "$wall" "$peak" "$wb_mb" "$rb_mb"
+        echo "$csv_label,$tactual,$n,$INPUT_BYTES,$wall,$peak,$wb,$rb,$wb_bytes,$rb_bytes" >> "$CSV"
     }
 
-    run_one "pio --external-merge" "pio-extmerge-zstd" \
-        "$PIO" --external-merge --merge-codec zstd \
+    run_one "pio --external-merge" "pio-extmerge-zstd" "$THREADS" \
+        "$PIO" --external-merge --merge-codec zstd -t "$THREADS" \
                --max-mem "$BUDGET" --tmpdir "$RUN_TMP" "$BENCH_FILE"
 
-    run_one "pio --multi-pass" "pio-multipass" \
-        "$PIO" --multi-pass --max-mem "$BUDGET" "$BENCH_FILE"
+    run_one "pio --multi-pass" "pio-multipass" "$THREADS" \
+        "$PIO" --multi-pass -t "$THREADS" --max-mem "$BUDGET" "$BENCH_FILE"
 
-    run_one "bedops sort-bed" "bedops-sort-bed" \
+    run_one "bedops sort-bed" "bedops-sort-bed" "1" \
         sort-bed --max-mem "$BUDGET" --tmpdir "$RUN_TMP" "$BENCH_FILE"
 
-    run_one "GNU sort -S $BUDGET" "gnu-sort" \
-        sort -k1,1 -k2,2n -S "$BUDGET" -T "$RUN_TMP" "$BENCH_FILE"
+    run_one "GNU sort -S $BUDGET" "gnu-sort" "$THREADS" \
+        sort -k1,1 -k2,2n -S "$BUDGET" --parallel="$THREADS" -T "$RUN_TMP" "$BENCH_FILE"
 
     rm -f "$OUT_FILE" "$RUN_TMP"/piosort.run.*.tmp
 done
