@@ -327,34 +327,35 @@ at process exit — the SSD-wear-relevant metric).
 |       |        | `bedops sort-bed`           | 1 | 242 s  | 4.9 GB | 17.1 GB |
 |       |        | `GNU sort --parallel=8`     | 8 | 121 s  | 4.2 GB | 17.1 GB |
 
-> **Note** — the 16 GiB-cap table below was collected on v3.4.0 before
-> parallel parsing landed; pio's wall-times in that table do **not**
-> reflect the v3.5.0 speedup and will be re-run.
+#### 16 GiB cap, 8 threads
 
-#### 16 GiB cap
+![Wall time @ 16G / -t 8](benchmark/bench_external_16G_t8_time.png)
+![Peak RSS @ 16G / -t 8](benchmark/bench_external_16G_t8_rss.png)
+![Total disk writes @ 16G / -t 8](benchmark/bench_external_16G_t8_writes.png)
 
-![Wall time @ 16G](benchmark/bench_external_16G_time.png)
-![Peak RSS @ 16G](benchmark/bench_external_16G_rss.png)
-![Total disk writes @ 16G](benchmark/bench_external_16G_writes.png)
+| Reads | Input | Tool | T | Wall | Peak RSS | Disk writes |
+|------:|------:|------|--:|-----:|---------:|------------:|
+|  50 M | 2.0 GB | `pio --external-merge zstd` | 8 | **6.0 s**  | 5.1 GB  | 2.7 GB |
+|       |        | `pio --multi-pass`          | 8 | 7.0 s      | 6.4 GB  | **2.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 36.2 s     | 2.7 GB  | 2.0 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 20.6 s     | 8.3 GB  | 2.0 GB |
+| 100 M | 4.0 GB | `pio --external-merge zstd` | 8 | **12.8 s** | 10.1 GB | 5.4 GB |
+|       |        | `pio --multi-pass`          | 8 | 16.8 s     | 12.9 GB | **4.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 71.3 s     | 5.5 GB  | 4.0 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 49.0 s     | 16.6 GB | 4.0 GB |
+| 200 M | 8.0 GB | `pio --external-merge zstd` | 8 | **27.6 s** | 20.1 GB | 10.8 GB |
+|       |        | `pio --multi-pass`          | 8 | 39.5 s     | 20.3 GB | **8.2 GB** |
+|       |        | `bedops sort-bed`           | 1 | 160 s      | 10.9 GB | 8.2 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 125 s      | 16.8 GB | 16.3 GB |
+| 500 M | 21.6 GB | `pio --external-merge zstd`| 8 | **82.9 s** | 21.5 GB | 27.2 GB |
+|       |        | `pio --multi-pass`          | 8 | 122 s      | 24.7 GB | **20.6 GB** |
+|       |        | `bedops sort-bed`           | 1 | 708 s      | 19.6 GB | 41.2 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 332 s      | 16.8 GB | 41.2 GB |
 
-| Reads | Input | Tool | Wall | Peak RSS | Disk writes |
-|------:|------:|------|-----:|---------:|------------:|
-|  50 M | 2.0 GB | `pio --external-merge zstd` | 16.5 s | 3.1 GB | 2.7 GB |
-|       |        | `pio --multi-pass`          | 15.9 s | 4.4 GB | **2.0 GB** |
-|       |        | `bedops sort-bed`           | 35.2 s | 2.7 GB | 2.0 GB |
-|       |        | `GNU sort -S 16G`           | 21.1 s | 8.3 GB | 2.0 GB |
-| 100 M | 4.0 GB | `pio --external-merge zstd` | 43.8 s | 6.4 GB | 5.6 GB |
-|       |        | `pio --multi-pass`          | 39.3 s | 8.7 GB | **4.0 GB** |
-|       |        | `bedops sort-bed`           | 69.7 s | 5.5 GB | 4.0 GB |
-|       |        | `GNU sort -S 16G`           | 51.5 s | 16.6 GB | 4.0 GB |
-| 200 M | 8.0 GB | `pio --external-merge zstd` | 158 s | 13.0 GB | 11.3 GB |
-|       |        | `pio --multi-pass`          | 148 s | 15.7 GB | **8.2 GB** |
-|       |        | `bedops sort-bed`           | 167 s | 11.0 GB | 8.2 GB |
-|       |        | `GNU sort -S 16G`           | 121 s | 16.8 GB | 16.3 GB |
-| 500 M | 21.6 GB | `pio --external-merge zstd`| 904 s | 22.9 GB | 28.5 GB |
-|       |        | `pio --multi-pass`          | 831 s | 23.9 GB | **20.6 GB** |
-|       |        | `bedops sort-bed`           | 745 s | 19.6 GB | 43.2 GB |
-|       |        | `GNU sort -S 16G`          | 2973 s | 16.8 GB | 43.2 GB |
+At the 500 M / 21 GB / 16 GiB-cap case (input ≫ cap, all tools spill or
+multi-pass): **`pio --external-merge -t 8` is 4× faster than GNU sort
+and 9× faster than bedops**, while `pio --multi-pass -t 8` writes
+**52 % less** than either alternative.
 
 **Key findings (4 GiB cap, 8 threads):**
 
@@ -379,12 +380,15 @@ at process exit — the SSD-wear-relevant metric).
 
 To reproduce:
 ```bash
-bash benchmark/bench_external.sh "10000000 50000000 100000000 200000000" 4G /var/tmp
-bash benchmark/bench_external.sh "50000000 100000000 200000000 500000000" 16G /var/tmp
+bash benchmark/bench_external.sh "10000000 50000000 100000000 200000000" 4G /var/tmp 8
+bash benchmark/bench_external.sh "50000000 100000000 200000000 500000000" 16G /var/tmp 8
 ```
-Data: `benchmark/bench_external_4G.csv` / `bench_external_16G.csv`. Plots
-via `gnuplot -e "BUDGET='4G'" benchmark/plot_external.gp` (or `'16G'`).
-The 500 M run takes ~70 minutes total (mostly GNU sort spilling).
+Data: `benchmark/bench_external_4G_t8.csv` /
+`bench_external_16G_t8.csv`. Plots via
+`gnuplot -e "BUDGET='4G';THREADS=8" benchmark/plot_external.gp` (or
+`'16G'`). The 500 M / 16 GiB run takes ~25 minutes total (down from
+~70 minutes in v3.4.0; v3.5.0's parallel parsing + GNU sort's
+`--parallel=8` both cut their respective costs ~3–11×).
 
 ### Performance Summary
 
