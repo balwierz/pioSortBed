@@ -16,12 +16,6 @@ None of these block existing functionality.
   - Anything past the recognised columns: catch-all `Tail` string
     column.
 
-- **§6.5 optional interval index** — Arrow IPC stream embedded under
-  footer KV `lociSSD_interval_index`. Optional in the spec; readers
-  fall back to predicate pushdown if absent. Worth adding if/when a
-  reader actually needs row-precision pruning instead of row-group
-  precision.
-
 - **`--collapse` + `--lociss-output`** — currently rejected at CLI
   parse. Could emit the collapsed weight as a `Score` column
   (`double` or `int32`). Needs design clarity on what column name

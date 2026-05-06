@@ -4,6 +4,50 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.7.0] — 2026-05-06
+
+### Added
+- Optional spec §6.5 **interval index** under footer KV
+  `lociSSD_interval_index`: an Arrow IPC stream (zstd-compressed)
+  encoding a single Arrow Table with one row per chromosome and
+  large_list<int64> columns `starts` / `ends` / `max_end_running` /
+  `row_id`. Enables row-precision pruning for region queries (vs.
+  the §7 predicate pushdown's row-group precision).
+
+  Opt-in via the new `--lociss-index` flag (default OFF). Memory
+  cost ~24 B/record retained in RAM until output finalises (no
+  streaming yet — the per-chromosome lists are accumulated and the
+  blob is built in one pass at finish() time). For a 200 M-record
+  fixture that's ~4.8 GiB of extra RAM during the sort.
+
+  Spec compliance:
+  - Schema fields exactly match §6.5: `chromosome` (string),
+    `starts`, `ends`, `max_end_running`, `row_id` (all
+    `large_list<int64>`).
+  - Schema-level metadata `lociSSD_index_format_version = "1"`.
+  - One row per chromosome, in storage order.
+  - `max_end_running` mirrors the data column's `MaxEndSoFar`
+    (per-chromosome cumulative max, resets at chromosome boundary).
+  - `row_id[i] = chromStat.rowOffset + i` (sequential within each
+    chromosome).
+  - Arrow IPC stream zstd-compressed before embedding (level 3).
+
+  Cross-path consistency verified on 500k records / 22 chromosomes:
+  all four sort paths (default classic, --low-mem-ssd, --multi-pass,
+  --external-merge) produce **byte-identical** index blobs
+  (compressed = 4.04 MB, md5=0c970873ec6375b3) and identical row
+  data (md5=8e9bf3acdac5c62b from v3.6.0 verification).
+
+  The accumulator captures from both `LocissSink::writeRecord`
+  (per-record append; used by classic / multi-pass / external-merge)
+  and `LocissSink::writeChromBatch` (extracts Start/End/MaxEndSoFar
+  from the caller's Arrow Table chunk-by-chunk; used by
+  --low-mem-ssd's parallel chrom emit).
+
+### TODO
+- The §6.5 interval-index TODO entry has been removed from
+  `TODO.md` (now implemented).
+
 ## [3.6.0] — 2026-05-06
 
 ### Changed

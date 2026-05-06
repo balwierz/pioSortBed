@@ -35,6 +35,8 @@
 #ifdef WITH_LOCISS
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <arrow/io/memory.h>
+#include <arrow/ipc/writer.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 #include <parquet/types.h>
@@ -48,7 +50,7 @@
 // without needing the full class definition (which lives between the
 // sort paths and CLI/MAIN). Helpers are defined after LocissSink.
 class LocissSink;
-static LocissSink* locissOpen(const std::string& path);
+static LocissSink* locissOpen(const std::string& path, bool buildIndex = false);
 static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
                              int32_t beg, int32_t end);
 static int locissWriteChromBatch(LocissSink* sink,
@@ -550,7 +552,8 @@ struct ChromBuf
 static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
                           int fCollapse, char sortMode, int numThreads,
                           bool naturalSort, size_t maxMemBytes, bool verbose,
-                          const std::string& locissOutput)
+                          const std::string& locissOutput,
+                          bool locissIndex)
 {
 	time_t tstart, tend;
 	if(verbose) time(&tstart);
@@ -1031,7 +1034,7 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 #ifdef WITH_LOCISS
 	LocissSink* sink = nullptr;
 	if(!locissOutput.empty()) {
-		sink = locissOpen(locissOutput);
+		sink = locissOpen(locissOutput, locissIndex);
 		if(!sink) { free(nodes); return 1; }
 	}
 	// Per-chromosome work for the LociSSD path: walk the chromosome's
@@ -2657,7 +2660,8 @@ static int extMergeSort(const std::string& inputFile,
                         bool naturalSort,
                         int numThreads,
                         bool verbose,
-                        const std::string& locissOutput)
+                        const std::string& locissOutput,
+                        bool locissIndex)
 {
 	if(memBudget == 0) memBudget = 1ULL << 30;  // default 1 GB
 	std::string tmpDir = tmpDirOpt;
@@ -2954,7 +2958,7 @@ static int extMergeSort(const std::string& inputFile,
 #ifdef WITH_LOCISS
 	LocissSink* sink = nullptr;
 	if(!locissOutput.empty()) {
-		sink = locissOpen(locissOutput);
+		sink = locissOpen(locissOutput, locissIndex);
 		if(!sink) {
 			readers.clear();
 			for(const std::string& p : runPaths) unlink(p.c_str());
@@ -3053,7 +3057,8 @@ static int multiPassSort(const std::string& inputFile,
                          bool naturalSort,
                          int numThreads,
                          bool verbose,
-                         const std::string& locissOutput)
+                         const std::string& locissOutput,
+                         bool locissIndex)
 {
 	if(budget == 0) budget = 1ULL << 30;
 
@@ -3296,7 +3301,7 @@ static int multiPassSort(const std::string& inputFile,
 #ifdef WITH_LOCISS
 	LocissSink* sink = nullptr;
 	if(!locissOutput.empty()) {
-		sink = locissOpen(locissOutput);
+		sink = locissOpen(locissOutput, locissIndex);
 		if(!sink) { munmap(mmapBase, fileSize); return 1; }
 	}
 #endif
@@ -3449,13 +3454,14 @@ static int multiPassSort(const std::string& inputFile,
 
 class LocissSink {
 public:
-	LocissSink(const std::string& path)
+	LocissSink(const std::string& path, bool buildIndex = false)
 		: finalPath_(path),
 		  tmpPath_(path + ".tmp"),
 		  totalRows_(0),
 		  rowsInBatch_(0),
 		  haveCurChrom_(false),
-		  curRunMaxEnd_(INT32_MIN)
+		  curRunMaxEnd_(INT32_MIN),
+		  buildIndex_(buildIndex)
 	{}
 
 	~LocissSink() {
@@ -3529,6 +3535,7 @@ public:
 			curRunMinStart_ = beg;
 			curRunMaxStart_ = beg;
 			curRunMaxEnd_   = end;
+			if(buildIndex_) indexPerChrom_.emplace_back();
 		} else {
 			if(beg < curRunMinStart_) curRunMinStart_ = beg;
 			if(beg > curRunMaxStart_) curRunMaxStart_ = beg;
@@ -3542,6 +3549,12 @@ public:
 		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok()) {
 			std::cerr << "Error: arrow builder append failed" << std::endl;
 			return 1;
+		}
+		if(buildIndex_) {
+			ChromIndexData& idx = indexPerChrom_.back();
+			idx.starts.push_back((int64_t)beg);
+			idx.ends.push_back((int64_t)end);
+			idx.maxEndRunning.push_back((int64_t)curRunMaxEnd_);
 		}
 		totalRows_++;
 		rowsInBatch_++;
@@ -3591,6 +3604,37 @@ public:
 			if(maxEnd   > curRunMaxEnd_  ) curRunMaxEnd_   = maxEnd;
 		}
 
+		// Extract per-chrom index data BEFORE WriteTable, while the
+		// caller's table is still in scope. Spec §6.5: starts / ends /
+		// max_end_running are int64; convert from the table's int32.
+		if(buildIndex_) {
+			indexPerChrom_.emplace_back();
+			ChromIndexData& idx = indexPerChrom_.back();
+			int64_t n = table->num_rows();
+			idx.starts.reserve((size_t)n);
+			idx.ends.reserve((size_t)n);
+			idx.maxEndRunning.reserve((size_t)n);
+			auto startCol = table->GetColumnByName("Start");
+			auto endCol   = table->GetColumnByName("End");
+			auto maxCol   = table->GetColumnByName("MaxEndSoFar");
+			if(!startCol || !endCol || !maxCol) {
+				std::cerr << "Error: writeChromBatch table missing required columns"
+				          << std::endl;
+				return 1;
+			}
+			for(int ci = 0; ci < startCol->num_chunks(); ci++) {
+				auto sa = std::static_pointer_cast<arrow::Int32Array>(startCol->chunk(ci));
+				auto ea = std::static_pointer_cast<arrow::Int32Array>(endCol->chunk(ci));
+				auto ma = std::static_pointer_cast<arrow::Int32Array>(maxCol->chunk(ci));
+				int64_t cn = sa->length();
+				for(int64_t i = 0; i < cn; i++) {
+					idx.starts.push_back((int64_t)sa->Value(i));
+					idx.ends.push_back((int64_t)ea->Value(i));
+					idx.maxEndRunning.push_back((int64_t)ma->Value(i));
+				}
+			}
+		}
+
 		auto wStatus = writer_->WriteTable(*table, kRowGroupSize);
 		if(!wStatus.ok()) {
 			std::cerr << "Error: parquet WriteTable (chrom batch) failed: "
@@ -3613,6 +3657,13 @@ public:
 		std::string manifest = buildManifestJson(writerVersion);
 		auto kvm = std::make_shared<arrow::KeyValueMetadata>();
 		kvm->Append("lociSSD_manifest", manifest);
+		// Optional: §6.5 interval index. Built only when --lociss-index
+		// requested it (memory cost: ~24 B/record retained until finish).
+		if(buildIndex_) {
+			std::string blob = buildIntervalIndexBlob();
+			if(blob.empty()) return 1;
+			kvm->Append("lociSSD_interval_index", blob);
+		}
 		auto addStatus = writer_->AddKeyValueMetadata(kvm);
 		if(!addStatus.ok()) {
 			std::cerr << "Error: AddKeyValueMetadata failed: "
@@ -3645,6 +3696,16 @@ private:
 		int32_t  minStart;
 		int32_t  maxStart;
 		int32_t  maxEnd;
+	};
+
+	// One per chromosome (parallel to chromStats_). Populated only when
+	// buildIndex_ is set. starts/ends/maxEndRunning are int64 per spec
+	// §6.5, even though the data columns may be int32 (spec calls for
+	// int64 in the index regardless of coord_dtype).
+	struct ChromIndexData {
+		std::vector<int64_t> starts;
+		std::vector<int64_t> ends;
+		std::vector<int64_t> maxEndRunning;
 	};
 
 	int flushBatch() {
@@ -3728,6 +3789,140 @@ private:
 		os << '"';
 	}
 
+	// Build the §6.5 interval-index payload: an Arrow Table with one row
+	// per chromosome and large_list<int64> columns starts / ends /
+	// max_end_running / row_id. Serialise as an Arrow IPC stream, then
+	// zstd-compress. Returns the compressed bytes as a std::string ready
+	// to embed under footer KV key "lociSSD_interval_index", or empty
+	// string on error (with details on stderr).
+	std::string buildIntervalIndexBlob() const {
+		size_t nChroms = chromStats_.size();
+		if(nChroms != indexPerChrom_.size()) {
+			std::cerr << "Error: interval-index per-chrom count mismatch ("
+			          << nChroms << " stats vs " << indexPerChrom_.size()
+			          << " index entries)" << std::endl;
+			return std::string();
+		}
+
+		// Build offset arrays + flat values arrays in one pass.
+		std::vector<int64_t> offsets;
+		offsets.reserve(nChroms + 1);
+		offsets.push_back(0);
+		size_t totalRows = 0;
+		for(const auto& idx : indexPerChrom_) {
+			totalRows += idx.starts.size();
+			offsets.push_back((int64_t)totalRows);
+		}
+
+		std::vector<int64_t> startsFlat, endsFlat, maxEndFlat, rowIdFlat;
+		startsFlat.reserve(totalRows);
+		endsFlat.reserve(totalRows);
+		maxEndFlat.reserve(totalRows);
+		rowIdFlat.reserve(totalRows);
+		for(size_t c = 0; c < nChroms; c++) {
+			const auto& idx = indexPerChrom_[c];
+			startsFlat.insert(startsFlat.end(), idx.starts.begin(), idx.starts.end());
+			endsFlat.insert(endsFlat.end(),     idx.ends.begin(),   idx.ends.end());
+			maxEndFlat.insert(maxEndFlat.end(), idx.maxEndRunning.begin(), idx.maxEndRunning.end());
+			int64_t base = chromStats_[c].rowOffset;
+			for(size_t i = 0; i < idx.starts.size(); i++)
+				rowIdFlat.push_back(base + (int64_t)i);
+		}
+
+		// Build Arrow Int64 values + Int64 offsets buffers (raw memory).
+		auto makeInt64Array = [](const std::vector<int64_t>& v)
+			-> std::shared_ptr<arrow::Int64Array> {
+			arrow::Int64Builder b;
+			(void)b.Reserve((int64_t)v.size());
+			for(int64_t x : v) b.UnsafeAppend(x);
+			std::shared_ptr<arrow::Int64Array> out;
+			(void)b.Finish(&out);
+			return out;
+		};
+		auto offsetsArr = makeInt64Array(offsets);
+
+		auto startsValues = makeInt64Array(startsFlat);
+		auto endsValues   = makeInt64Array(endsFlat);
+		auto maxEndValues = makeInt64Array(maxEndFlat);
+		auto rowIdValues  = makeInt64Array(rowIdFlat);
+
+		auto startsListR = arrow::LargeListArray::FromArrays(*offsetsArr, *startsValues);
+		auto endsListR   = arrow::LargeListArray::FromArrays(*offsetsArr, *endsValues);
+		auto maxEndListR = arrow::LargeListArray::FromArrays(*offsetsArr, *maxEndValues);
+		auto rowIdListR  = arrow::LargeListArray::FromArrays(*offsetsArr, *rowIdValues);
+		if(!startsListR.ok() || !endsListR.ok() ||
+		   !maxEndListR.ok() || !rowIdListR.ok()) {
+			std::cerr << "Error: LargeListArray::FromArrays failed for interval index"
+			          << std::endl;
+			return std::string();
+		}
+
+		// Chromosome string column (one entry per chromosome).
+		arrow::StringBuilder chromB;
+		(void)chromB.Reserve((int64_t)nChroms);
+		size_t totalChromBytes = 0;
+		for(const auto& cs : chromStats_) totalChromBytes += cs.name.size();
+		(void)chromB.ReserveData((int64_t)totalChromBytes);
+		for(const auto& cs : chromStats_) chromB.UnsafeAppend(cs.name);
+		std::shared_ptr<arrow::Array> chromArr;
+		(void)chromB.Finish(&chromArr);
+
+		auto schemaMeta = arrow::KeyValueMetadata::Make(
+			{"lociSSD_index_format_version"}, {"1"});
+		auto schema = arrow::schema({
+			arrow::field("chromosome",      arrow::utf8(),                       false),
+			arrow::field("starts",          arrow::large_list(arrow::int64()),   false),
+			arrow::field("ends",            arrow::large_list(arrow::int64()),   false),
+			arrow::field("max_end_running", arrow::large_list(arrow::int64()),   false),
+			arrow::field("row_id",          arrow::large_list(arrow::int64()),   false),
+		}, schemaMeta);
+		auto table = arrow::Table::Make(schema, {
+			chromArr, *startsListR, *endsListR, *maxEndListR, *rowIdListR
+		}, (int64_t)nChroms);
+
+		// Serialise as Arrow IPC stream into an in-memory buffer.
+		auto sinkR = arrow::io::BufferOutputStream::Create();
+		if(!sinkR.ok()) {
+			std::cerr << "Error: BufferOutputStream::Create failed" << std::endl;
+			return std::string();
+		}
+		auto sink = *sinkR;
+		auto writerR = arrow::ipc::MakeStreamWriter(sink, schema);
+		if(!writerR.ok()) {
+			std::cerr << "Error: MakeStreamWriter failed: "
+			          << writerR.status().ToString() << std::endl;
+			return std::string();
+		}
+		auto ipcWriter = *writerR;
+		auto wt = ipcWriter->WriteTable(*table);
+		if(!wt.ok()) {
+			std::cerr << "Error: IPC WriteTable failed: " << wt.ToString() << std::endl;
+			return std::string();
+		}
+		auto cs = ipcWriter->Close();
+		if(!cs.ok()) {
+			std::cerr << "Error: IPC writer close failed: " << cs.ToString() << std::endl;
+			return std::string();
+		}
+		auto bufR = sink->Finish();
+		if(!bufR.ok()) return std::string();
+		auto rawIpc = *bufR;
+
+		// zstd-compress the IPC stream into a sized std::string (which is
+		// what arrow::KeyValueMetadata::Append expects anyway).
+		size_t maxComp = ZSTD_compressBound((size_t)rawIpc->size());
+		std::string compressed(maxComp, '\0');
+		size_t cn = ZSTD_compress(compressed.data(), maxComp,
+		                          rawIpc->data(), (size_t)rawIpc->size(), 3);
+		if(ZSTD_isError(cn)) {
+			std::cerr << "Error: ZSTD_compress on interval index failed: "
+			          << ZSTD_getErrorName(cn) << std::endl;
+			return std::string();
+		}
+		compressed.resize(cn);
+		return compressed;
+	}
+
 	std::string buildManifestJson(const std::string& writerVersion) const {
 		std::ostringstream o;
 		// ISO 8601 UTC timestamp
@@ -3788,9 +3983,11 @@ private:
 	arrow::Int32Builder  maxEndBuilder_;
 
 	std::vector<ChromStat> chromStats_;
+	std::vector<ChromIndexData> indexPerChrom_;
 
 	uint64_t totalRows_;
 	int64_t  rowsInBatch_;
+	bool     buildIndex_;
 
 	bool        haveCurChrom_;
 	std::string curChromName_;
@@ -3863,8 +4060,8 @@ static std::shared_ptr<arrow::Table> buildLocissChromTable(
 // Forward-declared helpers (declared near the top of the file) — defined
 // here so they have the full LocissSink type. Sort paths drive the sink
 // through these.
-static LocissSink* locissOpen(const std::string& path) {
-	auto* s = new LocissSink(path);
+static LocissSink* locissOpen(const std::string& path, bool buildIndex) {
+	auto* s = new LocissSink(path, buildIndex);
 	if(s->open() != 0) { delete s; return nullptr; }
 	return s;
 }
@@ -3942,6 +4139,7 @@ int main(int argc, char *argv[])
 	int extMerge = 0;
 	int multiPass = 0;
 	std::string locissOutput;
+	int locissIndex = 0;
 	// zstd default: fastest compressed codec across all builds, best
 	// compression ratio (~0.33x of text input on a synthetic BED6, ~0.45x
 	// of binary-uncompressed temps), and at 200 M records / 256 M budget
@@ -4010,11 +4208,20 @@ int main(int argc, char *argv[])
 #ifdef WITH_LOCISS
 	app.add_option("--lociss-output", locissOutput,
 		"write a LociSSD v2 Parquet file to FILE instead of BED text on "
-		"stdout. Schema: Chromosome (string), Start (int64), End (int64), "
-		"MaxEndSoFar (int64); zstd-3 compression; manifest JSON in the "
+		"stdout. Schema: Chromosome (string), Start (int32), End (int32), "
+		"MaxEndSoFar (int32); zstd-3 compression; manifest JSON in the "
 		"Parquet file-level KV metadata. Atomic write (tmp + rename). "
-		"Currently supported only on the classic sort path (default; not "
-		"--low-mem-ssd / --multi-pass / --external-merge).");
+		"Works on every sort path (default classic, --low-mem-ssd, "
+		"--multi-pass, --external-merge); --collapse and --sort=b|5 are "
+		"not yet supported.");
+	app.add_flag("--lociss-index", locissIndex,
+		"also embed the optional spec-§6.5 interval index under the "
+		"Parquet footer KV key `lociSSD_interval_index` (Arrow IPC "
+		"stream, zstd-compressed, schema chromosome/starts/ends/"
+		"max_end_running/row_id). Memory cost: ~24 B/record retained "
+		"until output finalises (no streaming yet). Use only when a "
+		"reader actually needs row-precision pruning beyond what the "
+		"§7 predicate pushdown gives.");
 #endif
 
 	CLI11_PARSE(app, argc, argv);
@@ -4099,10 +4306,10 @@ int main(int argc, char *argv[])
 		}
 #ifdef WITH_LOCISS
 		return multiPassSort(inputFile, maxMemBytes, naturalSort,
-		                     numThreads, verbose, locissOutput);
+		                     numThreads, verbose, locissOutput, locissIndex);
 #else
 		return multiPassSort(inputFile, maxMemBytes, naturalSort,
-		                     numThreads, verbose, std::string());
+		                     numThreads, verbose, std::string(), false);
 #endif
 	}
 
@@ -4138,10 +4345,12 @@ int main(int argc, char *argv[])
 		}
 #ifdef WITH_LOCISS
 		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, numThreads, verbose, locissOutput);
+		                    naturalSort, numThreads, verbose,
+		                    locissOutput, locissIndex);
 #else
 		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, numThreads, verbose, std::string());
+		                    naturalSort, numThreads, verbose,
+		                    std::string(), false);
 #endif
 	}
 
@@ -4312,11 +4521,11 @@ int main(int argc, char *argv[])
 #ifdef WITH_LOCISS
 		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
 		                      numThreads, naturalSort, maxMemBytes, verbose,
-		                      locissOutput);
+		                      locissOutput, locissIndex);
 #else
 		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
 		                      numThreads, naturalSort, maxMemBytes, verbose,
-		                      std::string());
+		                      std::string(), false);
 #endif
 	}
 
@@ -4475,7 +4684,7 @@ int main(int argc, char *argv[])
 				p++;
 			}
 		}
-		LocissSink sink(locissOutput);
+		LocissSink sink(locissOutput, locissIndex != 0);
 		if(sink.open() != 0) { free(order); return 1; }
 		for(size_t i = 0; i < totalReads; i++) {
 			uint32_t ri = order[i];
