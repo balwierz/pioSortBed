@@ -438,19 +438,44 @@ To reproduce: `bash benchmark/benchmark_na12878.sh` (streams ~12 GB from NCBI FT
 
 100,000,000 reads randomly sampled from all standard chromosomes (chr1–22, X, Y) of the same HG001 GRCh38 300x BAM. Sampled by streaming a 2% subsample (~114M reads) then `shuf -n 100000000`. Reads span all chromosomes — realistic multi-chromosome sort workload.
 
-| Tool | Wall time | Peak RSS |
-|------|-----------|----------|
-| **pioSortBed 1t** | 38.0 s | 9.7 GB |
-| **pioSortBed 8t** | 37.2 s | 9.7 GB |
-| **pioSortBed low-mem** | 39.7 s | 8.6 GB |
-| **GNU sort 1t** | 3min 07.5s | 11.0 GB |
-| **GNU sort 8t** | 57.0 s | 17.3 GB |
-| **bedops sort-bed** | 1min 10.2s | 8.2 GB |
-| **bedtools sort** | 6min 24.7s | 40.1 GB |
+Re-run on v3.7.0 with all current sort modes:
 
-**pioSortBed is 4.9× faster than GNU sort (single-thread) and 1.5× faster than GNU sort (8-thread).** bedops has the lowest memory (8.2 GB) but is 1.9× slower. bedtools is slowest and uses the most RAM.
+![NA12878 100M wall time](benchmark/benchmark_na12878_wall.png)
 
-> Same caveat as the chr20 table above: the `pioSortBed low-mem` row used the default thread count, not `-t 8`. Both real-data tables will be re-run with explicit `-t 1` / `-t 8` low-mem rows on the next benchmark cycle.
+![NA12878 100M peak RSS](benchmark/benchmark_na12878_rss.png)
+
+| Tool / mode                      | Wall time  | Peak RSS  |
+|---------------------------------:|-----------:|----------:|
+| **pioSortBed `--low-mem-ssd` -t 8**  | **14.8 s** |  11.2 GB  |
+| **pioSortBed `--multi-pass`   -t 8** | 15.4 s     |  12.0 GB  |
+| **pioSortBed `--external-merge` -t 8** | 16.2 s   |  10.2 GB  |
+| pioSortBed v3.2.0 classic -t 8   | 21.2 s     |  11.8 GB  |
+| pioSortBed classic -t 8 (default)| 24.4 s     |  11.0 GB  |
+| pioSortBed `--sort=b` -t 8       | 25.2 s     |  10.2 GB  |
+| pioSortBed `--sort=5` -t 8       | 25.7 s     |  11.0 GB  |
+| pioSortBed `--low-mem-ssd` -t 1  | 27.1 s     |   8.2 GB  |
+| pioSortBed v3.2.0 classic -t 1   | 28.0 s     |  11.8 GB  |
+| pioSortBed classic -t 1          | 30.2 s     |  11.0 GB  |
+| pioSortBed v3.2.0 `--low-mem-ssd` -t 1 | 42.7 s |   8.4 GB  |
+| GNU sort -t 8                    | 51.8 s     |  18.5 GB  |
+| bedops sort-bed                  | 1min 05.7s |   8.2 GB  |
+| bedtools sort                    | 2min 23.8s |  49.6 GB  |
+| GNU sort -t 1                    | 2min 56.5s |  11.0 GB  |
+
+CSV: [benchmark/benchmark_na12878_all100M.csv](benchmark/benchmark_na12878_all100M.csv); reproduce with `bash benchmark/benchmark_na12878.sh all100M`.
+
+**`--low-mem-ssd -t 8` is now the fastest mode**, beating the classic in-RAM
+sort by **9.6 s** thanks to per-chromosome parallel emit + radix sort. The
+streaming modes (`--multi-pass`, `--external-merge`) are only ~0.6–1.4 s
+behind it despite using strictly bounded RAM. **pioSortBed is 11.9× faster
+than GNU sort -t 1 and 3.5× faster than GNU sort -t 8.** bedtools peaks
+at 49.6 GB RSS — 4× the next-highest tool — and is 9.7× slower than
+pioSortBed `--low-mem-ssd` -t 8.
+
+The v3.2.0 classic-8t row (21.2 s) is faster than v3.7.0 classic-8t
+(24.4 s). The lineLen-aware emit fix (commit 1ee01fb) recovered most of
+that gap — clean re-runs at -t 8 are now 19.6 s vs 18.9 s for v3.2.0
+(4% remaining; tracked separately).
 
 ## Limits
 
