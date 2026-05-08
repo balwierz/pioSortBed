@@ -99,11 +99,13 @@ using namespace std;
 class seqread
 {
 	public:
-	char* line; // keeps the full line; in case of collapse option just the weight as string.
-	int beg;
-	int end;
+	char*    line;   // keeps the full line; in case of collapse option just the weight as string.
+	int      beg;
+	int      end;
 	union { uint32_t next; uint32_t chrIdx; };
-	char str;
+	uint16_t lineLen;// byte length of `line` (BED row, up to 65535 B); avoids strlen at emit
+	char     str;
+	// sizeof = 8 + 4 + 4 + 4 + 2 + 1 + 1 padding = 24 bytes, same as before lineLen was added
 };
 
 class chrInfoT
@@ -1605,6 +1607,7 @@ static void parseLines(
 	while(1)
 	{
 		char* linePtr;
+		size_t curLineLen = 0; // byte length of linePtr string (excluding the NUL we wrote)
 
 		if(UseMmap)
 		{
@@ -1613,12 +1616,21 @@ static void parseLines(
 			char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
 			if(nl)
 			{
-				if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+				if(nl > mmapCur && *(nl - 1) == '\r')
+				{
+					*(nl - 1) = '\0';
+					curLineLen = (size_t)(nl - 1 - linePtr);
+				}
+				else
+				{
+					curLineLen = (size_t)(nl - linePtr);
+				}
 				*nl = '\0';
 				mmapCur = nl + 1;
 			}
 			else
 			{
+				curLineLen = (size_t)(mmapLim - linePtr);
 				mmapCur = mmapLim;
 			}
 		}
@@ -1629,9 +1641,17 @@ static void parseLines(
 			linePtr = lineBuf;
 			// Strip trailing \r\n or \n (getline keeps the newline if present).
 			if(glen >= 2 && lineBuf[glen-2] == '\r' && lineBuf[glen-1] == '\n')
+			{
 				lineBuf[glen-2] = '\0';
+				curLineLen = (size_t)(glen - 2);
+			}
 			else if(glen >= 1 && lineBuf[glen-1] == '\n')
+			{
 				lineBuf[glen-1] = '\0';
+				curLineLen = (size_t)(glen - 1);
+			}
+			else
+				curLineLen = (size_t)glen;
 		}
 
 		// Pass through BED header lines (track/browser/# comments) directly.
@@ -1694,19 +1714,24 @@ static void parseLines(
 			{
 				if(UseMmap)
 				{
-					reads[readCount].line = linePtr;
+					reads[readCount].line    = linePtr;
+					// UINT16_MAX is a sentinel "len unknown, strlen at emit" — for the
+					// pathological >64 KiB line. Real BED rows are << that.
+					reads[readCount].lineLen = (curLineLen >= UINT16_MAX) ? UINT16_MAX : (uint16_t)curLineLen;
 				}
 				else
 				{
 					// stdin/gzip: store only tail to save arena memory
 					size_t tlen = strlen(tailPtr);
-					reads[readCount].line = arena->alloc(tailPtr, tlen + 1);
+					reads[readCount].line    = arena->alloc(tailPtr, tlen + 1);
+					reads[readCount].lineLen = (tlen >= UINT16_MAX) ? UINT16_MAX : (uint16_t)tlen;
 				}
 			}
 			else
 			{
 				size_t wlen = strlen(weight);
-				reads[readCount].line = arena->alloc(weight, wlen + 1);
+				reads[readCount].line    = arena->alloc(weight, wlen + 1);
+				reads[readCount].lineLen = (wlen >= UINT16_MAX) ? UINT16_MAX : (uint16_t)wlen;
 			}
 			reads[readCount].beg = beg;
 			reads[readCount].end = end;
@@ -1794,15 +1819,25 @@ static void parseChunkMmap(char* start, char* end,
 	while(mmapCur < mmapLim)
 	{
 		char* linePtr = mmapCur;
+		size_t curLineLen = 0;
 		char* nl = (char*) memchr(mmapCur, '\n', (size_t)(mmapLim - mmapCur));
 		if(nl)
 		{
-			if(nl > mmapCur && *(nl - 1) == '\r') *(nl - 1) = '\0';
+			if(nl > mmapCur && *(nl - 1) == '\r')
+			{
+				*(nl - 1) = '\0';
+				curLineLen = (size_t)(nl - 1 - linePtr);
+			}
+			else
+			{
+				curLineLen = (size_t)(nl - linePtr);
+			}
 			*nl = '\0';
 			mmapCur = nl + 1;
 		}
 		else
 		{
+			curLineLen = (size_t)(mmapLim - linePtr);
 			mmapCur = mmapLim;
 		}
 
@@ -1844,11 +1879,13 @@ static void parseChunkMmap(char* start, char* end,
 		if(fCollapse)
 		{
 			size_t wlen = strlen(weight);
-			reads[idx].line = arena->alloc(weight, wlen + 1);
+			reads[idx].line    = arena->alloc(weight, wlen + 1);
+			reads[idx].lineLen = (wlen >= UINT16_MAX) ? UINT16_MAX : (uint16_t)wlen;
 		}
 		else
 		{
-			reads[idx].line = linePtr;
+			reads[idx].line    = linePtr;
+			reads[idx].lineLen = (curLineLen >= UINT16_MAX) ? UINT16_MAX : (uint16_t)curLineLen;
 		}
 		reads[idx].beg = beg;
 		reads[idx].end = lineEnd;
@@ -4702,7 +4739,11 @@ int main(int argc, char *argv[])
 	{
 		for(size_t i = 0; i < totalReads; i++)
 		{
-			fputs_unlocked(reads[order[i]].line, stdout);
+			const seqread& r = reads[order[i]];
+			if(r.lineLen != UINT16_MAX)
+				fwrite_unlocked(r.line, 1, r.lineLen, stdout);
+			else
+				fputs_unlocked(r.line, stdout); // pathological >64 KiB line
 			fputc_unlocked('\n', stdout);
 		}
 	}
