@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <meta name="author" content="Piotr Balwierz (Genomika.ai)" />
+  <meta name="dcterms.date" content="2026-05-08" />
+  <title>pioSortBed: a multi-mode, parallel BED sorter with native Parquet output</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    div.abstract {
+      margin: 2em 2em 2em 2em;
+      text-align: left;
+      font-size: 85%;
+    }
+    div.abstract-title {
+      font-weight: bold;
+      text-align: center;
+      padding: 0;
+      margin-bottom: 0.5em;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+    /* CSS for citations */
+    div.csl-bib-body { }
+    div.csl-entry {
+      clear: both;
+      margin-bottom: 0em;
+    }
+    .hanging-indent div.csl-entry {
+      margin-left:2em;
+      text-indent:-2em;
+    }
+    div.csl-left-margin {
+      min-width:2em;
+      float:left;
+    }
+    div.csl-right-inline {
+      margin-left:2em;
+      padding-left:1em;
+    }
+    div.csl-indent {
+      margin-left: 2em;
+    }  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">pioSortBed: a multi-mode, parallel BED sorter with
+native Parquet output</h1>
+<p class="author">Piotr Balwierz (Genomika.ai)</p>
+<p class="date">2026-05-08</p>
+<div class="abstract">
+<div class="abstract-title">Abstract</div>
+<p>The BED format is a workhorse of genomic interval analysis, but BED
+files produced by modern sequencing assays now routinely exceed 10^8
+records, making sorting a non-trivial pipeline step. The standard tools
+— <code>LC_ALL=C sort -k1,1 -k2,2n</code>, <code>bedtools sort</code>,
+and <code>bedops sort-bed</code> — all rely on single-threaded
+comparator-based sorting and treat BED records as opaque text. We
+present pioSortBed, a parallel BED sorter built around a chunked
+memory-mapped parser feeding a least-significant-digit (LSD) radix sort
+over packed 64-bit <code>(chromosome-index, position)</code> keys. Four
+sort paths share that kernel and let the user trade RAM, wall time, and
+SSD wear: an in-RAM <em>classic</em> path, a two-pass
+<em>low-mem-ssd</em> path, an <em>external-merge</em> path with
+compressed temp runs, and a <em>multi-pass</em> path that performs
+<strong>zero temp-file writes</strong>. On real WGS data (NA12878 GRCh38
+100M-read BED, 6.6 GB), <code>pioSortBed --low-mem-ssd -t 8</code> sorts
+in 14.8 s — 12.0× faster than single-threaded GNU sort, 3.5× faster than
+<code>sort --parallel=8</code>, 4.4× faster than
+<code>bedops sort-bed</code>, and 9.7× faster than
+<code>bedtools sort</code>. At 500 million synthetic records,
+<code>--multi-pass</code> writes 0 GiB of temp data versus 6.5 GiB for
+<code>--external-merge</code> and 20.2 GiB for either GNU sort or
+bedops. As a separate output mode, <code>--lociss-output</code> emits
+sorted Parquet conforming to the published LociSSD v2 spec, directly
+consumable by polars, DuckDB, pyranges 1, and any Parquet-aware reader,
+with statistics-based predicate pushdown for fast region queries. The
+source is a single C++17 file (~3700 lines) released under the MIT
+license, with a self-contained static Linux x86_64 binary.</p>
+</div>
+</header>
+<p><strong>Keywords:</strong> BED, sorting, genomic intervals, radix
+sort, parallel, external sort, SSD endurance, Parquet, bioinformatics,
+file format</p>
+<h1 id="introduction">Introduction</h1>
+<p>While the SAM/BAM/CRAM family of binary alignment formats <span
+class="citation" data-cites="danecek2021twelve">(Danecek et al.
+2021)</span> has been rapidly adopted as the standard representation for
+sequence alignment data, large-scale genomic pipelines continue to rely
+heavily on BED <span class="citation" data-cites="kent2002human">(Kent
+et al. 2002)</span> and BED-like tab-delimited interval formats for
+downstream data products: peak calls, methylation tracks, candidate
+regulatory elements, fragment maps, and similar. Reference resources
+such as the ENCODE project <span class="citation"
+data-cites="encode2012integrated">(The ENCODE Project Consortium
+2012)</span> distribute much of their derived interval data in BED, and
+analysis pipelines compose primarily through these files. To support
+rapid random access on a BED file, three preprocessing steps are
+typically required: sort, optionally compress (with bgzip <span
+class="citation" data-cites="danecek2021twelve">(Danecek et al.
+2021)</span>), and index (with tabix <span class="citation"
+data-cites="li2011tabix">(Li 2011)</span>). Compression has been heavily
+parallelised in modern implementations and is no longer a bottleneck;
+indexing is essentially linear in compressed size and similarly fast.
+The sort step, performed today by general-purpose tools — GNU
+<code>sort -k1,1 -k2,2n</code> <span class="citation"
+data-cites="coreutils">(Free Software Foundation 2025)</span>,
+<code>bedtools sort</code> <span class="citation"
+data-cites="quinlan2010bedtools">(Quinlan and Hall 2010)</span>, and
+<code>bedops sort-bed</code> <span class="citation"
+data-cites="neph2012bedops">(Neph et al. 2012)</span> — remains the
+slowest stage of the three on the inputs characteristic of
+high-throughput pipelines.</p>
+<p>The hardware context has shifted in two ways. First, workhorse
+pipeline nodes today routinely carry 64–256 GiB of RAM and NVMe-class
+local SSDs, so the classic external-merge-sort assumption — that the
+working set must fit in a small RAM budget while spilling intermediate
+runs to comparatively slow disk — is rarely the binding constraint for
+ordinary BED inputs. Second, those NVMe SSDs are typically rated for a
+fixed total bytes written (TBW) endurance — 600 TBW is a common
+consumer-class number for a 1 TB drive — and pipelines that re-sort the
+same large BED hundreds of times per year materially erode that budget.
+A modern BED sorter should be able to exploit on-node parallelism
+<em>and</em> exploit available RAM to avoid temp-file writes when
+possible, while still degrading gracefully when input genuinely exceeds
+RAM.</p>
+<p>A second, simultaneous shift is in the consumer side of BED data.
+Pipelines increasingly want sorted BED that is <em>also</em>
+statistically indexed and ready for direct ingest by Parquet-native
+analytics tools — polars <span class="citation"
+data-cites="polars">(Vink and Polars contributors 2025)</span>, DuckDB
+<span class="citation" data-cites="duckdb">(Raasveldt, Mühleisen, and
+DuckDB Foundation 2025)</span>, or pyranges 1 <span class="citation"
+data-cites="stovner2025pyranges">(Stovner and Sætrom 2025)</span>. Today
+this is typically a separate step after sorting (BED-text →
+BED-to-Parquet), which doubles I/O on multi-gigabyte files. Doing the
+conversion at sort time, in a single pass, avoids the second read.</p>
+<p>All three of the standard sorting tools are effectively
+single-threaded: <code>sort --parallel=N</code> uses multiple threads
+only inside <code>std::sort</code>, not for parsing, and
+<code>bedtools sort</code> and <code>bedops sort-bed</code> are serial
+throughout. All three treat the chromosome name as an opaque string and
+the start coordinate as a parsed integer compared via a generic
+comparator. None exploits the fact that BED keys are bounded integers
+that can be radix-sorted, none parses input in parallel, and none can
+emit statistically indexed Parquet directly.</p>
+<p>Two observations drive the design of pioSortBed: (1) the natural BED
+sort key — the pair <code>(chromosome-index, start-position)</code> —
+fits in a 64-bit unsigned integer and can be LSD-radix-sorted in O(n)
+time at very high constant-factor throughput; and (2) BED parsing is
+embarrassingly parallel over newline-aligned chunks of an
+<code>mmap</code>’d input file. Building on those primitives, pioSortBed
+exposes four sort paths with different RAM / wall time / SSD-wear
+trade-offs, plus an optional Parquet output mode. We show that the
+combination yields 5–17× speedups over the dominant tools across input
+sizes from 10^4 to 5×10^8 records, and that the resulting tool is
+correctness-equivalent to the canonical
+<code>LC_ALL=C sort -k1,1 -k2,2n</code> reference.</p>
+<h1 id="implementation">Implementation</h1>
+<p>pioSortBed is a single-source-file C++17 program (~3700 lines, plus
+the header-only CLI11 <span class="citation"
+data-cites="cli11">(Schreiner and CLI11 contributors 2025)</span> for
+argument parsing) compiled against the parallel STL backend provided by
+oneTBB <span class="citation" data-cites="onetbb">(Intel Corporation
+2025)</span> and linked against liblz4 / libzstd <span class="citation"
+data-cites="zstd">(Collet, Kucherawy, and Facebook, Inc. 2024)</span>.
+It exposes a single executable that accepts a BED file (uncompressed,
+gzip-compressed, or read from standard input) and emits sorted BED to
+standard output, a named file, or a LociSSD Parquet dataset.</p>
+<h2 id="input-acquisition">Input acquisition</h2>
+<p>Files on disk are mapped with <code>mmap</code>
+(<code>PROT_READ | PROT_WRITE | MAP_POPULATE</code>, with
+<code>MADV_HUGEPAGE</code>), giving the parser zero-copy read-only
+access to every byte of the input. Gzip-compressed inputs and standard
+input are slurped into a heap buffer through the same downstream
+interface, so all subsequent stages operate uniformly on a
+(<code>base</code>, <code>size</code>) pair. Header lines
+(<code>#</code>, <code>track</code>, <code>browser</code>) are emitted
+to the output stream in a leading pass and elided from the body.</p>
+<h2 id="parallel-parsing">Parallel parsing</h2>
+<p>The input is split into newline-aligned chunks, one per worker
+thread. Each thread parses its chunk into per-chromosome partial linked
+lists keyed by chromosome name, with read indices that are already
+global across the file (no rebase pass at merge time). A final serial
+step concatenates the per-chunk linked lists into a global
+per-chromosome map. Chromosome names are stored as
+<code>(pointer, length)</code> tuples into the input buffer; field 4+
+tails are similarly retained as pointers, so per-record metadata is
+small (24 bytes for the in-RAM paths, 16 bytes for
+<code>--low-mem-ssd</code>) and per-record string copies are avoided in
+all standard cases. The same parallel parser drives every sort path,
+including the streaming variants — a property added in v3.5.0 that
+contributed roughly a 2.4× speedup at 8 threads on
+<code>--external-merge</code> versus the previous serial
+<code>getline</code> parser.</p>
+<h2 id="sorting-kernel-radixsort64">Sorting kernel:
+<code>radixSort64</code></h2>
+<p>The shared sorting kernel is an LSD radix sort over packed 64-bit
+<code>(chromosome-index &lt;&lt; 32 | position)</code> keys <span
+class="citation" data-cites="knuth1998art">(Knuth 1998)</span>,
+implemented as 8 passes of 8-bit digits. The implementation skips passes
+whose corresponding byte is constant across all keys — typical for the
+high bytes when <code>chromosome-index</code> is small and positions fit
+in 32 bits, so most files require only 4 of the 8 passes. The parallel
+variant builds per-thread digit histograms in parallel, performs a
+single serial 2D prefix sum over the (T threads × 256 buckets) grid,
+then scatters in parallel into disjoint output ranges. No atomics are
+required at any stage. For inputs below ~3 million records, parallel
+comparator <code>std::sort</code> over the same key proves marginally
+faster and is selected automatically.</p>
+<h2 id="four-sort-paths">Four sort paths</h2>
+<p>pioSortBed exposes four sort paths, all driven by the same parallel
+parser and <code>radixSort64</code> kernel, but differing in how they
+hold per-record state and how they emit. The defaults are tuned to the
+common case (a BED file that fits in RAM with room to spare) but the
+user can override at the command line. Table 1 summarises the
+trade-offs.</p>
+<p><strong>Classic</strong> (default). Stores each record in a 24-byte
+<code>seqread</code> struct (<code>int beg</code>, <code>int end</code>,
+plus union slots used during parsing and sorting, plus a
+<code>uint16_t lineLen</code> so output emit can use
+<code>fwrite_unlocked</code> with a known length rather than
+<code>strlen</code>-scanning each line). After parsing, indices into
+this array are LSD-radix-sorted by the packed 64-bit key, then a linear
+scan emits each line zero-copy from the <code>mmap</code>’d input
+buffer. Recommended for inputs that comfortably fit in RAM and where
+wall time matters more than memory footprint.</p>
+<p><strong><code>--low-mem-ssd</code>.</strong> A two-pass design. Pass
+1 walks the input and builds a flat 16-byte-per-record table
+(<code>size_t off; uint32_t next; uint32_t lineLen</code>) of
+per-chromosome linked lists, again in parallel chunks. Pass 2 processes
+chromosomes concurrently: each chromosome’s linked list is materialised
+into a contiguous index array, sorted with <code>radixSort64</code> on a
+single 32-bit position key (no chromosome-index in the key — chromosomes
+are processed independently), and emitted directly from
+<code>mmap</code> pointers via <code>fwrite_unlocked</code>. Output
+across chromosomes is serialised through a
+<code>mutex + condition_variable</code> barrier so chromosomes appear in
+the user’s chosen order (lexicographic by default, or natural order via
+<code>--natural-sort</code>). The 16-byte index halves the per-record
+metadata of the classic path. On real-world BED with 24 unevenly sized
+chromosomes, the per-chromosome parallel emit makes this path the
+fastest of the four (see §Results).</p>
+<p><strong><code>--external-merge</code>.</strong> A bounded-RAM
+streaming sort for inputs that may exceed available RAM. Pass 1 reads
+the input in chunks (one chunk per thread, parallel-parsed), fills an
+in-RAM run buffer up to <code>--max-mem</code> bytes, sorts the run with
+<code>radixSort64</code>, and writes a <em>compressed</em> binary run
+file to a temp directory. Pass 2 opens all run files, maintains a
+min-heap of (key, runIdx), and emits BED text by popping and refilling
+the heap. Peak RSS is bounded by <code>--max-mem</code> regardless of
+input size, so the path will sort an arbitrary-sized BED in a fixed
+memory footprint.</p>
+<p>The temp-run codec is selectable via <code>--merge-codec</code>; zstd
+is the default. At 200M records / 256 MiB budget, zstd is faster
+<em>end-to-end</em> than raw (61.7 s vs 64.0 s), because the disk I/O
+saved by ~3× compression exceeds the codec’s CPU cost. lz4 trades modest
+ratio for fast decode. In <code>WITH_BAM</code> builds, htscodecs’
+SIMD-vectorised rANS order-0 codec is also available and is the fastest
+in that configuration.</p>
+<p><strong><code>--multi-pass</code>.</strong> A K-pass scan that
+performs <strong>zero temp-file writes</strong>. Pass 1 streams the
+input via the parallel parser and builds a histogram keyed by
+<code>(chromosome-index, beg &gt;&gt; 20)</code> (a 1 MiB position
+quantum), tracking byte size per bucket. The histogram is bin-packed
+into K consecutive <code>(chr, beg-quantum)</code> groups each ≤
+<code>--max-mem</code>. Passes 2..K+1 re-stream the input, filter to one
+group, sort + emit. Total writes equal the size of the sorted output
+(pioSortBed never writes a temp file in this mode); total reads = (K+1)
+× file size. The path trades wall time for SSD endurance: it is 2–3×
+slower than <code>--external-merge</code> at similar RAM budgets but
+writes nothing the user did not ask for. At input sizes between 1× and
+~5× available RAM — where the alternative is paying 30–100% extra disk
+writes for external-merge or hitting OOM with the classic path —
+<code>--multi-pass</code> is the right default for repeat-sort workloads
+on consumer SSDs.</p>
+<p><strong>Table 1.</strong> Sort-path comparison. <em>Best for</em> is
+the input regime where this path is the right default. <em>Temp</em>
+refers to extra writes beyond the unavoidable sorted output file
+(i.e. the SSD-wear cost).</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Path</th>
+<th>Per-record RAM</th>
+<th>Temp writes</th>
+<th>Best for</th>
+<th>Sort orders</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>classic (default)</td>
+<td>24 B + line</td>
+<td>none</td>
+<td>small–medium, RAM headroom</td>
+<td>s, b, 5</td>
+</tr>
+<tr>
+<td><code>--low-mem-ssd</code></td>
+<td>16 B + line</td>
+<td>none</td>
+<td>≥ 1M records, SSD-backed</td>
+<td>s, b, 5</td>
+</tr>
+<tr>
+<td><code>--external-merge</code></td>
+<td>0 (RAM cap)</td>
+<td>~30–50% of output (compressed)</td>
+<td>input ≫ RAM</td>
+<td>s only</td>
+</tr>
+<tr>
+<td><code>--multi-pass</code></td>
+<td>0 (RAM cap)</td>
+<td><strong>0</strong></td>
+<td>1×–5× RAM, wear-sensitive</td>
+<td>s only</td>
+</tr>
+</tbody>
+</table>
+<p><code>--external-merge</code> and <code>--multi-pass</code> currently
+support only the default coordinate sort (<code>--sort=s</code>);
+<code>--sort=b</code> (start+end) and <code>--sort=5</code>
+(strand-aware 5’-end) require the in-RAM paths. Stdin and gzip inputs
+require classic or low-mem-ssd. Header passthrough,
+<code>--natural-sort</code>, and <code>--collapse</code> (where
+applicable) work uniformly across all four paths.</p>
+<h2 id="locissd-parquet-output">LociSSD Parquet output</h2>
+<p><code>--lociss-output FILE</code> makes pioSortBed write an Apache
+Parquet file <span class="citation" data-cites="parquet">(Apache
+Software Foundation 2025b)</span> conforming to the LociSSD v2 spec
+<span class="citation" data-cites="formatspec">(Balwierz 2026)</span>
+instead of (or alongside) a BED text stream. The file contains four
+required columns — <code>Chromosome</code>, <code>Start</code>,
+<code>End</code>, and a derived <code>MaxEndSoFar</code> (per-chromosome
+running maximum of <code>End</code>) — plus a JSON manifest in the
+Parquet footer key-value metadata recording per-chromosome row offsets,
+value bounds, schema, and writer version.</p>
+<p><code>MaxEndSoFar</code> makes the file self-indexing for region
+queries. A reader issuing
+<code>(query_chromosome, query_start, query_end)</code> pushes down the
+predicate</p>
+<pre><code>Chromosome == query_chromosome
+AND Start &lt; query_end
+AND End   &gt; query_start
+AND MaxEndSoFar &gt; query_start</code></pre>
+<p>to Parquet. The fourth clause is logically redundant with the third
+but lets a statistics-aware Parquet reader prune row groups via min/max
+statistics on the <em>cumulative</em> <code>MaxEndSoFar</code> column
+even when a few long intervals would inflate <code>End</code>’s
+row-group max statistic and defeat pruning of the underlying
+<code>End</code> column directly. With a well-tuned
+<code>row_group_size</code> (the spec recommends 65536) this gives
+row-group precision pruning for free, with no dedicated index scan.</p>
+<p>Optional <code>--lociss-index</code> (added v3.7.0) embeds a
+row-precision interval index — an Apache Arrow <span class="citation"
+data-cites="arrow">(Apache Software Foundation 2025a)</span> IPC stream
+encoding
+<code>(chromosome, starts, ends, max_end_running, row_id)</code> per
+chromosome, zstd-compressed and stored under the footer KV key
+<code>lociSSD_interval_index</code>. The index trades ~24 B/record
+transient RAM during sort for row-precision pruning at read time. The
+format spec keeps the index optional; for TB-scale datasets the §7
+predicate-pushdown path scales better.</p>
+<p>The output integrates directly with downstream Parquet consumers
+without glue:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># polars</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> polars <span class="im">as</span> pl</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>df <span class="op">=</span> pl.read_parquet(<span class="st">&quot;regions.lociss&quot;</span>)</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>df.<span class="bu">filter</span>((pl.col(<span class="st">&quot;Chromosome&quot;</span>) <span class="op">==</span> <span class="st">&quot;chr1&quot;</span>) <span class="op">&amp;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>          (pl.col(<span class="st">&quot;Start&quot;</span>).lt(<span class="dv">100_000</span>)))</span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># DuckDB</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> duckdb</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>duckdb.sql(<span class="st">&quot;SELECT * FROM &#39;regions.lociss&#39; &quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>           <span class="st">&quot;WHERE Chromosome = &#39;chr1&#39; AND Start &lt; 100000&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># pyranges 1</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyranges <span class="im">as</span> pr</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>gr <span class="op">=</span> pr.read_table(<span class="st">&quot;regions.lociss&quot;</span>)</span></code></pre></div>
+<p><code>--lociss-output</code> works on every sort path; the
+corresponding sort-mode restrictions still apply
+(<code>--sort=b|5</code> and <code>--collapse</code> are not yet
+supported with LociSSD output). Cross-path consistency was verified on a
+500k-record / 22-chromosome fixture: all four sort paths produce
+byte-identical Parquet (md5sum matches across runs).</p>
+<h2 id="output-emission">Output emission</h2>
+<p>For BED text output, whichever sort path is chosen, output is
+reconstructed zero-copy from the original <code>mmap</code>’d input
+wherever possible. The classic and <code>--low-mem-ssd</code> paths
+retain a <code>(pointer, length)</code> tuple for each record’s line in
+the input buffer and call
+<code>fwrite_unlocked(line, lineLen, 1, stdout)</code> directly. The
+classic path writes through an 8 MiB stdout buffer; the
+<code>--low-mem-ssd</code> path uses a per-chromosome
+<code>ChromBuf</code> that pre-sizes output once and grows
+arithmetically. The streaming paths reconstruct each output line from
+the run-file payload (which retains chromosome via a per-run dictionary
+plus the row’s <code>beg</code>, <code>end</code>, strand, and tail
+bytes).</p>
+<h1 id="results">Results</h1>
+<h2 id="hardware-and-methodology">Hardware and methodology</h2>
+<p>The headline benchmark hardware is a desktop workstation: 16-core /
+32-thread CPU at up to 5 GHz, 62 GiB DDR5, KIOXIA NVMe SSD; Linux 6.x.
+The synthetic sweep figures (Figures 1, 2) were originally captured on a
+Lenovo ThinkPad P1 Gen 7 (Intel Core Ultra 7 155H — 16 physical cores /
+22 logical threads, 32 GiB DDR5, KIOXIA KXG8AZNV1T02 NVMe SSD) as that
+rig was where the prior edition of this benchmark was run; cross-rig
+spot-checks at 100 M records were within 5% of the desktop numbers.</p>
+<p>Synthetic fixtures are generated with
+<code>tests/gen_fixture.awk</code> (random chromosome assignments,
+random <code>[start, end]</code> intervals on each chromosome, a
+<code>read&lt;i&gt;</code> name, a numeric score, and a strand flag, in
+random input order). The real-data benchmark uses NA12878 (HG001) GRCh38
+300x Illumina WGS reads from GIAB/NHGRI <span class="citation"
+data-cites="zook2016giab">(Zook et al. 2016)</span>, converted with
+<code>samtools view | bedtools bamtobed</code>, then
+<code>shuf -n 100000000</code>. Wall time is measured by
+<code>/usr/bin/time -f '%e'</code>; peak resident set size by
+<code>/usr/bin/time -f '%M'</code>; total bytes written and read by
+<code>/usr/bin/time -v</code>’s <code>File system outputs</code> and
+<code>inputs</code> fields, which derive from
+<code>getrusage(2)</code>’s <code>ru_oublock</code> /
+<code>ru_inblock</code> counters and capture the total block-layer I/O
+the process caused, including pages still dirty in the page cache at
+process exit. Each tool emits its sorted output to a file on the same
+NVMe device as the input. Correctness is verified per run by
+<code>cmp</code> against the <code>LC_ALL=C sort -k1,1 -k2,2n</code>
+reference; all configurations pass at every size. All benchmarks scripts
+and CSVs are in <code>benchmark/</code> in the repository.</p>
+<h2 id="synthetic-sweep-104-to-108-records">Synthetic sweep, 10^4 to
+10^8 records</h2>
+<p>Figure 1 shows wall time versus input size on a log-x, linear-y scale
+for the classic and <code>--low-mem-ssd</code> paths at 1, 4, and 8
+threads, plus GNU sort, bedops sort-bed, and bedtools. The recommended
+fast path, <code>pioSortBed --low-mem-ssd -t 8</code>, sorts 50 million
+records in 16.1 s, 100 million in 33.0 s, and 200 million in ~70 s. By
+comparison, single-threaded <code>LC_ALL=C sort -k1,1 -k2,2n</code>
+requires 1 min 19 s, 2 min 51 s, and 5 min+ at the same sizes — a 4–7×
+slowdown. Parallel GNU sort (<code>sort --parallel=8</code>) recovers
+most of that gap but still takes 23 s, 48 s, and 117 s — 1.4–1.6× slower
+than pioSortBed at every size in the sweep. <code>bedops sort-bed</code>
+and <code>bedtools sort</code>, both effectively single-threaded, range
+from 2× to 7× slower than the default classic path of pioSortBed across
+the benchmarked range.</p>
+<p>Figure 2 shows peak resident set size on the same axes. At 50 million
+records, <code>pioSortBed --low-mem-ssd</code> peaks at 3.0 GiB; the
+classic path peaks at 4.1 GiB; <code>bedops sort-bed</code> (which holds
+all records in heap-allocated per-record structs and discards the
+original input bytes after parsing) peaks at 2.7 GiB;
+<code>LC_ALL=C sort -k1,1 -k2,2n</code> at 4.4 GiB single-threaded;
+<code>bedtools sort</code> at 19.4 GiB. At 100 million records
+<code>bedtools sort</code> exhausted memory on a 16 GiB host but
+completed on the desktop in 49.6 GiB of peak RSS.</p>
+<figure id="fig:time">
+<img src="figures/fig1_time.png" style="width:100.0%"
+alt="Wall time vs. input size, eleven sorter configurations on the same machine. Note the log-x axis: the rightmost point is 10^8 records." />
+<figcaption aria-hidden="true">Wall time vs. input size, eleven sorter
+configurations on the same machine. Note the log-x axis: the rightmost
+point is 10^8 records.</figcaption>
+</figure>
+<figure id="fig:memory">
+<img src="figures/fig2_memory.png" style="width:100.0%"
+alt="Peak resident set size vs. input size, same configurations as Figure 1. The pioSortBed --low-mem-ssd path scales linearly with input bytes (the mmap’d file plus a 16-byte-per-record index dominate the curve); the classic path adds the per-record seqread array to that floor. bedtools sort’s heap-allocated per-record structs scale much worse than any other tool." />
+<figcaption aria-hidden="true">Peak resident set size vs. input size,
+same configurations as Figure 1. The pioSortBed
+<code>--low-mem-ssd</code> path scales linearly with input bytes (the
+<code>mmap</code>’d file plus a 16-byte-per-record index dominate the
+curve); the classic path adds the per-record <code>seqread</code> array
+to that floor. <code>bedtools sort</code>’s heap-allocated per-record
+structs scale much worse than any other tool.</figcaption>
+</figure>
+<h2 id="real-data-na12878-100m-reads">Real data: NA12878 100M reads</h2>
+<p>100 million reads sampled from all standard chromosomes (chr1–22, X,
+Y) of the GIAB HG001 GRCh38 300x WGS BAM, converted to BED via
+<code>bedtools bamtobed</code>, gives a 6.6 GB BED file with realistic
+chromosome-size distribution (chr1 is ~5× chr22). All four pioSortBed
+sort paths are benchmarked at -t 1 and -t 8 against the previous
+pioSortBed version (v3.2.0, two paths only) and the four external
+tools.</p>
+<p>Figure 3 and Table 2 show wall time. The headline result:
+<code>pioSortBed --low-mem-ssd -t 8</code> at 14.8 s is the fastest
+configuration, beating the classic path -t 8 (24.4 s) by 9.6 s. The lead
+comes from per-chromosome parallel emit: real BED has 24 unevenly sized
+chromosomes, so the chromosome-parallel low-mem-ssd path keeps every
+core busy through the emit phase, while the classic path’s monolithic
+sort+emit serialises on the radix sort. The two streaming paths come
+close — <code>--multi-pass -t 8</code> at 15.4 s and
+<code>--external-merge -t 8</code> at 16.2 s — proving that bounded RAM
+does not have to mean bounded throughput on workstation hardware.</p>
+<p><strong>Table 2.</strong> NA12878 GRCh38 100M-read BED (6.6 GB) sort,
+all configurations. Wall time medians from three runs each.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tool / mode</th>
+<th>Wall time</th>
+<th>Peak RSS</th>
+<th>Speedup vs GNU sort 1t</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>pioSortBed <code>--low-mem-ssd</code> -t 8</td>
+<td>14.8 s</td>
+<td>11.2 GB</td>
+<td><strong>11.9×</strong></td>
+</tr>
+<tr>
+<td>pioSortBed <code>--multi-pass</code> -t 8</td>
+<td>15.4 s</td>
+<td>12.0 GB</td>
+<td>11.5×</td>
+</tr>
+<tr>
+<td>pioSortBed <code>--external-merge</code> -t 8</td>
+<td>16.2 s</td>
+<td>10.2 GB</td>
+<td>10.9×</td>
+</tr>
+<tr>
+<td>pioSortBed v3.2.0 classic -t 8</td>
+<td>21.2 s</td>
+<td>11.8 GB</td>
+<td>8.3×</td>
+</tr>
+<tr>
+<td>pioSortBed classic -t 8</td>
+<td>24.4 s</td>
+<td>11.0 GB</td>
+<td>7.2×</td>
+</tr>
+<tr>
+<td>pioSortBed <code>--sort=b</code> -t 8</td>
+<td>25.2 s</td>
+<td>10.2 GB</td>
+<td>7.0×</td>
+</tr>
+<tr>
+<td>pioSortBed <code>--sort=5</code> -t 8</td>
+<td>25.7 s</td>
+<td>11.0 GB</td>
+<td>6.9×</td>
+</tr>
+<tr>
+<td>pioSortBed <code>--low-mem-ssd</code> -t 1</td>
+<td>27.1 s</td>
+<td>8.2 GB</td>
+<td>6.5×</td>
+</tr>
+<tr>
+<td>pioSortBed v3.2.0 classic -t 1</td>
+<td>28.0 s</td>
+<td>11.8 GB</td>
+<td>6.3×</td>
+</tr>
+<tr>
+<td>pioSortBed classic -t 1</td>
+<td>30.2 s</td>
+<td>11.0 GB</td>
+<td>5.8×</td>
+</tr>
+<tr>
+<td>pioSortBed v3.2.0 <code>--low-mem-ssd</code> -t 1</td>
+<td>42.7 s</td>
+<td>8.4 GB</td>
+<td>4.1×</td>
+</tr>
+<tr>
+<td>GNU sort <code>--parallel=8</code></td>
+<td>51.8 s</td>
+<td>18.5 GB</td>
+<td>3.4×</td>
+</tr>
+<tr>
+<td>bedops sort-bed</td>
+<td>1 min 05.7 s</td>
+<td>8.2 GB</td>
+<td>2.7×</td>
+</tr>
+<tr>
+<td>bedtools sort</td>
+<td>2 min 23.8 s</td>
+<td>49.6 GB</td>
+<td>1.2×</td>
+</tr>
+<tr>
+<td><code>LC_ALL=C sort -k1,1 -k2,2n</code></td>
+<td>2 min 56.5 s</td>
+<td>11.0 GB</td>
+<td>1.0×</td>
+</tr>
+</tbody>
+</table>
+<figure id="fig:realdata">
+<img src="figures/fig3_realdata.png" style="width:100.0%"
+alt="NA12878 GRCh38 100M-read sort, wall time. Bars colour-coded: pioSortBed v3.7.0 (blue), pioSortBed v3.2.0 baseline (orange), external tools (grey). All -t 8 unless labelled otherwise." />
+<figcaption aria-hidden="true">NA12878 GRCh38 100M-read sort, wall time.
+Bars colour-coded: pioSortBed v3.7.0 (blue), pioSortBed v3.2.0 baseline
+(orange), external tools (grey). All -t 8 unless labelled
+otherwise.</figcaption>
+</figure>
+<h2 id="ssd-wear-bytes-written-per-sort">SSD wear: bytes written per
+sort</h2>
+<p>Figure 4 plots total bytes written to the block layer (output file +
+temp files combined) versus input size, for the three streaming-capable
+configurations of pioSortBed plus bedops and GNU sort, on a synthetic
+sweep at 16 GiB RAM cap and 8 threads. The output file write
+(uncompressed sorted BED) is unavoidable and equals the input size.
+Everything beyond that is temp-file writes — the SSD-wear cost of the
+sort.</p>
+<p>Table 3 quantifies. At 500 million records (21.6 GiB output),
+<code>--multi-pass</code> writes only the output: <strong>0 GiB of temp
+data, contributing nothing to NAND wear beyond the result the user
+actually wanted</strong>. <code>--external-merge</code> with the default
+zstd codec writes 6.5 GiB of compressed temp runs (~32% of output).
+<code>bedops sort-bed</code> and <code>GNU sort --parallel=8</code> both
+spill to /tmp uncompressed and write 20.2 GiB of temps each — equal to
+the output, doubling the total disk writes.</p>
+<p><strong>Table 3.</strong> Temp-file bytes written per sort (output
+writes excluded), 16 GiB RAM cap, 8 threads.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Reads</th>
+<th style="text-align: right;">extmerge zstd</th>
+<th style="text-align: right;">multipass</th>
+<th style="text-align: right;">bedops</th>
+<th style="text-align: right;">GNU sort -8t</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">50M</td>
+<td style="text-align: right;">0.65 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">100M</td>
+<td style="text-align: right;">1.31 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">200M</td>
+<td style="text-align: right;">2.60 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">7.99 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">500M</td>
+<td style="text-align: right;">6.49 GiB</td>
+<td style="text-align: right;">0 GiB</td>
+<td style="text-align: right;">20.23 GiB</td>
+<td style="text-align: right;">20.24 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>A practical interpretation: a pipeline that re-sorts a 500M-record
+BED once a week consumes ~3.4 TBW/year on <code>--external-merge</code>,
+~10.5 TBW/year on bedops or GNU sort, and 0 TBW/year on
+<code>--multi-pass</code>. On a 1 TB consumer-class SSD with 600 TBW
+endurance, the difference is non-academic.</p>
+<figure id="fig:ssdwear">
+<img src="figures/fig4_ssdwear.png" style="width:100.0%"
+alt="Total bytes written to the block layer (output + temp), 16 GiB cap, 8 threads, 50M to 500M records. --multi-pass overlaps with bedops and GNU sort lines below 200M because bedops/GNU sort do not yet spill at those sizes; above 200M bedops and GNU sort begin spilling and their total writes diverge upward, while --multi-pass continues to track the unavoidable output size." />
+<figcaption aria-hidden="true">Total bytes written to the block layer
+(output + temp), 16 GiB cap, 8 threads, 50M to 500M records.
+<code>--multi-pass</code> overlaps with bedops and GNU sort lines below
+200M because bedops/GNU sort do not yet spill at those sizes; above 200M
+bedops and GNU sort begin spilling and their total writes diverge
+upward, while <code>--multi-pass</code> continues to track the
+unavoidable output size.</figcaption>
+</figure>
+<h2 id="streaming-mode-scaling">Streaming-mode scaling</h2>
+<p>Figure 5 shows wall time at 10M to 500M records on log-log axes for
+the two pioSortBed streaming paths plus <code>bedops sort-bed</code> and
+<code>GNU sort --parallel=8</code>, all at 16 GiB cap and 8 threads.
+Both pioSortBed streaming paths scale linearly with input size and at
+500M reads are 4.7× faster than GNU sort <code>--parallel=8</code> and
+7.6× faster than bedops sort-bed.</p>
+<p>The figure also overlays the v3.5.0 baseline (dotted lines) for the
+two pioSortBed streaming paths. The post-v3.5.0 commit threading
+<code>numThreads</code> through the per-run <code>radixSort64</code>
+call gave a substantial speedup: at 500M records,
+<code>--multi-pass</code> improved from 121.9 s to 80.4 s (−34%), and
+<code>--external-merge</code> from 82.9 s to 66.8 s (−19%).</p>
+<figure id="fig:streaming">
+<img src="figures/fig5_streamingscale.png" style="width:100.0%"
+alt="Streaming-mode scaling, 10M–500M records. v3.7.0 (solid) vs v3.5.0 (dotted) for --external-merge and --multi-pass; bedops sort-bed and GNU sort --parallel=8 for context." />
+<figcaption aria-hidden="true">Streaming-mode scaling, 10M–500M records.
+v3.7.0 (solid) vs v3.5.0 (dotted) for <code>--external-merge</code> and
+<code>--multi-pass</code>; <code>bedops sort-bed</code> and
+<code>GNU sort --parallel=8</code> for context.</figcaption>
+</figure>
+<h2 id="correctness">Correctness</h2>
+<p>pioSortBed’s BED text output is byte-identical to
+<code>LC_ALL=C sort -k1,1 -k2,2n</code> for default-mode
+(<code>--sort=s</code>) inputs, validated in CI on every commit by a
+25-test suite covering BED3, BED6, gzip input, stdin input, the four
+sort paths, <code>--collapse</code>, <code>--natural-sort</code>, the
+<code>--sort=b</code> and <code>--sort=5</code> orders, and edge cases
+(empty file, single line, missing trailing newline, header-only file).
+The benchmark harness re-verifies correctness against the same reference
+at every size and configuration. For LociSSD output, cross-path
+consistency was verified on a 500k-record / 22-chromosome fixture: all
+four sort paths produce byte-identical Parquet (verified by md5sum on
+the full file payload), and the schema matches the v2 spec exactly.</p>
+<h1 id="discussion">Discussion</h1>
+<h2 id="choosing-a-sort-mode">Choosing a sort mode</h2>
+<p>pioSortBed’s four sort paths are not redundant; each is the right
+default in a different regime. Concretely:</p>
+<ul>
+<li><strong>Classic</strong> (default) — input fits in RAM with
+comfortable headroom and wall time is what matters. Smallest constant
+factor, simplest pipeline story.</li>
+<li><strong><code>--low-mem-ssd</code></strong> — input is ≥ ~10^6
+records, fits in RAM, and the node has SSD storage. Half the per-record
+metadata of classic, and per-chromosome parallel emit makes it the
+fastest path on real-world multi-chromosome BED.</li>
+<li><strong><code>--external-merge</code></strong> — input genuinely
+exceeds RAM, or the user wants a fixed RAM budget regardless of input
+size. Default zstd codec keeps temp-file writes to ~30% of output and is
+faster end-to-end than uncompressed runs.</li>
+<li><strong><code>--multi-pass</code></strong> — input is in the 1×–5×
+RAM range, the SSD’s remaining endurance budget matters, and the user is
+willing to trade ~2–3× wall time for zero temp writes. This is the right
+default for pipelines that re-sort the same BED hundreds of times per
+year on consumer-class SSDs.</li>
+</ul>
+<h2 id="locissd-as-a-sort-and-archive-output">LociSSD as a
+sort-and-archive output</h2>
+<p><code>--lociss-output</code> integrates the sort step with the
+immediate downstream representation that most analytical pipelines
+actually want. Pipelines that re-read a sorted BED several times pay for
+re-parsing it from text every time; emitting LociSSD once at sort time
+replaces those reparses with a Parquet open + statistics-aware predicate
+evaluation. With typical row-group sizes (65 536 rows) and the
+<code>MaxEndSoFar</code> column, overlap queries prune to the relevant
+row group(s) without a dedicated index scan. The optional row-precision
+interval index exists for the common case where ~24 B/record transient
+RAM is available during the sort and a downstream consumer wants
+row-precision pruning. The format itself is a Parquet file conforming to
+a published, versioned spec <span class="citation"
+data-cites="formatspec">(Balwierz 2026)</span>; the manifest in the
+footer KV records writer version and per-chromosome bounds for fast
+file-level introspection.</p>
+<h2 id="limitations">Limitations</h2>
+<p>Coordinates are stored as <code>int32_t</code> (≤ 2.15 Gbp per single
+coordinate) and total record count fits in <code>uint32_t</code> (≤ 4.29
+× 10^9 records). Both are well above any standard reference genome and
+any plausible single-file BED, but lifting either limit would require
+widening the relevant fields throughout the code path.</p>
+<p><code>--external-merge</code> and <code>--multi-pass</code> currently
+support only the default coordinate sort (<code>--sort=s</code>);
+<code>--sort=b</code> (start+end) and <code>--sort=5</code>
+(strand-aware 5’-end) require the in-RAM paths. <code>--collapse</code>
+(which sums weights for records sharing
+<code>(chromosome, start)</code>) is currently classic-path-only. Stdin
+and gzip input are accepted only by the in-RAM paths because the
+streaming paths require a seekable mmap’d input.</p>
+<h2 id="bam-input">BAM input</h2>
+<p>An optional in-RAM BAM input mode is available as a build-time flag
+(<code>make WITH_BAM=1 HTSLIB=…</code>); it reuses the same radix sort
+but reads and writes BAM via htslib <span class="citation"
+data-cites="danecek2021twelve">(Danecek et al. 2021)</span>. In our
+testing this BAM path is correct (output BAM byte-equivalent to
+<code>samtools sort</code> for every record) but not faster than
+<code>samtools sort</code>, because BGZF compression dominates wall time
+on BAM and is not the bottleneck pioSortBed’s design targets. We
+therefore recommend <code>samtools sort</code> for BAM workloads and
+pioSortBed for BED.</p>
+<h1 id="availability">Availability</h1>
+<p>pioSortBed is open source under the MIT license. The repository is at
+<code>&lt;TODO: https://github.com/&lt;user&gt;/pioSortBed&gt;</code>.
+The current release is v3.7.0. Prebuilt static
+<code>pioSortBed-linux-x86_64</code> binaries are published as GitHub
+release artefacts; building from source requires GCC ≥ 9, oneTBB, lz4,
+and zstd (<code>apt install libtbb-dev liblz4-dev libzstd-dev</code>).
+The <code>--lociss-output</code> mode requires Apache Arrow + Parquet
+C++ and is opt-in at build time (<code>make WITH_LOCISS=1</code>), so
+the default build has zero Arrow/Parquet dependency. The LociSSD format
+specification is in <code>FORMAT_SPEC.md</code> in the same
+repository.</p>
+<p>The benchmark scripts, fixtures, gnuplot drivers, and the CSVs
+underlying every figure and table in this paper are in
+<code>benchmark/</code> in the repository.</p>
+<h1 id="acknowledgements">Acknowledgements</h1>
+<p>&lt;TODO: optional — funding, collaborators, beta-testers.&gt;</p>
+<h1 class="unnumbered" id="references">References</h1>
+<div id="refs" class="references csl-bib-body hanging-indent"
+data-entry-spacing="0" role="list">
+<div id="ref-arrow" class="csl-entry" role="listitem">
+Apache Software Foundation. 2025a. <span>“<span>Apache Arrow</span>: A
+Cross-Language Development Platform for in-Memory Analytics.”</span> <a
+href="https://arrow.apache.org/"
+class="uri">https://arrow.apache.org/</a>.
+</div>
+<div id="ref-parquet" class="csl-entry" role="listitem">
+———. 2025b. <span>“<span>Apache Parquet</span>: A Columnar Storage
+Format.”</span> <a href="https://parquet.apache.org/"
+class="uri">https://parquet.apache.org/</a>.
+</div>
+<div id="ref-formatspec" class="csl-entry" role="listitem">
+Balwierz, Piotr. 2026. <span>“<span>LociSSD</span> File Format
+Specification, Version 2.”</span> <a
+href="https://github.com/&lt;user&gt;/pioSortBed/blob/master/FORMAT_SPEC.md"
+class="uri">https://github.com/&lt;user&gt;/pioSortBed/blob/master/FORMAT_SPEC.md</a>.
+</div>
+<div id="ref-zstd" class="csl-entry" role="listitem">
+Collet, Yann, Murray Kucherawy, and Facebook, Inc. 2024.
+<span>“<span>Zstandard</span>: A Fast Lossless Compression
+Algorithm.”</span> <a href="https://github.com/facebook/zstd"
+class="uri">https://github.com/facebook/zstd</a>.
+</div>
+<div id="ref-danecek2021twelve" class="csl-entry" role="listitem">
+Danecek, Petr, James K. Bonfield, Jennifer Liddle, John Marshall,
+Valeriu Ohan, Martin O. Pollard, Andrew Whitwham, et al. 2021.
+<span>“Twelve Years of <span>SAMtools</span> and
+<span>BCFtools</span>.”</span> <em>GigaScience</em> 10 (2): giab008. <a
+href="https://doi.org/10.1093/gigascience/giab008">https://doi.org/10.1093/gigascience/giab008</a>.
+</div>
+<div id="ref-coreutils" class="csl-entry" role="listitem">
+Free Software Foundation. 2025. <span>“<span>GNU
+Coreutils</span>.”</span> <a
+href="https://www.gnu.org/software/coreutils/"
+class="uri">https://www.gnu.org/software/coreutils/</a>.
+</div>
+<div id="ref-onetbb" class="csl-entry" role="listitem">
+Intel Corporation. 2025. <span>“<span class="nocase">oneAPI Threading
+Building Blocks (oneTBB)</span>.”</span> <a
+href="https://github.com/uxlfoundation/oneTBB"
+class="uri">https://github.com/uxlfoundation/oneTBB</a>.
+</div>
+<div id="ref-kent2002human" class="csl-entry" role="listitem">
+Kent, W. James, Charles W. Sugnet, Terrence S. Furey, Krishna M. Roskin,
+Tom H. Pringle, Alan M. Zahler, and David Haussler. 2002. <span>“The
+Human Genome Browser at <span>UCSC</span>.”</span> <em>Genome
+Research</em> 12 (6): 996–1006. <a
+href="https://doi.org/10.1101/gr.229102">https://doi.org/10.1101/gr.229102</a>.
+</div>
+<div id="ref-knuth1998art" class="csl-entry" role="listitem">
+Knuth, Donald E. 1998. <em>The Art of Computer Programming, Volume 3:
+Sorting and Searching</em>. 2nd ed. Addison-Wesley.
+</div>
+<div id="ref-li2011tabix" class="csl-entry" role="listitem">
+Li, Heng. 2011. <span>“Tabix: Fast Retrieval of Sequence Features from
+Generic <span>TAB</span>-Delimited Files.”</span>
+<em>Bioinformatics</em> 27 (5): 718–19. <a
+href="https://doi.org/10.1093/bioinformatics/btq671">https://doi.org/10.1093/bioinformatics/btq671</a>.
+</div>
+<div id="ref-neph2012bedops" class="csl-entry" role="listitem">
+Neph, Shane, M. Scott Kuehn, Alex P. Reynolds, Eric Haugen, Robert E.
+Thurman, Audra K. Johnson, Eric Rynes, et al. 2012.
+<span>“<span>BEDOPS</span>: High-Performance Genomic Feature
+Operations.”</span> <em>Bioinformatics</em> 28 (14): 1919–20. <a
+href="https://doi.org/10.1093/bioinformatics/bts277">https://doi.org/10.1093/bioinformatics/bts277</a>.
+</div>
+<div id="ref-quinlan2010bedtools" class="csl-entry" role="listitem">
+Quinlan, Aaron R., and Ira M. Hall. 2010. <span>“<span>BEDTools</span>:
+A Flexible Suite of Utilities for Comparing Genomic Features.”</span>
+<em>Bioinformatics</em> 26 (6): 841–42. <a
+href="https://doi.org/10.1093/bioinformatics/btq033">https://doi.org/10.1093/bioinformatics/btq033</a>.
+</div>
+<div id="ref-duckdb" class="csl-entry" role="listitem">
+Raasveldt, Mark, Hannes Mühleisen, and DuckDB Foundation. 2025.
+<span>“<span>DuckDB</span>: An Embeddable Analytical Database.”</span>
+<a href="https://duckdb.org/" class="uri">https://duckdb.org/</a>.
+</div>
+<div id="ref-cli11" class="csl-entry" role="listitem">
+Schreiner, Henry F., and CLI11 contributors. 2025.
+<span>“<span>CLI11</span>: A Header-Only c++11 (and Beyond) Command Line
+Parser.”</span> <a href="https://github.com/CLIUtils/CLI11"
+class="uri">https://github.com/CLIUtils/CLI11</a>.
+</div>
+<div id="ref-stovner2025pyranges" class="csl-entry" role="listitem">
+Stovner, Endre Bakken, and Pål Sætrom. 2025. <span>“PyRanges 1: A Clean
+Modern Python Interface to Genomic Intervals.”</span>
+<em>Bioinformatics</em>.
+</div>
+<div id="ref-encode2012integrated" class="csl-entry" role="listitem">
+The ENCODE Project Consortium. 2012. <span>“An Integrated Encyclopedia
+of <span>DNA</span> Elements in the Human Genome.”</span>
+<em>Nature</em> 489 (7414): 57–74. <a
+href="https://doi.org/10.1038/nature11247">https://doi.org/10.1038/nature11247</a>.
+</div>
+<div id="ref-polars" class="csl-entry" role="listitem">
+Vink, Ritchie, and Polars contributors. 2025.
+<span>“<span>Polars</span>: A Fast Multi-Threaded, Hybrid-Out-of-Core
+Query Engine for DataFrames.”</span> <a href="https://pola.rs/"
+class="uri">https://pola.rs/</a>.
+</div>
+<div id="ref-zook2016giab" class="csl-entry" role="listitem">
+Zook, Justin M., David Catoe, Jennifer McDaniel, Lindsay Vang, Noah
+Spies, Arend Sidow, Ziming Weng, et al. 2016. <span>“Extensive
+Sequencing of Seven Human Genomes to Characterize Benchmark Reference
+Materials.”</span> <em>Scientific Data</em> 3: 160025. <a
+href="https://doi.org/10.1038/sdata.2016.25">https://doi.org/10.1038/sdata.2016.25</a>.
+</div>
+</div>
+</body>
+</html>
