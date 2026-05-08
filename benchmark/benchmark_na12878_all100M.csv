@@ -1,0 +1,16 @@
+tool,version,wall_s,peak_rss_kb
+pio-classic-1t,3.7.0,30.22,11558508
+pio-classic-8t,3.7.0,24.44,11559440
+pio-low-mem-ssd-1t,3.7.0,27.05,8638876
+pio-low-mem-ssd-8t,3.7.0,14.82,11772844
+pio-external-merge-8t,3.7.0,16.23,10697696
+pio-multi-pass-8t,3.7.0,15.44,12584196
+pio-sort=b-8t,3.7.0,25.17,10692692
+pio-sort=5-8t,3.7.0,25.74,11559252
+pio-OLD-classic-1t,3.2.0,27.97,12338332
+pio-OLD-classic-8t,3.2.0,21.21,12339524
+pio-OLD-low-mem-ssd-1t,3.2.0,42.73,8766428
+gnu-sort-1t,sort (GNU coreutils) 9.11,176.50,11554404
+gnu-sort-8t,sort (GNU coreutils) 9.11,51.80,19366884
+bedops-sort-bed,2.4.42 (typical),65.65,8595276
+bedtools-sort,bedtools v2.31.1,143.75,51986144
