@@ -8,57 +8,180 @@ LC_ALL=C sort -k1,1 -k2,2n file.bed
 ```
 but significantly faster on large datasets. Supports BED3, BED6, and extended BED formats.
 
-## Algorithm
+## Sort modes
 
-pioSortBed has two sort paths:
+pioSortBed exposes **four sort paths**, all driven by the same parallel
+mmap-chunked parser and the same LSD radix sort kernel
+(`radixSort64`, an 8-pass 8-bit radix on packed `(chrIdx, pos)` 64-bit
+keys). The paths differ in how they hold per-record state, where they
+emit, and whether they write any temp files. Pick by the input size
+relative to your RAM and how much you care about SSD wear:
 
-- **`--low-mem-ssd` — recommended for any file ≥ ~1 M reads.** A two-pass
-  algorithm. Pass 1 walks the mmap'd input once and builds a 16-byte-per-
-  read index table with per-chromosome linked lists. Pass 2 processes each
-  chromosome independently: small per-chrom `std::sort`, then emit lines
-  via mmap pointers (no copy). Both passes parallelise; chromosomes flow
-  through a producer-consumer barrier so output is in alphabetical order.
-  Peak RAM scales with read count (~16 B per read for the index, plus the
-  mmap), not with chromosome length.
+### Which mode should I use?
 
-- **Classic path (the default when `--low-mem-ssd` isn't set)** holds the
-  whole input in a `seqread[]` array and runs an LSD radix sort over
-  packed `(chrIdx, pos)` 64-bit keys (`radixSort64`), falling back to
-  comparator `std::sort` only below a small-input threshold. At `-t > 1`
-  the radix builds per-thread digit histograms in parallel and scatters
-  into disjoint output ranges (no atomics).
+| Input size vs RAM | SSD wear matters? | Use | Why |
+|---|---|---|---|
+| Anything ≤ ~1 M reads | — | **default (classic)** | Lowest constant factor; two-pass overhead doesn't pay off below ~1 M. |
+| 1 M – RAM-sized | no | **`--low-mem-ssd -t 8`** | **Fastest path on real-world multi-chromosome BED.** Per-chromosome parallel emit beats the classic monolithic sort. |
+| 1× – 5× RAM | yes (re-sort weekly+) | **`--multi-pass -t 8`** | **Zero temp-file writes** — only the unavoidable output file. 2–3× slower than `--external-merge` but 0 NAND wear beyond the result. |
+| 1× – 5× RAM | no | **`--external-merge -t 8`** | Fast streaming sort with compressed (zstd) temp runs. ~30 % wear overhead. |
+| ≫ RAM | — | **`--external-merge -t 8 --max-mem=...`** | Only the streaming paths handle inputs that don't fit; external-merge scales asymptotically faster than multi-pass once K > ~5 groups. |
 
-  The classic path is mainly useful at small sizes (< ~1 M reads), where
-  the two-pass overhead of `--low-mem-ssd` dominates. Above that,
-  `--low-mem-ssd -t 4` or `-t 8` is faster on both wall time *and* peak
-  RSS — see the benchmark plots below.
+> Recipe in one line: try `--low-mem-ssd -t 8` first; switch to
+> `--multi-pass -t 8 --max-mem=4G` if your input exceeds RAM or you're
+> sort-bound on a consumer SSD; switch to `--external-merge -t 8` if
+> multi-pass is too slow on your input.
 
-**Parsing** (both paths, file input): the mmap is split into newline-
-aligned chunks parsed concurrently; per-chunk per-chromosome partials
-merge in a final serial step. `-t 1` short-circuits to a realloc-grow
-serial parser. Stdin / `.gz` input is slurped into a single buffer up
-front so it can use the same parser as the file path (zero per-line
-allocation).
+### Mode descriptions
+
+- **Classic path (default).** Holds the whole input in a 24-byte
+  `seqread[]` array (`int beg`, `int end`, union with `next`/`chrIdx`,
+  `uint16_t lineLen`, `char str`) and runs `radixSort64` on indices
+  packed as `(chrIdx << 32) | pos`. Falls back to comparator
+  `std::sort` only below ~3 M reads where the radix overhead dominates.
+  At `-t > 1` the radix builds per-thread digit histograms in parallel
+  and scatters into disjoint output ranges (no atomics). Emits zero-copy
+  from the mmap'd input buffer via `fwrite_unlocked(line, 1, lineLen,
+  stdout)`. **Best for:** anything that fits in RAM with comfortable
+  headroom and where you want the lowest possible constant factor.
+
+- **`--low-mem-ssd`.** Two-pass design. Pass 1 walks the mmap once and
+  builds a 16-byte-per-read table (`size_t off; uint32_t next; uint32_t
+  lineLen`) with per-chromosome linked lists. Pass 2 processes each
+  chromosome independently: small per-chrom `radixSort64` on a 32-bit
+  position key (chromosome-index drops out of the key — chromosomes
+  sort independently), then emit lines zero-copy from the mmap. Both
+  passes parallelise; chromosomes flow through a producer-consumer
+  barrier so output is in the user's chosen chromosome order. Peak RAM
+  is dominated by the mmap'd input plus 16 B/read; chromosome length
+  is irrelevant. **Best for:** ≥ ~1 M-read BEDs on SSD-backed systems
+  — at NA12878 scale (100M reads, 24 chromosomes) this is the
+  fastest path of all four (14.8 s vs 24.4 s for classic).
+
+- **`--external-merge`.** Bounded-RAM streaming sort. Pass 1 reads the
+  input in parallel chunks, fills an in-RAM run buffer up to
+  `--max-mem` (default 1 GiB), sorts the run with `radixSort64`, and
+  writes a **compressed** binary run file (default `zstd` codec, also
+  `lz4` or `raw`; `WITH_BAM` builds add htscodecs' SIMD-vectorised
+  rANS). Pass 2 is a k-way min-heap merge over all run files. Peak
+  RSS is bounded by `--max-mem` regardless of input size. zstd is the
+  default because it's faster *end-to-end* than uncompressed at scale
+  — the I/O saved by compression exceeds the codec CPU cost.
+  **Best for:** input genuinely exceeds RAM, or you want a fixed RAM
+  budget regardless of input size.
+
+- **`--multi-pass`.** K-pass scan with **zero temp-file writes**.
+  Pass 1 builds a histogram keyed by `(chrIdx, beg >> 20)` (1 MiB
+  position quantum) and bin-packs into K consecutive groups each
+  ≤ `--max-mem`. Passes 2..K+1 re-stream the input, filter to one
+  group, sort + emit. Total writes = output size only (no temps);
+  total reads = (K+1) × input size. **Best for:** input is 1×–5× RAM
+  and SSD endurance matters more than the 2–3× wall-time penalty over
+  `--external-merge`. A pipeline that re-sorts a 500M-record BED
+  weekly costs ~3.4 TBW/year on `--external-merge`, ~10.5 TBW/year on
+  GNU sort or bedops, and **0 TBW/year on `--multi-pass`**.
+
+### Compatibility matrix
+
+| Sort mode \ Feature | `--sort=s` (default) | `--sort=b` | `--sort=5` | `--collapse` | stdin / `.gz` | `--lociss-output` |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| classic (default) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `--low-mem-ssd`   | ✅ | ✅ | ✅ | ✅ | — | ✅ |
+| `--external-merge`| ✅ | — | — | — | — | ✅ |
+| `--multi-pass`    | ✅ | — | — | — | — | ✅ |
+
+Stdin and `.gz` inputs are slurped into memory first by the in-RAM paths;
+the streaming paths require a seekable mmap'd file. The `--sort=b`
+(start + end) and `--sort=5` (5'-end, strand-aware) orders require the
+in-RAM paths because the streaming-path run-file format only encodes
+the start-coordinate key.
+
+### Parallel parsing
+
+All four paths share the same parallel mmap-chunked parser: the input
+is split into newline-aligned chunks, each chunk is parsed by a worker
+thread into per-chromosome partial linked lists with global indices,
+and a final serial step concatenates the per-chunk lists into a single
+per-chromosome map (no rebase pass). At `-t 1` this short-circuits to
+a serial parser to avoid the per-chunk bookkeeping cost. Stdin / `.gz`
+input is slurped into one buffer up front and parsed through the same
+machinery.
+
+## LociSSD Parquet output
+
+`--lociss-output FILE` writes a sorted **Apache Parquet** file conforming
+to the LociSSD v2 spec ([`FORMAT_SPEC.md`](FORMAT_SPEC.md)) instead of
+(or alongside) BED text. The file contains four required columns
+— `Chromosome`, `Start`, `End`, and a derived `MaxEndSoFar`
+(per-chromosome running max of `End`) — plus a JSON manifest in the
+Parquet footer KV metadata.
+
+The format is **natively consumable by every Parquet-aware reader**
+with no glue:
+
+```python
+# polars
+import polars as pl
+df = pl.read_parquet("regions.lociss")
+
+# DuckDB
+import duckdb
+duckdb.sql("SELECT * FROM 'regions.lociss' "
+           "WHERE Chromosome = 'chr1' AND Start < 100000 AND MaxEndSoFar > 50000")
+
+# pyranges 1
+import pyranges as pr
+gr = pr.read_table("regions.lociss")
+```
+
+The `MaxEndSoFar` column makes the file **self-indexing for region
+queries**: a reader can prune row groups via Parquet's min/max
+statistics without a separate index scan. The optional `--lociss-index`
+flag additionally embeds a row-precision interval index in the footer
+KV (Arrow IPC stream, zstd-compressed) for fine-grained pruning at
+the cost of ~24 B/record transient RAM during sort.
+
+`--lociss-output` works on **every sort path** (classic, `--low-mem-ssd`,
+`--multi-pass`, `--external-merge`); only the corresponding sort-mode
+restrictions apply (`--sort=b|5` and `--collapse` are not yet supported
+with LociSSD output). Build with `make WITH_LOCISS=1` (requires
+`libarrow-dev` + `libparquet-dev`); the default build has zero Arrow /
+Parquet dependency.
 
 ## Installation
 
-**Dependencies:** GCC ≥ 9 (C++17), oneTBB (`libtbb-dev` on Debian/Ubuntu).
+**Dependencies:** GCC ≥ 9 (C++17), oneTBB, liblz4, libzstd
+(`apt install libtbb-dev liblz4-dev libzstd-dev` on Debian/Ubuntu).
 CLI11 is bundled in this repo.
 
 ```bash
 make
-make test       # optional: runs the test suite
+make test       # optional: runs the test suite (25 checks)
 make install    # optional: installs to /usr/local/bin (override PREFIX=...)
 ```
 
-Manual compilation:
+**Optional builds:**
+
+- `make WITH_BAM=1 HTSLIB=/path/to/htslib` adds an in-RAM BAM input
+  path (coord-sort only; reuses `radixSort64` and writes BAM via
+  htslib). Also enables htscodecs' SIMD-vectorised rANS codecs for
+  `--external-merge`.
+- `make WITH_LOCISS=1` enables the `--lociss-output` Parquet writer.
+  Requires `libarrow-dev libparquet-dev`. The default build has zero
+  Arrow/Parquet dependency.
+
+Manual compilation (default build):
 ```bash
 g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
-    -static-libstdc++ -static-libgcc -ltbb -DVERSION_STRING=\"3.0.11\"
+    -static-libstdc++ -static-libgcc -ltbb -llz4 -lzstd \
+    -DVERSION_STRING=\"3.7.0\"
 ```
 
 > Parallelism uses C++17 `std::execution::par` algorithms backed by oneTBB,
-> not OpenMP. The C++ runtime is linked statically; libtbb stays dynamic.
+> not OpenMP. The C++ runtime is linked statically; libtbb / lz4 / zstd
+> stay dynamic in the default `make`. The release binary
+> (`make release-binary TBB_LIB=...`) statically links all of libtbb,
+> lz4, and zstd to produce a self-contained `pioSortBed-linux-x86_64`.
 
 ## Usage
 
@@ -69,25 +192,49 @@ pioSortBed [options] -   # read from standard input
 
 | Option | Description |
 |--------|-------------|
+| **Sort key** | |
 | `-s s` / `--sort s` | Sort by start coordinate (default) |
-| `-s b` / `--sort b` | Sort by start and end coordinate |
-| `-s 5` / `--sort 5` | Sort by 5' end (respects strand: col 6) |
+| `-s b` / `--sort b` | Sort by start and end coordinate (classic / low-mem-ssd only) |
+| `-s 5` / `--sort 5` | Sort by 5' end, strand-aware (classic / low-mem-ssd only) |
 | `-n` / `--natural-sort` | Natural chromosome order: `chr2 < chr10` (default: lexicographic) |
-| `--collapse` | Collapse overlapping regions, summing weights |
-| `--low-mem-ssd` | Two-pass mode (SSD-friendly). **Recommended fast path for any file ≥ ~1 M reads** — beats the classic path on both wall time and peak RSS at scale. Stdin and `.gz` inputs are slurped into memory first; file input is mmap'd directly. |
-| `-t N` / `--threads N` | Number of threads for classic sort (0 = all cores; 1 = single-threaded) |
-| `--max-mem=N[GMK]` | Memory cap on the `--low-mem-ssd` parallel pass-2 emit-buffer budget (e.g. `4G`, `500M`). Without it `--low-mem-ssd` runs uncapped — usually what you want. Set this only to *prevent* OOM, not to optimise memory. See the [`--max-mem` sweep below](#--max-mem-budget-sweep-pio-lm--t-4--200m). |
+| **Sort path** (see [Sort modes](#sort-modes) for which to pick) | |
+| *(no flag)* | Classic in-RAM `radixSort64` path (default) |
+| `--low-mem-ssd` | Two-pass mode — fastest path at ≥ 1 M reads on SSD-backed systems |
+| `--external-merge` | Streaming sort with compressed (zstd) temp files. Use for inputs > RAM |
+| `--multi-pass` | K-pass scan, **zero temp-file writes**. SSD-wear-friendly fallback |
+| **Memory / threading / I/O** | |
+| `-t N` / `--threads N` | Number of threads (0 = all cores; 1 = single-threaded) |
+| `--max-mem=N[GMK]` | RAM cap. For `--low-mem-ssd`: parallel pass-2 emit budget (default uncapped). For `--external-merge`: per-run buffer (default 1 GiB). For `--multi-pass`: per-group budget. |
+| `--merge-codec raw\|lz4\|zstd` | Temp-file compression for `--external-merge` (default: `zstd`). With `WITH_BAM=1`: also `rans0`, `rans1`. |
+| `--tmpdir DIR` | Temp directory for `--external-merge` runs (default: `$TMPDIR` or `/tmp`) |
+| `-o FILE` / `--output FILE` | Write to file instead of stdout |
+| **Other** | |
+| `--collapse` | Collapse overlapping regions, summing weights (classic / low-mem-ssd only) |
+| `--lociss-output FILE` | Write sorted Parquet (LociSSD v2 spec) instead of BED text. Works on every sort path. Requires `make WITH_LOCISS=1`. See [LociSSD Parquet output](#lociss-parquet-output). |
+| `--lociss-index` | Embed an optional row-precision interval index in the LociSSD output footer |
+| `-v` / `--verbose` | Print parsing / sorting timing and chromosome stats to stderr |
+| `-V` / `--version` | Print version and exit |
 | `-h` / `--help` | Show help message |
 
 BED header lines (`track`, `browser`, `#` comments) are passed through unchanged to output. Gzip-compressed input (`.gz` extension) is transparently decompressed.
 
 **Examples:**
 ```bash
-pioSortBed input.bed > sorted.bed
-pioSortBed input.bed.gz > sorted.bed          # gzip input
-cat input.bed | pioSortBed - > sorted.bed
-pioSortBed --sort b input.bed > sorted.bed
-pioSortBed --natural-sort input.bed > sorted.bed   # chr2 before chr10
+# Common cases
+pioSortBed input.bed > sorted.bed                      # small file
+pioSortBed --low-mem-ssd -t 8 input.bed > sorted.bed   # ≥ 1 M reads, RAM-fits — recommended
+pioSortBed input.bed.gz > sorted.bed                   # gzip input
+cat input.bed | pioSortBed - > sorted.bed              # stdin
+pioSortBed --sort b input.bed > sorted.bed             # tie-break by end coord
+pioSortBed --natural-sort input.bed > sorted.bed       # chr2 before chr10
+
+# Streaming sorts (input ≫ RAM, or wear-sensitive workflow)
+pioSortBed --external-merge -t 8 --max-mem=4G huge.bed > sorted.bed
+pioSortBed --multi-pass     -t 8 --max-mem=4G huge.bed > sorted.bed   # 0 temp writes
+
+# LociSSD Parquet output (requires WITH_LOCISS=1 build)
+pioSortBed --low-mem-ssd -t 8 --lociss-output sorted.lociss input.bed
+pioSortBed --low-mem-ssd -t 8 --lociss-output sorted.lociss --lociss-index input.bed
 ```
 
 ## Benchmark Results
@@ -333,29 +480,39 @@ at process exit — the SSD-wear-relevant metric).
 ![Peak RSS @ 16G / -t 8](benchmark/bench_external_16G_t8_rss.png)
 ![Total disk writes @ 16G / -t 8](benchmark/bench_external_16G_t8_writes.png)
 
+Refreshed under v3.7.0 (the v3.5.0 baseline is preserved as
+`benchmark/bench_external_16G_t8.v3.5.0_baseline.csv`):
+
 | Reads | Input | Tool | T | Wall | Peak RSS | Disk writes |
 |------:|------:|------|--:|-----:|---------:|------------:|
-|  50 M | 2.0 GB | `pio --external-merge zstd` | 8 | **6.0 s**  | 5.1 GB  | 2.7 GB |
-|       |        | `pio --multi-pass`          | 8 | 7.0 s      | 6.4 GB  | **2.0 GB** |
-|       |        | `bedops sort-bed`           | 1 | 36.2 s     | 2.7 GB  | 2.0 GB |
-|       |        | `GNU sort --parallel=8`     | 8 | 20.6 s     | 8.3 GB  | 2.0 GB |
-| 100 M | 4.0 GB | `pio --external-merge zstd` | 8 | **12.8 s** | 10.1 GB | 5.4 GB |
-|       |        | `pio --multi-pass`          | 8 | 16.8 s     | 12.9 GB | **4.0 GB** |
-|       |        | `bedops sort-bed`           | 1 | 71.3 s     | 5.5 GB  | 4.0 GB |
-|       |        | `GNU sort --parallel=8`     | 8 | 49.0 s     | 16.6 GB | 4.0 GB |
-| 200 M | 8.0 GB | `pio --external-merge zstd` | 8 | **27.6 s** | 20.1 GB | 10.8 GB |
-|       |        | `pio --multi-pass`          | 8 | 39.5 s     | 20.3 GB | **8.2 GB** |
-|       |        | `bedops sort-bed`           | 1 | 160 s      | 10.9 GB | 8.2 GB |
-|       |        | `GNU sort --parallel=8`     | 8 | 125 s      | 16.8 GB | 16.3 GB |
-| 500 M | 21.6 GB | `pio --external-merge zstd`| 8 | **82.9 s** | 21.5 GB | 27.2 GB |
-|       |        | `pio --multi-pass`          | 8 | 122 s      | 24.7 GB | **20.6 GB** |
-|       |        | `bedops sort-bed`           | 1 | 708 s      | 19.6 GB | 41.2 GB |
-|       |        | `GNU sort --parallel=8`     | 8 | 332 s      | 16.8 GB | 41.2 GB |
+|  10 M | 0.4 GB | `pio --external-merge zstd` | 8 | **1.2 s**  | 1.0 GB  | 0.5 GB |
+|       |        | `pio --multi-pass`          | 8 | 1.3 s      | 1.2 GB  | **0.4 GB** |
+|       |        | `bedops sort-bed`           | 1 | 6.0 s      | 0.5 GB  | 0.4 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 3.7 s      | 1.6 GB  | 0.4 GB |
+|  50 M | 2.0 GB | `pio --external-merge zstd` | 8 | **6.2 s**  | 5.0 GB  | 2.6 GB |
+|       |        | `pio --multi-pass`          | 8 | 6.4 s      | 6.1 GB  | **2.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 30.3 s     | 2.6 GB  | 2.0 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 22.0 s     | 7.9 GB  | 2.0 GB |
+| 100 M | 4.0 GB | `pio --external-merge zstd` | 8 | **12.2 s** | 10.1 GB | 5.2 GB |
+|       |        | `pio --multi-pass`          | 8 | 12.8 s     | 12.3 GB | **3.9 GB** |
+|       |        | `bedops sort-bed`           | 1 | 60.8 s     | 5.2 GB  | 3.9 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 47.3 s     | 15.9 GB | 3.9 GB |
+| 200 M | 8.0 GB | `pio --external-merge zstd` | 8 | **25.5 s** | 20.3 GB | 10.6 GB |
+|       |        | `pio --multi-pass`          | 8 | 31.4 s     | 24.7 GB | **8.0 GB** |
+|       |        | `bedops sort-bed`           | 1 | 125 s      | 10.4 GB | 8.0 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 114 s      | 16.0 GB | 16.0 GB |
+| 500 M | 21.6 GB | `pio --external-merge zstd`| 8 | **66.8 s** | 39.3 GB | 26.6 GB |
+|       |        | `pio --multi-pass`          | 8 | 80.4 s     | 42.6 GB | **20.1 GB** |
+|       |        | `bedops sort-bed`           | 1 | 506 s      | 18.6 GB | 40.3 GB |
+|       |        | `GNU sort --parallel=8`     | 8 | 313 s      | 16.0 GB | 40.3 GB |
 
 At the 500 M / 21 GB / 16 GiB-cap case (input ≫ cap, all tools spill or
-multi-pass): **`pio --external-merge -t 8` is 4× faster than GNU sort
-and 9× faster than bedops**, while `pio --multi-pass -t 8` writes
-**52 % less** than either alternative.
+multi-pass): **`pio --external-merge -t 8` is 4.7× faster than GNU sort
+and 7.6× faster than bedops**, while `pio --multi-pass -t 8` writes
+**50 % less** than either alternative (20.1 GB vs 40.3 GB). Compared to
+the v3.5.0 baseline, v3.7.0 cut extmerge's 500M wall time by 19 %
+(82.9 → 66.8 s) and multi-pass's by 34 % (121.9 → 80.4 s) thanks to
+threading `numThreads` through `radixSort64` in each run.
 
 **Key findings (4 GiB cap, 8 threads):**
 
@@ -392,27 +549,30 @@ Data: `benchmark/bench_external_4G_t8.csv` /
 
 ### Performance Summary
 
-**Recommended path:** `pioSortBed --low-mem-ssd -t N input.bed > sorted.bed`,
-with `N` = 4 or 8 on a typical desktop (8 if you have ≥ 16 GB RAM and the
-hardware to back it up; 4 if you'd rather trade ~25 % wall time for ~17 %
-lower peak RSS — see the [`--max-mem` sweep section](#--max-mem-budget-sweep-pio-lm--t-4--200m)
-above).
+For a one-line answer: see the [Which mode should I use?](#which-mode-should-i-use)
+table at the top of the *Sort modes* section. The benchmarks above
+support that recipe with concrete numbers across the four pioSortBed
+paths plus GNU sort, bedops, and bedtools.
 
-**Classic path** (default, no `--low-mem-ssd`):
-- LSD radix sort (`radixSort64`) over packed `(chrIdx, pos)` 64-bit keys.
-  Falls back to `std::sort` only below a small-input threshold. `-t 1`
-  is serial radix; `-t > 1` builds per-thread digit histograms in
-  parallel and scatters into disjoint output ranges (no atomics).
-- Use cases: small inputs (< ~1 M reads, where the two-pass overhead of
-  `--low-mem-ssd` dominates), and benchmarking.
+Headline numbers from the real-data NA12878 100M-read benchmark below
+(6.6 GB BED, 24 chromosomes, all paths at `-t 8`):
 
-**Parsing** (both paths, mmap or stdin slurp): file split into newline-
-aligned chunks parsed in parallel; per-chunk per-chromosome partials
-merged at the end. `-t 1` falls through to a realloc-grow serial parser.
+| Mode | Wall | vs GNU sort -1t |
+|---|---:|---:|
+| `--low-mem-ssd` | **14.8 s** | 11.9× |
+| `--multi-pass` | 15.4 s | 11.5× |
+| `--external-merge` | 16.2 s | 10.9× |
+| classic (default) | 24.4 s | 7.2× |
+| GNU sort `--parallel=8` | 51.8 s | 3.4× |
+| bedops sort-bed | 65.7 s | 2.7× |
+| bedtools sort | 144 s | 1.2× |
+| `LC_ALL=C sort -k1,1 -k2,2n` | 176 s | 1.0× |
 
-To reproduce: `bash benchmark/benchmark.sh` (requires GNU time; gnuplot
-for plots; `TMPDIR=/var/tmp` recommended for the 100 M+ sizes — GNU sort
-spill files plus the 8.6 GB 200 M-row fixture exceed a 16 GB tmpfs).
+To reproduce the synthetic sweep: `bash benchmark/benchmark.sh`
+(requires GNU time; gnuplot for plots; `TMPDIR=/var/tmp` recommended
+for the 100 M+ sizes — GNU sort spill files plus the 8.6 GB 200 M-row
+fixture exceed a 16 GB tmpfs). For the real-data benchmark:
+`bash benchmark/benchmark_na12878.sh all100M`.
 
 ### Real-data Benchmark: NA12878 WGS (chr20, 120M reads)
 
