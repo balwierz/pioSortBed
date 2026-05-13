@@ -4154,19 +4154,19 @@ int main(int argc, char *argv[])
 	char* outBuf = (char*) malloc(1 << 23);
 	setvbuf(stdout, outBuf, _IOFBF, 1 << 23);
 
-	CLI::App app{"Ultra fast bed file sorter\nPiotr Balwierz, 2012-2026\n\n"
-		"Results are equivalent to \"LC_ALL=C sort -k1,1 -k2,2n file.bed\"\n"
-		"or \"sort -k1,1 -k2,2n -k3,3n file.bed\" if --sort=b enabled.\n"
-		"Defaults to all cores; pass -t 1 for single-threaded.\n"
-		"For files > ~1 M reads, --low-mem-ssd is the recommended fast path.\n\n"
-		"Input file should contain a new line character in the end of the last line.\n"
-		"Gzip-compressed input (.gz) is transparently decompressed via gzip.\n"
-		"BED header lines (track/browser/#) are passed through unchanged.\n\n"
-		"Compilation-time limits:\n"
-		"  Line length: no fixed limit (stdin/gzip uses getline; mmap uses memchr).\n"
-		"  Chromosome name: no fixed limit (stored as pointer+length).\n"
-		"  Weight field (BED col 4, --collapse): " + to_string(kWeightBufSize - 1) + " B; over-long values are rejected with an error.\n"
-		"  Read number limit: " + to_string((unsigned long long)UINT32_MAX - 1) + " (all paths).\n"};
+	CLI::App app{
+		"pioSortBed — a fast, multi-mode BED file sorter.\n"
+		"Output is byte-identical to `LC_ALL=C sort -k1,1 -k2,2n` (default --sort=s).\n"
+		"\n"
+		"Sort paths (pick one, or none for the in-RAM default):\n"
+		"  (default)        in-RAM classic radix sort\n"
+		"  --low-mem-ssd    two-pass, per-chromosome parallel emit — fastest at >= 1M reads\n"
+		"  --external-merge bounded-RAM streaming sort with compressed temp runs\n"
+		"  --multi-pass     K-pass scan, zero temp-file writes; SSD-wear-friendly\n"
+		"\n"
+		"Defaults to all cores; pass `-t 1` for serial. Header lines\n"
+		"(track / browser / #) pass through unchanged. Gzip inputs (.gz) are\n"
+		"transparently decompressed."};
 	app.set_version_flag("-V,--version", VERSION_STRING);
 
 	string inputFile;
@@ -4193,72 +4193,56 @@ int main(int argc, char *argv[])
 	app.add_option("input-file", inputFile,
 		"input file; \"-\" reads from stdin; .gz files are decompressed automatically")
 		->required();
-	app.add_option("-o,--output", outputFile,
-		"write sorted output to this file (default: stdout)");
 	app.add_option("-s,--sort", sortMode,
-		"s: start coordinate [default]\n"
-		"b: sort also by end coordinate\n"
-		"5: sort by 5' end (respects strand)")
-		->default_val('s');
+		"sort key:  s = start coord (default)  |  b = start + end  |  5 = 5'-end, strand-aware")
+		->default_val('s')
+		->default_str("s")
+		->option_text("{s|b|5}");
 	app.add_flag("--collapse", fCollapse,
-		"collapse BEDWEIGHT by summing weights of the reads and truncate the coordinates, "
-		"set strand to \"+\", id to \".\". Makes no sense for --sort=b");
+		"collapse records sharing (chromosome, start) by summing their score "
+		"column; truncates coordinates to a single base and sets strand=+. "
+		"Not compatible with --sort=b");
 	app.add_flag("--low-mem-ssd", lowMemSSD,
-		"low-memory two-pass file mode (SSD-friendly): keeps line offsets in RAM and "
-		"sorts one chromosome at a time; slower than default but uses less peak RAM");
+		"two-pass, per-chromosome parallel emit. Recommended fast path "
+		"for >= 1M reads on SSD-backed systems");
 	app.add_flag("--external-merge", extMerge,
-		"external merge sort: stream the input, build sorted runs in RAM up to "
-		"--max-mem (default 1G), spill each run as a binary temp file, k-way "
-		"merge to stdout. Use for inputs > RAM. Temp files go to --tmpdir or "
-		"$TMPDIR. (only the default coordinate sort is supported)");
+		"bounded-RAM streaming sort. Builds sorted runs of --max-mem bytes "
+		"(default 1G), spills compressed temp files to --tmpdir (or $TMPDIR), "
+		"k-way merges to output. Use for inputs >= RAM. --sort=s only");
 	app.add_flag("--multi-pass", multiPass,
-		"K-pass scan, no disk writes: pass 1 builds a histogram + bin-packs "
-		"into K consecutive (chr,beg) groups <= --max-mem; passes 2..K+1 "
-		"re-stream the input filtering by group, sort + emit. Use for "
-		"medium inputs (~1-5x RAM) where SSD-wear matters and you don't "
-		"want temp files. K = ceil(file_size / --max-mem). "
-		"(only the default coordinate sort; file input only)");
+		"K-pass scan with zero temp-file writes. Re-streams the input "
+		"(K+1) times instead of spilling. SSD-wear-friendly alternative "
+		"to --external-merge for inputs in the 1x-5x RAM range. --sort=s "
+		"only, file input only");
 	app.add_option("--merge-codec", extCodecStr,
-		"compression codec for --external-merge temp files: raw|lz4|zstd"
-		" (rans0|rans1 also available in WITH_BAM builds). zstd is the "
-		"default — fastest compressed codec, best ratio, and at large "
-		"sizes it is faster than `raw` end-to-end because compression "
-		"saves more disk I/O than its CPU costs.")
-		->default_val("zstd");
+		"compression codec for --external-merge temp runs (zstd is fastest "
+		"end-to-end at scale because saved I/O exceeds compression CPU)")
+		->default_val("zstd")
+		->option_text("{raw|lz4|zstd}");
 	app.add_option("--tmpdir", extTmpDir,
 		"temp directory for --external-merge run files (default: $TMPDIR or /tmp)");
 	app.add_option("-t,--threads", numThreads,
-		"number of threads for the classic sort path "
-		"(0 = all cores; 1 = single-threaded std::sort)")
+		"worker threads (0 = all available cores, 1 = serial)")
 		->default_val(0);
 	app.add_flag("-n,--natural-sort", naturalSort,
-		"sort chromosomes in natural order (chr2 < chr10) instead of "
-		"lexicographic order (chr10 < chr2)");
+		"sort chromosomes in natural order (chr2 < chr10) instead of lexicographic");
 	app.add_option("--max-mem", maxMemStr,
-		"memory cap on per-chromosome scratch in --low-mem-ssd parallel "
-		"emit (e.g. 4G, 500M, 2048K, or bare bytes). Without this, "
-		"--low-mem-ssd runs uncapped. Set only to PREVENT OOM, not to "
-		"optimise memory.");
+		"memory cap, accepts suffix K/M/G (e.g. 4G, 500M). Required by "
+		"--external-merge and --multi-pass; advisory for --low-mem-ssd "
+		"(uncapped by default)");
+	app.add_option("-o,--output", outputFile,
+		"write sorted output to this file (default: stdout)");
 	app.add_flag("-v,--verbose", verbose,
-		"print parsing / sorting timing and per-chromosome length info to stderr "
-		"(default: silent)");
+		"report parsing / sorting timings and per-chromosome stats on stderr");
 #ifdef WITH_LOCISS
 	app.add_option("--lociss-output", locissOutput,
-		"write a LociSSD v2 Parquet file to FILE instead of BED text on "
-		"stdout. Schema: Chromosome (string), Start (int32), End (int32), "
-		"MaxEndSoFar (int32); zstd-3 compression; manifest JSON in the "
-		"Parquet file-level KV metadata. Atomic write (tmp + rename). "
-		"Works on every sort path (default classic, --low-mem-ssd, "
-		"--multi-pass, --external-merge); --collapse and --sort=b|5 are "
-		"not yet supported.");
+		"write a sorted LociSSD v2 Parquet file (FORMAT_SPEC.md) instead "
+		"of BED text. Works on every sort path; --collapse and --sort=b|5 "
+		"are not yet supported");
 	app.add_flag("--lociss-index", locissIndex,
-		"also embed the optional spec-§6.5 interval index under the "
-		"Parquet footer KV key `lociSSD_interval_index` (Arrow IPC "
-		"stream, zstd-compressed, schema chromosome/starts/ends/"
-		"max_end_running/row_id). Memory cost: ~24 B/record retained "
-		"until output finalises (no streaming yet). Use only when a "
-		"reader actually needs row-precision pruning beyond what the "
-		"§7 predicate pushdown gives.");
+		"with --lociss-output, also embed an optional row-precision "
+		"interval index in the Parquet footer (Arrow IPC stream, "
+		"zstd-compressed). Costs ~24 B/record transient RAM during sort");
 #endif
 
 	CLI11_PARSE(app, argc, argv);
