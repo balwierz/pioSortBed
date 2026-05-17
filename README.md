@@ -148,6 +148,44 @@ with LociSSD output). Build with `make WITH_LOCISS=1` (requires
 `libarrow-dev` + `libparquet-dev`); the default build has zero Arrow /
 Parquet dependency.
 
+### Handling non-standard BED-like input
+
+BED has no header and no schema enforcement: production pipelines
+routinely emit "BED-like" files with custom column layouts (narrowPeak,
+methylation calls with extra signal columns, fragment maps with
+strand-and-counts tails, etc.). pioSortBed handles arbitrary tail
+columns by **detecting from the first record** whether the input has
+any columns past `End`. The schema is then locked for the whole file:
+
+| First record shape | Resulting LociSSD schema |
+|---|---|
+| 3 columns (pure BED3) | `Chromosome, Start, End, MaxEndSoFar` |
+| 4+ columns (anything past End) | `Chromosome, Start, End, Tail, MaxEndSoFar` |
+
+`Tail` is a single `string` column carrying the raw post-`End`
+tab-separated bytes verbatim (no leading tab). Three properties worth
+noting:
+
+1. **Column layout doesn't matter.** Whether the input is BED4, BED6,
+   BED12, narrowPeak (10 cols), or some lab's custom 7-column format,
+   the bytes round-trip into `Tail` unchanged. Downstream tools split
+   the `Tail` string locally for the columns they actually need.
+2. **Column count can vary record-to-record.** Within a BED4+ file
+   one record can have 6 user fields and another 8 — `Tail` is just
+   different strings. Useful for messy real-world inputs.
+3. **Mixing BED3 and BED4+ in the same file is rejected.** Parquet
+   doesn't support mid-write schema evolution, so once the first
+   record's tail-presence determines the schema, every later record
+   must match. The error message is explicit and suggests either
+   splitting the input or padding the BED3 records with a placeholder
+   column (e.g. `awk -F'\t' 'NF==3{$0=$0"\t."} 1'`).
+
+For genuine BED4 / BED5 / BED6 / BED12 inputs, future versions may
+split the typed columns out (Name, Score, Strand, …) so downstream
+tools can predicate-push on Strand and friends without parsing the
+`Tail` string. Today the `Tail` string preserves all data and unblocks
+the LociSSD output for every BED variant in the wild.
+
 ## Installation
 
 **Dependencies:** GCC ≥ 9 (C++17), oneTBB, liblz4, libzstd
