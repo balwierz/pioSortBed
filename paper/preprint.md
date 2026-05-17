@@ -649,12 +649,28 @@ paths require a seekable mmap'd input.
 
 An optional in-RAM BAM input mode is available as a build-time flag
 (`make WITH_BAM=1 HTSLIB=…`); it reuses the same radix sort but reads
-and writes BAM via htslib [@danecek2021twelve]. In our testing this BAM
-path is correct (output BAM byte-equivalent to `samtools sort` for
-every record) but not faster than `samtools sort`, because BGZF
+and writes BAM via htslib [@danecek2021twelve]. On a 1.1 GB / 57.8 M-
+read BAM, pioSortBed produces a record-identical output BAM (md5sum
+match across samtools view of `pio.bam`, `samtools sort default.bam`,
+and `samtools sort -m 4G.bam`). Wall time is competitive but not
+better than `samtools sort` (23 s for pio at `-t 8` vs 22 s for
+samtools default vs 18 s for `samtools sort -m 4G`); BGZF
 compression dominates wall time on BAM and is not the bottleneck
-pioSortBed's design targets. We therefore recommend `samtools sort`
-for BAM workloads and pioSortBed for BED.
+pioSortBed's design targets.
+
+pioSortBed *does* write less to disk than `samtools sort` at default
+settings: 1007 MB (output only) vs 2091 MB (output + ~1 GB of
+temp-file spills). At `samtools sort -m 4G` (large enough to fit the
+sort in RAM, no spilling) the two tools tie on bytes written but
+samtools uses 3.4× less peak RSS (16 GB vs 24 GB) because it
+streams records through a partial in-RAM index instead of holding
+every parsed record. Net: pioSortBed's BAM path is competitive on
+wall time and bytes written, but is RAM-constrained to BAMs that
+unpack to roughly half of system RAM (the 1.1 GB compressed BAM
+above peaked at 24 GB of RSS; multi-GB BAMs would exceed it). We
+therefore recommend `samtools sort -m N` for large BAM workloads
+where samtools' streaming design fits the available RAM budget, and
+pioSortBed for BED.
 
 # Availability
 

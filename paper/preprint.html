@@ -1189,13 +1189,28 @@ streaming paths require a seekable mmap’d input.</p>
 <p>An optional in-RAM BAM input mode is available as a build-time flag
 (<code>make WITH_BAM=1 HTSLIB=…</code>); it reuses the same radix sort
 but reads and writes BAM via htslib <span class="citation"
-data-cites="danecek2021twelve">(Danecek et al. 2021)</span>. In our
-testing this BAM path is correct (output BAM byte-equivalent to
-<code>samtools sort</code> for every record) but not faster than
-<code>samtools sort</code>, because BGZF compression dominates wall time
-on BAM and is not the bottleneck pioSortBed’s design targets. We
-therefore recommend <code>samtools sort</code> for BAM workloads and
-pioSortBed for BED.</p>
+data-cites="danecek2021twelve">(Danecek et al. 2021)</span>. On a 1.1 GB
+/ 57.8 M- read BAM, pioSortBed produces a record-identical output BAM
+(md5sum match across samtools view of <code>pio.bam</code>,
+<code>samtools sort default.bam</code>, and
+<code>samtools sort -m 4G.bam</code>). Wall time is competitive but not
+better than <code>samtools sort</code> (23 s for pio at
+<code>-t 8</code> vs 22 s for samtools default vs 18 s for
+<code>samtools sort -m 4G</code>); BGZF compression dominates wall time
+on BAM and is not the bottleneck pioSortBed’s design targets.</p>
+<p>pioSortBed <em>does</em> write less to disk than
+<code>samtools sort</code> at default settings: 1007 MB (output only) vs
+2091 MB (output + ~1 GB of temp-file spills). At
+<code>samtools sort -m 4G</code> (large enough to fit the sort in RAM,
+no spilling) the two tools tie on bytes written but samtools uses 3.4×
+less peak RSS (16 GB vs 24 GB) because it streams records through a
+partial in-RAM index instead of holding every parsed record. Net:
+pioSortBed’s BAM path is competitive on wall time and bytes written, but
+is RAM-constrained to BAMs that unpack to roughly half of system RAM
+(the 1.1 GB compressed BAM above peaked at 24 GB of RSS; multi-GB BAMs
+would exceed it). We therefore recommend <code>samtools sort -m N</code>
+for large BAM workloads where samtools’ streaming design fits the
+available RAM budget, and pioSortBed for BED.</p>
 <h1 id="availability">Availability</h1>
 <p>pioSortBed is open source under the MIT license. The repository is at
 <code>https://github.com/balwierz/pioSortBed</code>. The current release
