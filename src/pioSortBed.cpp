@@ -5115,8 +5115,10 @@ int main(int argc, char *argv[])
 #ifdef WITH_LOCISS
 	app.add_option("--lociss-output", locissOutput,
 		"write a sorted LociSSD v2 Parquet file (FORMAT_SPEC.md) instead "
-		"of BED text. Works on every sort path; --collapse and --sort=b|5 "
-		"are not yet supported");
+		"of BED text. Works on every sort path. Pairs with --collapse on "
+		"the classic sort path (writes a 5-column {Chr,Start,End,Score "
+		"double,MaxEndSoFar} schema per FORMAT_SPEC §10). --sort=b|5 not "
+		"yet supported");
 	app.add_flag("--lociss-index", locissIndex,
 		"with --lociss-output, also embed an optional row-precision "
 		"interval index in the Parquet footer (Arrow IPC stream, "
