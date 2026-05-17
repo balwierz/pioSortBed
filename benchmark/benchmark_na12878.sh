@@ -38,6 +38,17 @@ command -v sort     &>/dev/null && HAS_SORT=1
 command -v sort-bed &>/dev/null && HAS_BEDOPS=1
 command -v bedtools &>/dev/null && HAS_BEDTOOLS=1
 
+# Loci (Python; polars + pandas sort backends).
+# Env override: LOCI_PY=/path/to/python with `loci` importable.
+LOCI_PY="${LOCI_PY:-/home/piotr/Environments/Python3.14/bin/python}"
+LOCI_SORT_SCRIPT="${LOCI_SORT_SCRIPT:-/home/piotr/Sources/Loci1/examples/sort_bed.py}"
+HAS_LOCI=0
+LOCI_VER=""
+if [[ -x "$LOCI_PY" ]] && [[ -f "$LOCI_SORT_SCRIPT" ]]; then
+    LOCI_VER=$("$LOCI_PY" -c 'import loci; print(loci.__version__)' 2>/dev/null || true)
+    [[ -n "$LOCI_VER" ]] && HAS_LOCI=1
+fi
+
 READ_COUNT=$(wc -l < "$BED_FILE")
 # Follow symlinks (-L) so we get the real file size, not the symlink's 71 bytes.
 FILE_SIZE_H=$(du -hL "$BED_FILE" | cut -f1)
@@ -54,6 +65,11 @@ else
     echo "Previous bin   : NOT FOUND ($PIO_OLD) — version comparison skipped"
 fi
 echo "max-mem cap    : $MAX_MEM (for --low-mem-ssd / --external-merge / --multi-pass)"
+if (( HAS_LOCI )); then
+    echo "Loci           : $LOCI_PY (loci $LOCI_VER)"
+else
+    echo "Loci           : NOT FOUND ($LOCI_PY) — polars/pandas runs skipped"
+fi
 echo "==============================================================="
 echo ""
 
@@ -152,6 +168,26 @@ fi
 if (( HAS_BEDTOOLS )); then
     BT_VER=$(bedtools --version 2>&1 | head -1 || true)
     run_one "bedtools-sort"   "$BT_VER" bedtools sort -i "$BED_FILE"
+fi
+
+if (( HAS_LOCI )); then
+    # Loci wraps polars / pandas with a BED-aware reader+sorter. The example
+    # script sort_bed.py reads via loci.{polars_api,readers}.read_bed, sorts
+    # by (Chromosome, Start, End), writes BED. Wall time includes Python
+    # interpreter + Loci import startup (~0.2–0.3 s).
+    #
+    # The pandas backend reorders columns to put Strand 4th (its on-disk
+    # convention), so the output is not byte-identical to GNU sort's
+    # column-preserving order. The polars backend preserves column order.
+    echo "--- Loci ($LOCI_VER) — polars + pandas backends ---"
+    run_one "loci-polars-1t" "loci $LOCI_VER" \
+            "$LOCI_PY" "$LOCI_SORT_SCRIPT" "$BED_FILE" -c 1 -b polars
+    run_one "loci-polars-8t" "loci $LOCI_VER" \
+            "$LOCI_PY" "$LOCI_SORT_SCRIPT" "$BED_FILE" -c 8 -b polars
+    run_one "loci-pandas-1t" "loci $LOCI_VER" \
+            "$LOCI_PY" "$LOCI_SORT_SCRIPT" "$BED_FILE" -c 1 -b pandas
+    run_one "loci-pandas-8t" "loci $LOCI_VER" \
+            "$LOCI_PY" "$LOCI_SORT_SCRIPT" "$BED_FILE" -c 8 -b pandas
 fi
 
 echo ""

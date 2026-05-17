@@ -155,6 +155,7 @@ The 3.0.x cleanup pass removed every previously hard-coded compile-time limit. C
 - `benchmark/bench_max_mem.sh` — `--max-mem` budget sweep on `pio-lm -t 4 @ 200 M`
 - `benchmark/bench_query.sh` + `bench_query_drivers.py` — region-query latency benchmark (4 readers × 3 sizes × 2 cache states)
 - `benchmark/bench_pipeline.sh` — end-to-end pipeline wall time + bytes written
+- `benchmark/bench_loci.sh` — Loci (Python; polars + pandas) sort scaling sweep across the same sizes as `benchmark.sh`; needs `LOCI_PY`/`LOCI_SORT_SCRIPT` (defaults match the bench desktop layout)
 - `benchmark/plot_readme.gp` — gnuplot driver for the four README plots (time/memory × log/linear)
 - `benchmark/plot_maxmem.gp` — dual-y plot for the `--max-mem` sweep
 - `benchmark/maxmem_sweep.csv`, `benchmark/maxmem_sweep.png` — sweep data + rendered plot

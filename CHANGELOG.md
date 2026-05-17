@@ -121,6 +121,14 @@ the project uses [semantic versioning](https://semver.org).
   Arrow's `libarrow-dev` cannot coexist as APT packages — they
   pull in incompatible libcurl SSL backends).
 
+- Loci added to benchmarks. `benchmark_na12878.sh` runs Loci's
+  polars + pandas sort backends at 1 / 8 threads alongside
+  pioSortBed and the external tools (skipped if Loci isn't
+  importable from `LOCI_PY`). New `benchmark/bench_loci.sh`
+  sweeps the same input sizes as `benchmark.sh` (4 configs:
+  polars / pandas × 1 / 8 threads) and writes its own CSV so
+  the cross-tool plot pipeline's column layout is untouched.
+
 ## [3.7.0] — 2026-05-06
 
 ### Added
