@@ -261,7 +261,7 @@ pioSortBed [options] -   # read from standard input
 | `--tmpdir DIR` | Temp directory for `--external-merge` runs (default: `$TMPDIR` or `/tmp`) |
 | `-o FILE` / `--output FILE` | Write to file instead of stdout |
 | **Other** | |
-| `--collapse` | Collapse overlapping regions, summing weights (classic / low-mem-ssd only) |
+| `--collapse` | Collapse records sharing `(chr, start)` by summing their score column. Text output: classic / `--low-mem-ssd`. Parquet output (`--lociss-output`): classic only — writes a 5-column `{Chr, Start, End, Score double, MaxEndSoFar}` schema per FORMAT_SPEC §10. Not compatible with `--sort=b\|5`, `--external-merge`, `--multi-pass`. |
 | `--bgzip` | Write BGZF-compressed BED text (`.bed.gz`) instead of plain text. Requires `-o FILE`. Mutually exclusive with `--lociss-output`. Requires `make WITH_HTSLIB=1`. |
 | `--tabix` | After `--bgzip`, build a tabix `.tbi` index in place. Implies `--bgzip`. Replaces the canonical `pio \| bgzip ; tabix` three-tool pipeline. |
 | `--lociss-output FILE` | Write sorted Parquet (LociSSD v2 spec) instead of BED text. Works on every sort path. Requires `make WITH_LOCISS=1`. See [LociSSD Parquet output](#lociss-parquet-output). |

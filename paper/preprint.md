@@ -314,9 +314,12 @@ df = ds.region("chr1", 100_000, 200_000)
 ```
 
 `--lociss-output` works on every sort path; the corresponding sort-mode
-restrictions still apply (`--sort=b|5` and `--collapse` are not yet
-supported with LociSSD output). Cross-path consistency was verified
-on a 500k-record / 22-chromosome fixture: all four sort paths produce
+restrictions still apply (`--sort=b|5` not yet supported with LociSSD
+output). `--collapse` pairs with `--lociss-output` on the classic
+sort path and writes the five-column
+`{Chromosome, Start, End, Score double, MaxEndSoFar}` schema from
+FORMAT_SPEC §10. Cross-path consistency was verified on a
+500k-record / 22-chromosome fixture: all four sort paths produce
 byte-identical Parquet (md5sum matches across runs).
 
 ## Integrated bgzip + tabix output
@@ -663,12 +666,14 @@ relevant fields throughout the code path.
 default coordinate sort (`--sort=s`); `--sort=b` (start+end) and
 `--sort=5` (strand-aware 5'-end) require the in-RAM paths.
 `--collapse` (which sums weights for records sharing
-`(chromosome, start)`) is currently classic-path-only — both for BED
-text output and for `--lociss-output`, where it writes a five-column
-`{Chromosome, Start, End, Score (double), MaxEndSoFar}` schema
-matching FORMAT_SPEC §10. Stdin and gzip input are accepted only by
-the in-RAM paths because the streaming paths require a seekable
-mmap'd input.
+`(chromosome, start)`) works on the classic and `--low-mem-ssd` paths
+for BED text output, and on the classic path for `--lociss-output` —
+where it writes the five-column
+`{Chromosome, Start, End, Score (double), MaxEndSoFar}` schema from
+FORMAT_SPEC §10. `--external-merge` and `--multi-pass` do not
+implement collapse. Stdin and gzip input are accepted only by the
+in-RAM paths because the streaming paths require a seekable mmap'd
+input.
 
 ## BAM input
 
