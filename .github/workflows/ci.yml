@@ -10,38 +10,51 @@ on:
 jobs:
   build-and-test:
     name: ${{ matrix.config.name }}
-    runs-on: ${{ matrix.config.runner }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.config.container }}
     strategy:
       fail-fast: false
       matrix:
         config:
           - name: "default (BED-only)"
-            runner: ubuntu-latest
+            container: ""
             flags: ""
             apt_extra: ""
             needs_arrow: false
           - name: "WITH_HTSLIB (+ --bgzip / --tabix)"
-            runner: ubuntu-latest
+            container: ""
             flags: "WITH_HTSLIB=1"
             apt_extra: "libhts-dev tabix"
             needs_arrow: false
           - name: "WITH_HTSLIB + WITH_LOCISS (+ --lociss-output)"
-            # ubuntu-22.04 (jammy), not ubuntu-latest (24.04 noble) —
-            # Apache Arrow's noble package depends on libcurl4-openssl-dev,
-            # which noble replaced with libcurl4t64-openssl-dev (the
-            # 64-bit-time_t transition). Pinning to jammy sidesteps the
-            # dependency mismatch until upstream Arrow ships a noble-
-            # compatible package.
-            runner: ubuntu-22.04
+            # Run in a clean ubuntu:22.04 container, not on the
+            # ubuntu-latest runner, because Apache Arrow's APT package
+            # libarrow-dev declares an unsatisfiable libcurl4-openssl-dev
+            # dependency on the noble runner (the 64-bit-time_t transition
+            # replaced it with libcurl4t64-openssl-dev) AND on the
+            # ubuntu-22.04 runner image (pre-installed packages on the
+            # runner conflict with the jammy libcurl4-openssl-dev). A
+            # pristine jammy container has neither problem.
+            container: "ubuntu:22.04"
             flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
             # libarrow-dev / libparquet-dev come from the Apache Arrow APT
             # source. python3-pyarrow isn't a Debian package; install via pip
             # (test/test.sh uses pyarrow for the cross-path data-payload
-            # md5 check).
+            # md5 check). sudo isn't present in the bare container — Steps
+            # run as root.
             apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pip"
             needs_arrow: true
 
     steps:
+      - name: Install git + ca-certificates (container only)
+        if: ${{ matrix.config.container != '' }}
+        # actions/checkout needs git inside the container; the
+        # bare ubuntu:22.04 image doesn't ship it. ca-certificates
+        # is needed for the Apache Arrow apt source download.
+        run: |
+          apt-get update
+          apt-get install -y -V git ca-certificates
+
       - uses: actions/checkout@v4
 
       - name: Add Apache Arrow APT repo
@@ -50,17 +63,17 @@ jobs:
         # in its default repos; the Apache Arrow project distributes them via
         # their own APT source. https://arrow.apache.org/install/
         run: |
-          sudo apt-get update
-          sudo apt-get install -y -V ca-certificates lsb-release wget
+          apt-get update
+          apt-get install -y -V ca-certificates lsb-release wget
           codename=$(lsb_release --codename --short)
           wget -q https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-${codename}.deb
-          sudo apt-get install -y -V ./apache-arrow-apt-source-latest-${codename}.deb
+          apt-get install -y -V ./apache-arrow-apt-source-latest-${codename}.deb
           rm apache-arrow-apt-source-latest-${codename}.deb
 
       - name: Install build + test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y -V \
+          ${{ matrix.config.container == '' && 'sudo' || '' }} apt-get update
+          ${{ matrix.config.container == '' && 'sudo' || '' }} apt-get install -y -V \
             g++ make \
             libtbb-dev liblz4-dev libzstd-dev \
             ${{ matrix.config.apt_extra }}
@@ -70,7 +83,7 @@ jobs:
         # test/test.sh's cross-path data-payload md5 check uses pyarrow
         # to skip the manifest's created_utc timestamp when comparing
         # files. Install via pip with --break-system-packages because
-        # Ubuntu noble's system Python is externally-managed (PEP 668).
+        # Ubuntu's system Python is externally-managed (PEP 668).
         run: |
           python3 -m pip install --break-system-packages 'pyarrow~=21.0' || \
           python3 -m pip install --break-system-packages pyarrow
