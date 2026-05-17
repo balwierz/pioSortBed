@@ -58,18 +58,23 @@
 class LocissSink;
 static LocissSink* locissOpen(const std::string& path, bool buildIndex = false);
 static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
-                             int32_t beg, int32_t end);
+                             int32_t beg, int32_t end,
+                             const char* tail = nullptr, int tailLen = 0);
 static int locissWriteChromBatch(LocissSink* sink,
                                  std::shared_ptr<arrow::Table> table,
                                  const std::string& chromName,
                                  int32_t minStart, int32_t maxStart, int32_t maxEnd);
 static int locissFinishAndDelete(LocissSink* sink, const std::string& writerVersion);
 // Helper that builds a single-chromosome Arrow Table from sorted
-// (beg, end) arrays. Defined alongside LocissSink later in the file.
+// (beg, end) arrays. Pass tails=nullptr for BED3 (no Tail column);
+// pass an n-entry parallel array of (ptr, len) pairs for BED4+ (caller
+// supplies the post-End tab-separated bytes without a leading tab).
+// Defined alongside LocissSink later in the file.
 static std::shared_ptr<arrow::Table> buildLocissChromTable(
     const std::string& chromName,
     const int32_t* begArr, const int32_t* endArr, size_t n,
-    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd);
+    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd,
+    const std::pair<const char*, int>* tails = nullptr);
 #endif
 #include <lz4.h>
 #include <zstd.h>
@@ -1192,7 +1197,14 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 	                                 std::shared_ptr<arrow::Table>& tableOut,
 	                                 int32_t& mnOut, int32_t& mxOut, int32_t& meOut) -> int {
 		string2chrInfoT::iterator cit = chrInfo.find(chroms[ci]);
-		std::vector<std::pair<int32_t,int32_t>> recs;
+		struct Rec {
+			int32_t beg;
+			int32_t end;
+			const char* tailPtr; // post-End bytes, leading '\t' stripped (or "")
+			int tailLen;
+		};
+		std::vector<Rec> recs;
+		bool anyTail = false;
 		for(uint32_t cur = cit->second.lastRead; cur; cur = nodes[cur].next) {
 			const char* linePtr = mmapBase + nodes[cur].off;
 			const char* chrPtr; int chrLen;
@@ -1202,16 +1214,33 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				cerr << "Error parsing line: " << linePtr << endl;
 				return 1;
 			}
-			recs.emplace_back((int32_t)beg, (int32_t)end);
+			Rec r{(int32_t)beg, (int32_t)end, "", 0};
+			// parseBedLine3 leaves tailPtr at '\t' (BED4+) or NUL (BED3).
+			// Strip the leading '\t' so the Tail column stores only the
+			// tab-separated user fields.
+			if(tailPtr && *tailPtr == '\t') {
+				const char* t = tailPtr + 1;
+				size_t tLen = strlen(t); // lines were NUL-terminated by the parser
+				r.tailPtr = t;
+				r.tailLen = (int)tLen;
+				if(tLen > 0) anyTail = true;
+			}
+			recs.push_back(r);
 		}
 		std::sort(recs.begin(), recs.end(),
-		          [](const std::pair<int32_t,int32_t>& a,
-		             const std::pair<int32_t,int32_t>& b) { return a.first < b.first; });
+		          [](const Rec& a, const Rec& b) { return a.beg < b.beg; });
 		size_t n = recs.size();
 		std::vector<int32_t> begs(n), ends(n);
-		for(size_t i = 0; i < n; i++) { begs[i] = recs[i].first; ends[i] = recs[i].second; }
+		std::vector<std::pair<const char*, int>> tails;
+		if(anyTail) tails.resize(n);
+		for(size_t i = 0; i < n; i++) {
+			begs[i] = recs[i].beg;
+			ends[i] = recs[i].end;
+			if(anyTail) tails[i] = {recs[i].tailPtr, recs[i].tailLen};
+		}
 		tableOut = buildLocissChromTable(chroms[ci], begs.data(), ends.data(), n,
-		                                 &mnOut, &mxOut, &meOut);
+		                                 &mnOut, &mxOut, &meOut,
+		                                 anyTail ? tails.data() : nullptr);
 		return 0;
 	};
 #endif
@@ -3156,8 +3185,13 @@ static int extMergeSort(const std::string& inputFile,
 		const std::string& chr = globalChroms[(uint32_t)(top.key >> 32)];
 #ifdef WITH_LOCISS
 		if(sink) {
+			// Strip the leading '\t' that parseBedLine3 leaves on the tail
+			// — Tail column wants the tab-separated user fields only.
+			const char* tBytes = (rd->tailLen > 0)
+				? reinterpret_cast<const char*>(rd->tailPtr) + 1 : nullptr;
+			int tLen = (rd->tailLen > 0) ? (int)rd->tailLen - 1 : 0;
 			if(locissWriteRecord(sink, chr.c_str(), (int)chr.size(),
-			                     rd->beg, rd->end) != 0) {
+			                     rd->beg, rd->end, tBytes, tLen) != 0) {
 				readers.clear();
 				for(const std::string& p : runPaths) unlink(p.c_str());
 				locissFinishAndDelete(sink, "pioSortBed");
@@ -3571,8 +3605,23 @@ static int multiPassSort(const std::string& inputFile,
 			for(size_t i = 0; i < n; i++) {
 				const ExtEntry& e = entries[order[i]];
 				const std::string& chr = globalChrNames[sortOrder[e.chrIdx]];
+				// Multi-pass ExtEntry stores the full source line in
+				// (tailPtr, tailLen) for fast text re-emit. For the
+				// LociSSD Tail column we want only the bytes after the
+				// End field, so scan for the 3rd '\t' (BED3 records have
+				// only two and yield an empty tail).
+				const char* tBytes = nullptr;
+				int tLen = 0;
+				int tabs = 0;
+				for(uint16_t k = 0; k < e.tailLen; k++) {
+					if(e.tailPtr[k] == '\t' && ++tabs == 3) {
+						tBytes = e.tailPtr + k + 1;
+						tLen = (int)(e.tailLen - k - 1);
+						break;
+					}
+				}
 				if(locissWriteRecord(sink, chr.c_str(), (int)chr.size(),
-				                     e.beg, e.end) != 0) {
+				                     e.beg, e.end, tBytes, tLen) != 0) {
 					for(int t = 0; t < N; t++) delete chunkArena[t];
 					munmap(mmapBase, fileSize);
 					locissFinishAndDelete(sink, "pioSortBed");
@@ -3642,7 +3691,9 @@ public:
 		  rowsInBatch_(0),
 		  haveCurChrom_(false),
 		  curRunMaxEnd_(INT32_MIN),
-		  buildIndex_(buildIndex)
+		  buildIndex_(buildIndex),
+		  schemaLocked_(false),
+		  hasTailCol_(false)
 	{}
 
 	~LocissSink() {
@@ -3653,8 +3704,11 @@ public:
 		}
 	}
 
-	// Open the writer and prepare the Arrow schema. Must be called before
-	// any writeRecord(). Returns 0 on success, nonzero error code on failure.
+	// Open the output file stream and prepare for record emit. Schema
+	// construction (and Parquet writer creation) is deferred to the
+	// first writeRecord / writeChromBatch call, so the sink can detect
+	// whether the input is BED3 (no tail) or BED4+ (tail present) and
+	// build the appropriate schema.
 	//
 	// Coord columns (Start / End / MaxEndSoFar) are int32 — the spec's
 	// default since v2.x, sufficient for any per-chromosome position
@@ -3663,12 +3717,6 @@ public:
 	// would be needed for assemblies whose chromosomes exceed
 	// INT32_MAX (axolotl, lily, onion); not currently supported.
 	int open() {
-		auto chromField = arrow::field("Chromosome",  arrow::utf8(),  /*nullable=*/false);
-		auto startField = arrow::field("Start",       arrow::int32(), /*nullable=*/false);
-		auto endField   = arrow::field("End",         arrow::int32(), /*nullable=*/false);
-		auto maxField   = arrow::field("MaxEndSoFar", arrow::int32(), /*nullable=*/false);
-		schema_ = arrow::schema({chromField, startField, endField, maxField});
-
 		auto fileResult = arrow::io::FileOutputStream::Open(tmpPath_);
 		if(!fileResult.ok()) {
 			std::cerr << "Error: cannot open " << tmpPath_ << " for writing: "
@@ -3676,13 +3724,34 @@ public:
 			return 1;
 		}
 		outStream_ = *fileResult;
+		return 0;
+	}
+
+private:
+	// Build schema_ (and open the Parquet writer) on first record. hasTail
+	// is set by the first writeRecord/writeChromBatch call. Per
+	// FORMAT_SPEC.md §3.3 column ordering: Chromosome, Start, End, then
+	// optional user columns (here: Tail catch-all when present), then
+	// MaxEndSoFar last.
+	int lockSchema(bool hasTail) {
+		if(schemaLocked_) return 0;
+		hasTailCol_ = hasTail;
+		std::vector<std::shared_ptr<arrow::Field>> fields;
+		fields.push_back(arrow::field("Chromosome",  arrow::utf8(),  false));
+		fields.push_back(arrow::field("Start",       arrow::int32(), false));
+		fields.push_back(arrow::field("End",         arrow::int32(), false));
+		if(hasTailCol_)
+			fields.push_back(arrow::field("Tail",    arrow::utf8(),  false));
+		fields.push_back(arrow::field("MaxEndSoFar", arrow::int32(), false));
+		schema_ = arrow::schema(fields);
 
 		// Per FORMAT_SPEC.md §4.3, conforming writers SHOULD emit Parquet
 		// SortingColumn hints for the loci tuple (Chromosome, Start, End)
 		// — all ascending, nulls last. Advisory; readers may use it to
 		// short-circuit sort-order checks or pick predicate-pushdown
-		// strategies. Schema column indices match the arrow::schema below:
-		//   0 = Chromosome, 1 = Start, 2 = End, 3 = MaxEndSoFar (not in hint).
+		// strategies. Schema column indices: 0 = Chromosome, 1 = Start,
+		// 2 = End. (Tail at 3 if present, MaxEndSoFar last — neither in
+		// the sort-key set.)
 		std::vector<parquet::SortingColumn> sortingCols = {
 			{/*column_idx=*/0, /*descending=*/false, /*nulls_first=*/false},
 			{/*column_idx=*/1, /*descending=*/false, /*nulls_first=*/false},
@@ -3712,12 +3781,35 @@ public:
 			return 1;
 		}
 		writer_ = std::move(*wResult);
+		schemaLocked_ = true;
 		return 0;
 	}
 
+public:
+
 	// Append one record. Records MUST arrive in (chrom, beg, end) sort order.
+	// `tail` is the BED tail (everything after the End field, tab-separated
+	// fields starting with Name, NOT including a leading tab). Pass NULL
+	// or zero-length if input is BED3. Schema is locked from the first
+	// call's `tailLen` — subsequent calls must match (tail-present-ness;
+	// individual record tails may vary in content/length).
 	// Returns 0 on success, nonzero on error.
-	int writeRecord(const char* chrom, int chrLen, int32_t beg, int32_t end) {
+	int writeRecord(const char* chrom, int chrLen, int32_t beg, int32_t end,
+	                const char* tail = nullptr, int tailLen = 0)
+	{
+		if(!schemaLocked_) {
+			if(lockSchema(/*hasTail=*/tailLen > 0) != 0) return 1;
+		} else if((tailLen > 0) != hasTailCol_) {
+			std::cerr << "Error: LociSSD record tail-presence varies "
+			             "(first record was "
+			          << (hasTailCol_ ? "BED4+" : "BED3")
+			          << ", later record is "
+			          << (tailLen > 0 ? "BED4+" : "BED3")
+			          << "). All records must share the same column count."
+			          << std::endl;
+			return 1;
+		}
+
 		// Detect chromosome run boundary.
 		std::string chrName(chrom, chrLen);
 		if(!haveCurChrom_ || chrName != curChromName_) {
@@ -3739,7 +3831,12 @@ public:
 		auto s2 = startBuilder_.Append(beg);
 		auto s3 = endBuilder_.Append(end);
 		auto s4 = maxEndBuilder_.Append(curRunMaxEnd_);
-		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok()) {
+		bool tailOk = true;
+		if(hasTailCol_) {
+			auto st = tailBuilder_.Append(tail ? tail : "", tailLen);
+			tailOk = st.ok();
+		}
+		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok() || !tailOk) {
 			std::cerr << "Error: arrow builder append failed" << std::endl;
 			return 1;
 		}
@@ -3773,6 +3870,22 @@ public:
 	                    const std::string& chromName,
 	                    int32_t minStart, int32_t maxStart, int32_t maxEnd)
 	{
+		// Lock the schema from the first table's column list. The caller
+		// (buildLocissChromTable) decides whether to include a Tail column;
+		// every subsequent table must match.
+		bool incomingHasTail = (table->schema()->GetFieldIndex("Tail") >= 0);
+		if(!schemaLocked_) {
+			if(lockSchema(/*hasTail=*/incomingHasTail) != 0) return 1;
+		} else if(incomingHasTail != hasTailCol_) {
+			std::cerr << "Error: LociSSD chrom-batch schema mismatch "
+			             "(Tail column "
+			          << (incomingHasTail ? "present" : "absent")
+			          << " in this batch but previous batches were "
+			          << (hasTailCol_ ? "BED4+" : "BED3")
+			          << ")" << std::endl;
+			return 1;
+		}
+
 		// flushBatch() any pending in-builder rows first so the per-call
 		// row-group boundaries land cleanly. (In practice this is a no-op
 		// when writeRecord and writeChromBatch are not mixed.)
@@ -3902,17 +4015,26 @@ private:
 	};
 
 	int flushBatch() {
-		std::shared_ptr<arrow::Array> chromArr, startArr, endArr, maxArr;
+		std::shared_ptr<arrow::Array> chromArr, startArr, endArr, maxArr, tailArr;
 		auto sa = chromBuilder_.Finish(&chromArr);
 		auto sb = startBuilder_.Finish(&startArr);
 		auto sc = endBuilder_.Finish(&endArr);
 		auto sd = maxEndBuilder_.Finish(&maxArr);
-		if(!sa.ok() || !sb.ok() || !sc.ok() || !sd.ok()) {
+		bool tailOk = true;
+		if(hasTailCol_) {
+			auto st = tailBuilder_.Finish(&tailArr);
+			tailOk = st.ok();
+		}
+		if(!sa.ok() || !sb.ok() || !sc.ok() || !sd.ok() || !tailOk) {
 			std::cerr << "Error: arrow builder Finish failed" << std::endl;
 			return 1;
 		}
-		auto table = arrow::Table::Make(schema_,
-			{chromArr, startArr, endArr, maxArr}, rowsInBatch_);
+		// Column order matches the schema: Chromosome, Start, End,
+		// [Tail], MaxEndSoFar (MaxEndSoFar last per FORMAT_SPEC §3.3).
+		std::vector<std::shared_ptr<arrow::Array>> cols = {chromArr, startArr, endArr};
+		if(hasTailCol_) cols.push_back(tailArr);
+		cols.push_back(maxArr);
+		auto table = arrow::Table::Make(schema_, cols, rowsInBatch_);
 		auto wStatus = writer_->WriteTable(*table, rowsInBatch_);
 		if(!wStatus.ok()) {
 			std::cerr << "Error: parquet WriteTable failed: "
@@ -4149,6 +4271,14 @@ private:
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
 		o << "{\"name\":\"End\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		// Tail (BED4+ catch-all): raw bytes after the End field, tab-
+		// separated as in the source BED. Listed before MaxEndSoFar per
+		// the storage-order recommendation in FORMAT_SPEC.md §3.3
+		// (user columns precede the derived MaxEndSoFar).
+		if(hasTailCol_) {
+			o << "{\"name\":\"Tail\",\"arrow_type\":\"string\","
+			     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		}
 		o << "{\"name\":\"MaxEndSoFar\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":true}";
 		o << "],";
@@ -4174,6 +4304,7 @@ private:
 	arrow::Int32Builder  startBuilder_;
 	arrow::Int32Builder  endBuilder_;
 	arrow::Int32Builder  maxEndBuilder_;
+	arrow::StringBuilder tailBuilder_; // only used when hasTailCol_ is set
 
 	std::vector<ChromStat> chromStats_;
 	std::vector<ChromIndexData> indexPerChrom_;
@@ -4181,6 +4312,8 @@ private:
 	uint64_t totalRows_;
 	int64_t  rowsInBatch_;
 	bool     buildIndex_;
+	bool     schemaLocked_;
+	bool     hasTailCol_;
 
 	bool        haveCurChrom_;
 	std::string curChromName_;
@@ -4199,23 +4332,40 @@ private:
 //
 // Returned out-params chromName/min/max are filled for the
 // matching writeChromBatch call.
+// Build a per-chromosome Arrow Table for the LociSSD sink.
+//
+// `tails` is parallel to begArr / endArr: per-record (ptr, len) pairs for
+// the BED tail (everything after the End field, tab-separated, NOT
+// including a leading tab). Pass nullptr for BED3 (no tail column);
+// pass a non-null vector for BED4+ — every entry's len may be zero
+// (an all-empty Tail column is still a Tail column, just compressible
+// to a dictionary singleton).
+//
+// Column order matches FORMAT_SPEC.md §3.3:
+//   Chromosome, Start, End, [Tail], MaxEndSoFar.
 static std::shared_ptr<arrow::Table> buildLocissChromTable(
     const std::string& chromName,
     const int32_t* begArr, const int32_t* endArr, size_t n,
-    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd)
+    int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd,
+    const std::pair<const char*, int>* tails)  // default declared in fwd decl
 {
 	if(n == 0) return nullptr;
 
 	arrow::StringBuilder chromB;
 	arrow::Int32Builder  startB, endB, maxEndB;
-	// Reserve both offset-array (Reserve) and value-buffer (ReserveData)
-	// for the StringBuilder so UnsafeAppend below has room. For the int
-	// builders Reserve alone covers it (only one underlying buffer).
+	arrow::StringBuilder tailB;
 	(void)chromB.Reserve((int64_t)n);
 	(void)chromB.ReserveData((int64_t)(n * chromName.size()));
 	(void)startB.Reserve((int64_t)n);
 	(void)endB.Reserve((int64_t)n);
 	(void)maxEndB.Reserve((int64_t)n);
+	if(tails) {
+		(void)tailB.Reserve((int64_t)n);
+		// Conservative data-buffer reserve: average tail length × n.
+		size_t totalTailBytes = 0;
+		for(size_t i = 0; i < n; i++) totalTailBytes += (size_t)tails[i].second;
+		(void)tailB.ReserveData((int64_t)totalTailBytes);
+	}
 
 	int32_t mn = begArr[0], mx = begArr[0], me = endArr[0];
 	int32_t running = endArr[0];
@@ -4230,24 +4380,33 @@ static std::shared_ptr<arrow::Table> buildLocissChromTable(
 		startB.UnsafeAppend(s);
 		endB.UnsafeAppend(e);
 		maxEndB.UnsafeAppend(running);
+		if(tails) tailB.UnsafeAppend(tails[i].first, tails[i].second);
 	}
 	*outMinStart = mn;
 	*outMaxStart = mx;
 	*outMaxEnd   = me;
 
-	std::shared_ptr<arrow::Array> chrA, sA, eA, meA;
+	std::shared_ptr<arrow::Array> chrA, sA, eA, meA, tA;
 	(void)chromB.Finish(&chrA);
 	(void)startB.Finish(&sA);
 	(void)endB.Finish(&eA);
 	(void)maxEndB.Finish(&meA);
+	if(tails) (void)tailB.Finish(&tA);
 
-	auto schema = arrow::schema({
+	std::vector<std::shared_ptr<arrow::Field>> fields = {
 		arrow::field("Chromosome",  arrow::utf8(),  false),
 		arrow::field("Start",       arrow::int32(), false),
 		arrow::field("End",         arrow::int32(), false),
-		arrow::field("MaxEndSoFar", arrow::int32(), false),
-	});
-	return arrow::Table::Make(schema, {chrA, sA, eA, meA}, (int64_t)n);
+	};
+	std::vector<std::shared_ptr<arrow::Array>> cols = {chrA, sA, eA};
+	if(tails) {
+		fields.push_back(arrow::field("Tail", arrow::utf8(), false));
+		cols.push_back(tA);
+	}
+	fields.push_back(arrow::field("MaxEndSoFar", arrow::int32(), false));
+	cols.push_back(meA);
+
+	return arrow::Table::Make(arrow::schema(fields), cols, (int64_t)n);
 }
 
 // Forward-declared helpers (declared near the top of the file) — defined
@@ -4259,8 +4418,9 @@ static LocissSink* locissOpen(const std::string& path, bool buildIndex) {
 	return s;
 }
 static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
-                             int32_t beg, int32_t end) {
-	return sink->writeRecord(chrom, chrLen, beg, end);
+                             int32_t beg, int32_t end,
+                             const char* tail, int tailLen) {
+	return sink->writeRecord(chrom, chrLen, beg, end, tail, tailLen);
 }
 static int locissWriteChromBatch(LocissSink* sink,
                                  std::shared_ptr<arrow::Table> table,
@@ -4878,32 +5038,33 @@ int main(int argc, char *argv[])
 #ifdef WITH_LOCISS
 	else if(!locissOutput.empty())
 	{
-		// Detect BED4+ tail on the first emitted record and warn once.
-		// Round-1 LocissSink only writes the four required columns
-		// (Chromosome, Start, End, MaxEndSoFar); columns 4+ are dropped.
-		// Catch silent data loss before it surprises a user.
-		if(totalReads > 0) {
-			const char* p = reads[order[0]].line;
-			int tabs = 0;
-			while(*p) {
-				if(*p == '\t' && ++tabs >= 3) {
-					std::cerr << "Warning: --lociss-output is dropping BED "
-					             "columns 4+ (Name / Score / Strand / etc.); "
-					             "tail passthrough is not yet implemented in "
-					             "this build. Output will contain only "
-					             "Chromosome, Start, End, MaxEndSoFar." << std::endl;
-					break;
-				}
-				p++;
-			}
-		}
+		// Classic-path LociSSD emit. reads[ri].line points at the
+		// original BED record (chr\tbeg\tend[\ttail]); reads[ri].lineLen
+		// is its byte length. We locate the post-End byte by finding
+		// the 3rd '\t' and pass everything from there (sans leading '\t')
+		// as the Tail column.
 		LocissSink sink(locissOutput, locissIndex != 0);
 		if(sink.open() != 0) { free(order); return 1; }
 		for(size_t i = 0; i < totalReads; i++) {
 			uint32_t ri = order[i];
 			const std::string& chr = chroms[reads[ri].chrIdx];
+			// Find tail: scan for the 3rd '\t' in the line; tail bytes
+			// start right after it. BED3 records have only two tabs.
+			const char* line = reads[ri].line;
+			size_t llen = reads[ri].lineLen;
+			const char* tBytes = nullptr;
+			int tLen = 0;
+			int tabs = 0;
+			for(size_t k = 0; k < llen; k++) {
+				if(line[k] == '\t' && ++tabs == 3) {
+					tBytes = line + k + 1;
+					tLen = (int)(llen - k - 1);
+					break;
+				}
+			}
 			if(sink.writeRecord(chr.c_str(), (int)chr.size(),
-			                    reads[ri].beg, reads[ri].end) != 0) {
+			                    reads[ri].beg, reads[ri].end,
+			                    tBytes, tLen) != 0) {
 				free(order); return 1;
 			}
 		}

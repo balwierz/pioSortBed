@@ -335,6 +335,85 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "--- --lociss-output / Tail passthrough (WITH_LOCISS build only) ---"
+
+if "$PIO" --help 2>&1 | grep -q -- '--lociss-output'; then
+    TMP_BED=$(mktemp /tmp/pio_lociss_XXXX.bed)
+    TMP_LOCISS_BASE=$(mktemp -u /tmp/pio_lociss_XXXX.lociss)
+    cat > "$TMP_BED" <<EOF
+chr2	100	200	name1	1	+
+chr1	50	150	name2	2	-
+chr1	10	20	name3	3	+
+chr2	30	40	name4	4	-
+EOF
+
+    # Sort via every available sort path; verify Parquet magic and
+    # cross-path md5 match (zstd is deterministic at the same level,
+    # schema is fixed, data is identical → bytes must match exactly).
+    declare -a paths=(""  "--low-mem-ssd")
+    paths+=("--external-merge --max-mem=4G --tmpdir /tmp")
+    paths+=("--multi-pass --max-mem=4G")
+    declare -a outs
+    declare -a labels
+    all_ok=1
+    for flag in "${paths[@]}"; do
+        suffix=$(echo "$flag" | tr -d ' -=' | tr -c 'a-zA-Z0-9' '_')
+        out="${TMP_LOCISS_BASE}.${suffix}"
+        rm -f "$out"
+        if ! $PIO $flag --lociss-output "$out" "$TMP_BED" >/dev/null 2>&1; then
+            fail "--lociss-output failed for: ${flag:-classic}"
+            all_ok=0
+            continue
+        fi
+        if [[ ! -s "$out" ]]; then
+            fail "--lociss-output produced empty file for: ${flag:-classic}"
+            all_ok=0
+            continue
+        fi
+        head4=$(head -c 4 "$out")
+        tail4=$(tail -c 4 "$out")
+        if [[ "$head4" != "PAR1" || "$tail4" != "PAR1" ]]; then
+            fail "--lociss-output missing Parquet magic (${flag:-classic})"
+            all_ok=0
+            continue
+        fi
+        outs+=("$out")
+        labels+=("${flag:-classic}")
+    done
+    (( all_ok )) && ok "--lociss-output Parquet round-trip across all sort paths"
+
+    # Cross-path data-payload md5 (NOT raw file md5 — the manifest embeds
+    # a per-run created_utc timestamp, so file bytes differ between runs).
+    # Needs a Python that can read Parquet to extract payload bytes.
+    if command -v python3 &>/dev/null && \
+       python3 -c "import pyarrow.parquet" 2>/dev/null && \
+       (( ${#outs[@]} >= 2 )); then
+        md_first=$(python3 -c "
+import pyarrow.parquet as pq, hashlib
+t = pq.read_table('${outs[0]}').drop_columns(['MaxEndSoFar'])
+print(hashlib.md5(t.to_string().encode()).hexdigest())
+" 2>/dev/null)
+        match=1
+        for ((i=1; i<${#outs[@]}; i++)); do
+            md=$(python3 -c "
+import pyarrow.parquet as pq, hashlib
+t = pq.read_table('${outs[i]}').drop_columns(['MaxEndSoFar'])
+print(hashlib.md5(t.to_string().encode()).hexdigest())
+" 2>/dev/null)
+            [[ "$md" == "$md_first" ]] || { match=0; break; }
+        done
+        (( match )) \
+            && ok "--lociss-output cross-path data-payload match (BED6 Tail)" \
+            || fail "--lociss-output cross-path data-payload mismatch (${labels[*]})"
+    fi
+
+    rm -f "$TMP_BED" "${outs[@]}" 2>/dev/null
+else
+    echo "  SKIP: pioSortBed built without WITH_LOCISS; --lociss-output not available"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "--- Version flag ---"
 
 ver=$("$PIO" --version 2>&1)
