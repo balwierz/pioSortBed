@@ -64,7 +64,7 @@ relative to your RAM and how much you care about SSD wear:
   input in parallel chunks, fills an in-RAM run buffer up to
   `--max-mem` (default 1 GiB), sorts the run with `radixSort64`, and
   writes a **compressed** binary run file (default `zstd` codec, also
-  `lz4` or `raw`; `WITH_BAM` builds add htscodecs' SIMD-vectorised
+  `lz4` or `raw`; `WITH_RANS=1` builds add htscodecs' SIMD-vectorised
   rANS). Pass 2 is a k-way min-heap merge over all run files. Peak
   RSS is bounded by `--max-mem` regardless of input size. zstd is the
   default because it's faster *end-to-end* than uncompressed at scale
@@ -257,7 +257,7 @@ pioSortBed [options] -   # read from standard input
 | **Memory / threading / I/O** | |
 | `-t N` / `--threads N` | Number of threads (0 = all cores; 1 = single-threaded) |
 | `--max-mem=N[GMK]` | RAM cap. For `--low-mem-ssd`: parallel pass-2 emit budget (default uncapped). For `--external-merge`: per-run buffer (default 1 GiB). For `--multi-pass`: per-group budget. |
-| `--merge-codec raw\|lz4\|zstd` | Temp-file compression for `--external-merge` (default: `zstd`). With `WITH_BAM=1`: also `rans0`, `rans1`. |
+| `--merge-codec raw\|lz4\|zstd` | Temp-file compression for `--external-merge` (default: `zstd`). With `WITH_RANS=1`: also `rans0`, `rans1`. |
 | `--tmpdir DIR` | Temp directory for `--external-merge` runs (default: `$TMPDIR` or `/tmp`) |
 | `-o FILE` / `--output FILE` | Write to file instead of stdout |
 | **Other** | |
