@@ -56,6 +56,94 @@
 // without needing the full class definition (which lives between the
 // sort paths and CLI/MAIN). Helpers are defined after LocissSink.
 class LocissSink;
+
+// One enum value per supported LociSSD on-disk schema. The numeric
+// value (where it has one) is the total BED column count the flavor
+// corresponds to. Standard BED4/5/6/12 get typed columns; any other
+// count (BED7..11, BED13+, narrowPeak, custom layouts) falls back to
+// BED_PLUS — a catch-all Tail string preserving the raw post-End
+// bytes verbatim. See README §"Handling non-standard BED-like input".
+enum class BedFlavor {
+    BED3     = 3,   // Chr, Start, End                                              -> 4-col schema (+ MaxEndSoFar)
+    BED4     = 4,   // + Name                                                       -> 5-col
+    BED5     = 5,   // + Name, Score                                                -> 6-col
+    BED6     = 6,   // + Name, Score, Strand                                        -> 7-col (Strand reordered to pos 4 per spec §3.3)
+    BED12    = 12,  // + Name, Score, Strand, ThickStart, ThickEnd, ItemRgb,
+                    //   BlockCount, BlockSizes, BlockStarts                        -> 13-col
+    BED_PLUS = -1   // Any other column count -> catch-all Tail string column.
+};
+
+// Map BED total-column-count → BedFlavor. Counts not matching a known
+// BEDx land in BED_PLUS.
+static inline BedFlavor bedFlavorFromColumnCount(int totalCols) {
+    switch(totalCols) {
+        case 3:  return BedFlavor::BED3;
+        case 4:  return BedFlavor::BED4;
+        case 5:  return BedFlavor::BED5;
+        case 6:  return BedFlavor::BED6;
+        case 12: return BedFlavor::BED12;
+        default: return BedFlavor::BED_PLUS;
+    }
+}
+
+// Count BED columns in a tail string (number of tab-separated fields
+// after the End coord). Returns 0 for empty tail.
+static inline int countTailFields(const char* tail, int tailLen) {
+    if(tailLen <= 0) return 0;
+    int n = 1;
+    for(int i = 0; i < tailLen; i++) if(tail[i] == '\t') n++;
+    return n;
+}
+
+// Split tail bytes by '\t' into up to maxFields views. Returns the
+// total number of fields present (may exceed maxFields, in which case
+// only the first maxFields-1 are stored faithfully; the last slot
+// gets the remainder). For tailLen == 0 returns 0.
+static inline int splitTailFields(const char* tail, int tailLen,
+                                  std::pair<const char*, int>* fieldsOut,
+                                  int maxFields)
+{
+    if(tailLen <= 0) return 0;
+    int n = 0;
+    int start = 0;
+    for(int i = 0; i < tailLen; i++) {
+        if(tail[i] == '\t') {
+            if(n < maxFields) {
+                fieldsOut[n].first  = tail + start;
+                fieldsOut[n].second = i - start;
+            }
+            n++;
+            start = i + 1;
+        }
+    }
+    if(n < maxFields) {
+        fieldsOut[n].first  = tail + start;
+        fieldsOut[n].second = tailLen - start;
+    }
+    return n + 1;
+}
+
+// Parse a tab-delimited field as int32. Returns false on empty input
+// or any non-digit (after an optional leading '-'). The BED12
+// ThickStart/ThickEnd/BlockCount fields are integers; everything else
+// stays as utf8 (notably Score, which the spec calls out as possibly
+// non-numeric like ".").
+static inline bool parseInt32Field(const char* p, int len, int32_t* out) {
+    if(len <= 0) return false;
+    bool neg = false;
+    int i = 0;
+    if(p[0] == '-') { neg = true; i = 1; if(i == len) return false; }
+    int64_t v = 0;
+    for(; i < len; i++) {
+        char c = p[i];
+        if(c < '0' || c > '9') return false;
+        v = v * 10 + (c - '0');
+        if(v > INT32_MAX) return false;
+    }
+    *out = neg ? -(int32_t)v : (int32_t)v;
+    return true;
+}
+
 static LocissSink* locissOpen(const std::string& path, bool buildIndex = false);
 static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
                              int32_t beg, int32_t end,
@@ -64,14 +152,16 @@ static int locissWriteChromBatch(LocissSink* sink,
                                  std::shared_ptr<arrow::Table> table,
                                  const std::string& chromName,
                                  int32_t minStart, int32_t maxStart, int32_t maxEnd);
+static int locissSetFlavor(LocissSink* sink, BedFlavor flavor);
 static int locissFinishAndDelete(LocissSink* sink, const std::string& writerVersion);
 // Helper that builds a single-chromosome Arrow Table from sorted
-// (beg, end) arrays. Pass tails=nullptr for BED3 (no Tail column);
-// pass an n-entry parallel array of (ptr, len) pairs for BED4+ (caller
-// supplies the post-End tab-separated bytes without a leading tab).
-// Defined alongside LocissSink later in the file.
+// (beg, end) arrays + (for BED4+) per-record tail strings (post-End
+// tab-separated bytes, no leading tab). flavor MUST match the schema
+// already locked on the sink (set via locissSetFlavor() before
+// invoking this — the --low-mem-ssd parallel emit detects flavor
+// from the input's first BED line ahead of any worker).
 static std::shared_ptr<arrow::Table> buildLocissChromTable(
-    const std::string& chromName,
+    const std::string& chromName, BedFlavor flavor,
     const int32_t* begArr, const int32_t* endArr, size_t n,
     int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd,
     const std::pair<const char*, int>* tails = nullptr);
@@ -1184,15 +1274,44 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 
 #ifdef WITH_LOCISS
 	LocissSink* sink = nullptr;
+	BedFlavor   locissFlavor = BedFlavor::BED3;
 	if(!locissOutput.empty()) {
 		sink = locissOpen(locissOutput, locissIndex);
 		if(!sink) { free(nodes); return 1; }
+		// Detect flavor once from the first data record so every per-
+		// chromosome worker thread can build its Arrow table with the
+		// right schema in parallel (without serialising under the sink
+		// lock to infer it). Walk to the first non-empty chromosome.
+		for(size_t ci = 0; ci < chroms.size(); ci++) {
+			auto cit = chrInfo.find(chroms[ci]);
+			uint32_t first = cit->second.lastRead;
+			if(!first) continue;
+			const char* linePtr = mmapBase + nodes[first].off;
+			const char* chrPtr; int chrLen;
+			int beg = 0, end = 0;
+			const char* tailPtr = "";
+			if(parseBedLine3(linePtr, &chrPtr, &chrLen, &beg, &end, &tailPtr) < 3) {
+				cerr << "Error parsing first BED line: " << linePtr << endl;
+				free(nodes); return 1;
+			}
+			int nFields = 3;
+			if(tailPtr && *tailPtr == '\t') {
+				const char* t = tailPtr + 1;
+				nFields += (int)countTailFields(t, (int)strlen(t));
+			}
+			locissFlavor = bedFlavorFromColumnCount(nFields);
+			break;
+		}
+		if(locissSetFlavor(sink, locissFlavor) != 0) {
+			locissFinishAndDelete(sink, "pioSortBed");
+			free(nodes); return 1;
+		}
 	}
 	// Per-chromosome work for the LociSSD path: walk the chromosome's
-	// linked list parsing (beg, end) into local vectors, sort by beg,
-	// build the Arrow Table via buildLocissChromTable. Result is held
-	// in (table, mn/mx/me) for the caller to feed to writeChromBatch
-	// under the alphabetical-print barrier.
+	// linked list parsing (beg, end) + tail into local vectors, sort
+	// by beg, build the Arrow Table via buildLocissChromTable. Result
+	// is held in (table, mn/mx/me) for the caller to feed to
+	// writeChromBatch under the alphabetical-print barrier.
 	auto buildChromLocissTable = [&](int ci,
 	                                 std::shared_ptr<arrow::Table>& tableOut,
 	                                 int32_t& mnOut, int32_t& mxOut, int32_t& meOut) -> int {
@@ -1204,7 +1323,6 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 			int tailLen;
 		};
 		std::vector<Rec> recs;
-		bool anyTail = false;
 		for(uint32_t cur = cit->second.lastRead; cur; cur = nodes[cur].next) {
 			const char* linePtr = mmapBase + nodes[cur].off;
 			const char* chrPtr; int chrLen;
@@ -1215,15 +1333,11 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 				return 1;
 			}
 			Rec r{(int32_t)beg, (int32_t)end, "", 0};
-			// parseBedLine3 leaves tailPtr at '\t' (BED4+) or NUL (BED3).
-			// Strip the leading '\t' so the Tail column stores only the
-			// tab-separated user fields.
 			if(tailPtr && *tailPtr == '\t') {
 				const char* t = tailPtr + 1;
 				size_t tLen = strlen(t); // lines were NUL-terminated by the parser
 				r.tailPtr = t;
 				r.tailLen = (int)tLen;
-				if(tLen > 0) anyTail = true;
 			}
 			recs.push_back(r);
 		}
@@ -1232,15 +1346,17 @@ static int lowMemSortMmap(char* mmapBase, size_t mmapSize,
 		size_t n = recs.size();
 		std::vector<int32_t> begs(n), ends(n);
 		std::vector<std::pair<const char*, int>> tails;
-		if(anyTail) tails.resize(n);
+		const bool tailsNeeded = (locissFlavor != BedFlavor::BED3);
+		if(tailsNeeded) tails.resize(n);
 		for(size_t i = 0; i < n; i++) {
 			begs[i] = recs[i].beg;
 			ends[i] = recs[i].end;
-			if(anyTail) tails[i] = {recs[i].tailPtr, recs[i].tailLen};
+			if(tailsNeeded) tails[i] = {recs[i].tailPtr, recs[i].tailLen};
 		}
-		tableOut = buildLocissChromTable(chroms[ci], begs.data(), ends.data(), n,
+		tableOut = buildLocissChromTable(chroms[ci], locissFlavor,
+		                                 begs.data(), ends.data(), n,
 		                                 &mnOut, &mxOut, &meOut,
-		                                 anyTail ? tails.data() : nullptr);
+		                                 tailsNeeded ? tails.data() : nullptr);
 		return 0;
 	};
 #endif
@@ -3677,10 +3793,19 @@ static int multiPassSort(const std::string& inputFile,
 // inline as a running max within each chromosome run (resets at chrom
 // boundary).
 //
-// Round-1 schema is the minimum required by the spec — no Score/Strand
-// columns; BED tails are dropped. Future commits will add tail
-// passthrough (Name/Score/Strand for BED6).
+// Schema depends on the BedFlavor detected from the first record's
+// tail-field count. Standard BED4/5/6/12 get typed columns (Name,
+// Score, Strand, ...); BED3 gets the minimum required schema; any
+// other column count (narrowPeak's 10, custom 7/8/9-col layouts,
+// etc.) falls back to a catch-all Tail string column that preserves
+// the raw post-End bytes verbatim. See README's "Handling non-standard
+// BED-like input" section for the rationale.
 // ============================================================================
+
+// BedFlavor + helpers (bedFlavorFromColumnCount, countTailFields,
+// splitTailFields, parseInt32Field) are defined near the top of the
+// file alongside the LocissSink forward declaration so that the sort
+// paths (which run BEFORE LocissSink's definition) can use them.
 
 class LocissSink {
 public:
@@ -3693,7 +3818,7 @@ public:
 		  curRunMaxEnd_(INT32_MIN),
 		  buildIndex_(buildIndex),
 		  schemaLocked_(false),
-		  hasTailCol_(false)
+		  flavor_(BedFlavor::BED3)
 	{}
 
 	~LocissSink() {
@@ -3727,21 +3852,83 @@ public:
 		return 0;
 	}
 
+	// Pre-lock the schema before any writeRecord/writeChromBatch call.
+	// The --low-mem-ssd parallel emit path uses this: it peeks the first
+	// BED line ahead of sort to determine flavor, then every worker
+	// thread can build its per-chromosome Arrow table directly with the
+	// right column layout (no serial inference under the print barrier).
+	// Returns 0 on success.
+	int setFlavor(BedFlavor flavor) {
+		if(schemaLocked_) {
+			if(flavor != flavor_) {
+				std::cerr << "Error: setFlavor called after schema already "
+				             "locked to a different flavor" << std::endl;
+				return 1;
+			}
+			return 0;
+		}
+		return lockSchema(flavor);
+	}
+
 private:
-	// Build schema_ (and open the Parquet writer) on first record. hasTail
-	// is set by the first writeRecord/writeChromBatch call. Per
-	// FORMAT_SPEC.md §3.3 column ordering: Chromosome, Start, End, then
-	// optional user columns (here: Tail catch-all when present), then
-	// MaxEndSoFar last.
-	int lockSchema(bool hasTail) {
+	// Infer BedFlavor from a pre-built Arrow table's column layout. Used
+	// by writeChromBatch to keep batches in sync with the locked schema.
+	static BedFlavor inferFlavorFromTable(const arrow::Schema& s) {
+		if(s.GetFieldIndex("Tail")        >= 0) return BedFlavor::BED_PLUS;
+		if(s.GetFieldIndex("ThickStart")  >= 0) return BedFlavor::BED12;
+		if(s.GetFieldIndex("Strand")      >= 0) return BedFlavor::BED6;
+		if(s.GetFieldIndex("Score")       >= 0) return BedFlavor::BED5;
+		if(s.GetFieldIndex("Name")        >= 0) return BedFlavor::BED4;
+		return BedFlavor::BED3;
+	}
+
+	// Build schema_ (and open the Parquet writer) on first record. Flavor
+	// is set by the first writeRecord/writeChromBatch call (or via the
+	// public setFlavor() for callers that detect it ahead of time, e.g.
+	// the --low-mem-ssd writeChromBatch path that builds tables in
+	// parallel and needs to know the schema before any thread starts).
+	//
+	// Column ordering per FORMAT_SPEC.md §3.3: Chr, Start, End, then
+	// Strand if present (pulled to position 4), then the other user
+	// columns in BED order, then MaxEndSoFar last.
+	int lockSchema(BedFlavor flavor) {
 		if(schemaLocked_) return 0;
-		hasTailCol_ = hasTail;
+		flavor_ = flavor;
 		std::vector<std::shared_ptr<arrow::Field>> fields;
 		fields.push_back(arrow::field("Chromosome",  arrow::utf8(),  false));
 		fields.push_back(arrow::field("Start",       arrow::int32(), false));
 		fields.push_back(arrow::field("End",         arrow::int32(), false));
-		if(hasTailCol_)
-			fields.push_back(arrow::field("Tail",    arrow::utf8(),  false));
+		switch(flavor_) {
+		case BedFlavor::BED3:
+			break;
+		case BedFlavor::BED4:
+			fields.push_back(arrow::field("Name",  arrow::utf8(), false));
+			break;
+		case BedFlavor::BED5:
+			fields.push_back(arrow::field("Name",  arrow::utf8(), false));
+			fields.push_back(arrow::field("Score", arrow::utf8(), false));
+			break;
+		case BedFlavor::BED6:
+			// Strand pulled to position 4 per spec §3.3.
+			fields.push_back(arrow::field("Strand", arrow::utf8(), false));
+			fields.push_back(arrow::field("Name",   arrow::utf8(), false));
+			fields.push_back(arrow::field("Score",  arrow::utf8(), false));
+			break;
+		case BedFlavor::BED12:
+			fields.push_back(arrow::field("Strand",      arrow::utf8(),  false));
+			fields.push_back(arrow::field("Name",        arrow::utf8(),  false));
+			fields.push_back(arrow::field("Score",       arrow::utf8(),  false));
+			fields.push_back(arrow::field("ThickStart",  arrow::int32(), false));
+			fields.push_back(arrow::field("ThickEnd",    arrow::int32(), false));
+			fields.push_back(arrow::field("ItemRgb",     arrow::utf8(),  false));
+			fields.push_back(arrow::field("BlockCount",  arrow::int32(), false));
+			fields.push_back(arrow::field("BlockSizes",  arrow::utf8(),  false));
+			fields.push_back(arrow::field("BlockStarts", arrow::utf8(),  false));
+			break;
+		case BedFlavor::BED_PLUS:
+			fields.push_back(arrow::field("Tail", arrow::utf8(), false));
+			break;
+		}
 		fields.push_back(arrow::field("MaxEndSoFar", arrow::int32(), false));
 		schema_ = arrow::schema(fields);
 
@@ -3797,25 +3984,39 @@ public:
 	int writeRecord(const char* chrom, int chrLen, int32_t beg, int32_t end,
 	                const char* tail = nullptr, int tailLen = 0)
 	{
+		// Determine flavor from this record's tail-field count.
+		int tailFields = countTailFields(tail, tailLen);
+		BedFlavor recFlavor = bedFlavorFromColumnCount(3 + tailFields);
+
 		if(!schemaLocked_) {
-			if(lockSchema(/*hasTail=*/tailLen > 0) != 0) return 1;
-		} else if((tailLen > 0) != hasTailCol_) {
-			// Tail-presence (BED3 vs BED4+) must be uniform across the
-			// file because Parquet doesn't support mid-write schema
-			// changes. Within BED4+ records, varying tail-column counts
-			// are fine — the Tail column is an opaque tab-separated
-			// string so a record can have 4, 6, 8, ... user columns.
-			std::cerr << "Error: LociSSD input has mixed BED3 and BED4+ "
-			             "records (first record had "
-			          << (hasTailCol_ ? "user columns past End"
-			                          : "no columns past End")
-			          << ", a later record has the opposite). The Tail "
-			             "column can hold arbitrary tab-separated content "
-			             "with variable column counts, but tail-presence "
-			             "must be uniform — split the input or pad the "
-			             "BED3 records to BED4+ with a placeholder column."
-			          << std::endl;
-			return 1;
+			if(lockSchema(recFlavor) != 0) return 1;
+		} else if(recFlavor != flavor_) {
+			// Flavor varies record-to-record. The catch-all BED_PLUS
+			// flavor swallows variable-column-count inputs without
+			// error (the Tail column is opaque); typed BED4/5/6/12
+			// flavors require a uniform column count.
+			//
+			// One special tolerance: if the file is BED_PLUS we accept
+			// any tail-field count; if a record has zero tail-fields
+			// in a BED4+ context we error out (mixed BED3 / BED4+).
+			if(flavor_ == BedFlavor::BED_PLUS && tailFields > 0) {
+				// catch-all Tail accepts arbitrary tail content;
+				// no validation needed.
+			} else {
+				std::cerr << "Error: LociSSD input has inconsistent BED "
+				             "column count (first record had "
+				          << (3 + countTailFields(/*placeholder=*/nullptr, 0))
+				          << "..., later record has " << (3 + tailFields)
+				          << " columns). For typed BED4/5/6/12 schemas, "
+				             "every record must have the same column count. "
+				             "Inputs with variable column counts get the "
+				             "catch-all BED_PLUS flavor (Tail string), but "
+				             "the first record committed us to a typed flavor "
+				             "and Parquet doesn't support mid-write schema "
+				             "changes. Split the input by column count or "
+				             "pre-pad the short records." << std::endl;
+				return 1;
+			}
 		}
 
 		// Detect chromosome run boundary.
@@ -3835,19 +4036,60 @@ public:
 			if(end > curRunMaxEnd_)   curRunMaxEnd_ = end;
 		}
 
+		// Base columns always present.
 		auto s1 = chromBuilder_.Append(chrom, chrLen);
 		auto s2 = startBuilder_.Append(beg);
 		auto s3 = endBuilder_.Append(end);
 		auto s4 = maxEndBuilder_.Append(curRunMaxEnd_);
-		bool tailOk = true;
-		if(hasTailCol_) {
-			auto st = tailBuilder_.Append(tail ? tail : "", tailLen);
-			tailOk = st.ok();
-		}
-		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok() || !tailOk) {
-			std::cerr << "Error: arrow builder append failed" << std::endl;
+		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok()) {
+			std::cerr << "Error: arrow base-column append failed" << std::endl;
 			return 1;
 		}
+
+		// Typed columns by flavor.
+		std::pair<const char*, int> f[9]; // BED12 has at most 9 tail fields
+		(void)splitTailFields(tail, tailLen, f, 9);
+		switch(flavor_) {
+		case BedFlavor::BED3:
+			break;
+		case BedFlavor::BED4:
+			if(!nameBuilder_.Append(f[0].first, f[0].second).ok()) return arrowFail();
+			break;
+		case BedFlavor::BED5:
+			if(!nameBuilder_.Append(f[0].first, f[0].second).ok()) return arrowFail();
+			if(!scoreBuilder_.Append(f[1].first, f[1].second).ok()) return arrowFail();
+			break;
+		case BedFlavor::BED6:
+			if(!strandBuilder_.Append(f[2].first, f[2].second).ok()) return arrowFail();
+			if(!nameBuilder_.Append(f[0].first, f[0].second).ok()) return arrowFail();
+			if(!scoreBuilder_.Append(f[1].first, f[1].second).ok()) return arrowFail();
+			break;
+		case BedFlavor::BED12: {
+			int32_t thickStart = 0, thickEnd = 0, blockCount = 0;
+			if(!parseInt32Field(f[3].first, f[3].second, &thickStart)
+			|| !parseInt32Field(f[4].first, f[4].second, &thickEnd)
+			|| !parseInt32Field(f[6].first, f[6].second, &blockCount)) {
+				std::cerr << "Error: BED12 numeric field parse failed at row "
+				          << totalRows_ << " (ThickStart/ThickEnd/BlockCount)"
+				          << std::endl;
+				return 1;
+			}
+			if(!strandBuilder_.Append(f[2].first, f[2].second).ok())     return arrowFail();
+			if(!nameBuilder_.Append(f[0].first, f[0].second).ok())       return arrowFail();
+			if(!scoreBuilder_.Append(f[1].first, f[1].second).ok())      return arrowFail();
+			if(!thickStartBuilder_.Append(thickStart).ok())              return arrowFail();
+			if(!thickEndBuilder_.Append(thickEnd).ok())                  return arrowFail();
+			if(!rgbBuilder_.Append(f[5].first, f[5].second).ok())        return arrowFail();
+			if(!blockCountBuilder_.Append(blockCount).ok())              return arrowFail();
+			if(!blockSizesBuilder_.Append(f[7].first, f[7].second).ok()) return arrowFail();
+			if(!blockStartsBuilder_.Append(f[8].first, f[8].second).ok())return arrowFail();
+			break;
+		}
+		case BedFlavor::BED_PLUS:
+			if(!tailBuilder_.Append(tail ? tail : "", tailLen).ok()) return arrowFail();
+			break;
+		}
+
 		if(buildIndex_) {
 			ChromIndexData& idx = indexPerChrom_.back();
 			idx.starts.push_back((int64_t)beg);
@@ -3859,6 +4101,14 @@ public:
 		if(rowsInBatch_ >= kRowGroupSize) return flushBatch();
 		return 0;
 	}
+
+private:
+	// Common error path for an Arrow builder Append failure inside writeRecord.
+	int arrowFail() {
+		std::cerr << "Error: arrow typed-column append failed" << std::endl;
+		return 1;
+	}
+public:
 
 	// Append a single-chromosome run as a pre-built Arrow Table. Used by the
 	// parallel paths: each worker thread builds the Arrow arrays for its own
@@ -3878,18 +4128,20 @@ public:
 	                    const std::string& chromName,
 	                    int32_t minStart, int32_t maxStart, int32_t maxEnd)
 	{
-		// Lock the schema from the first table's column list. The caller
-		// (buildLocissChromTable) decides whether to include a Tail column;
-		// every subsequent table must match.
-		bool incomingHasTail = (table->schema()->GetFieldIndex("Tail") >= 0);
+		// Lock the schema from the first table's column layout. The
+		// caller (buildLocissChromTable) decides the flavor up-front
+		// (--low-mem-ssd's parallel emit detects flavor from the first
+		// non-header BED line before any worker starts); every
+		// subsequent table must match.
+		BedFlavor incomingFlavor = inferFlavorFromTable(*table->schema());
 		if(!schemaLocked_) {
-			if(lockSchema(/*hasTail=*/incomingHasTail) != 0) return 1;
-		} else if(incomingHasTail != hasTailCol_) {
-			std::cerr << "Error: LociSSD chrom-batch schema mismatch "
-			             "(Tail column "
-			          << (incomingHasTail ? "present" : "absent")
-			          << " in this batch but previous batches were "
-			          << (hasTailCol_ ? "BED4+" : "BED3")
+			if(lockSchema(incomingFlavor) != 0) return 1;
+		} else if(incomingFlavor != flavor_) {
+			std::cerr << "Error: LociSSD chrom-batch flavor mismatch "
+			             "(this batch detected as flavor "
+			          << (int)incomingFlavor
+			          << ", previous batches were "
+			          << (int)flavor_
 			          << ")" << std::endl;
 			return 1;
 		}
@@ -4023,24 +4275,66 @@ private:
 	};
 
 	int flushBatch() {
-		std::shared_ptr<arrow::Array> chromArr, startArr, endArr, maxArr, tailArr;
-		auto sa = chromBuilder_.Finish(&chromArr);
-		auto sb = startBuilder_.Finish(&startArr);
-		auto sc = endBuilder_.Finish(&endArr);
-		auto sd = maxEndBuilder_.Finish(&maxArr);
-		bool tailOk = true;
-		if(hasTailCol_) {
-			auto st = tailBuilder_.Finish(&tailArr);
-			tailOk = st.ok();
-		}
-		if(!sa.ok() || !sb.ok() || !sc.ok() || !sd.ok() || !tailOk) {
-			std::cerr << "Error: arrow builder Finish failed" << std::endl;
+		std::shared_ptr<arrow::Array> chromArr, startArr, endArr, maxArr;
+		std::shared_ptr<arrow::Array> nameArr, scoreArr, strandArr,
+		    thickStartArr, thickEndArr, rgbArr, blockCountArr,
+		    blockSizesArr, blockStartsArr, tailArr;
+		if(!chromBuilder_.Finish(&chromArr).ok()
+		|| !startBuilder_.Finish(&startArr).ok()
+		|| !endBuilder_.Finish(&endArr).ok()
+		|| !maxEndBuilder_.Finish(&maxArr).ok()) {
+			std::cerr << "Error: arrow base builder Finish failed" << std::endl;
 			return 1;
 		}
-		// Column order matches the schema: Chromosome, Start, End,
-		// [Tail], MaxEndSoFar (MaxEndSoFar last per FORMAT_SPEC §3.3).
+		// Finish per-flavor builders. Column order in the output table
+		// must exactly match the schema_ built in lockSchema().
 		std::vector<std::shared_ptr<arrow::Array>> cols = {chromArr, startArr, endArr};
-		if(hasTailCol_) cols.push_back(tailArr);
+		switch(flavor_) {
+		case BedFlavor::BED3:
+			break;
+		case BedFlavor::BED4:
+			if(!nameBuilder_.Finish(&nameArr).ok()) return arrowFinishFail();
+			cols.push_back(nameArr);
+			break;
+		case BedFlavor::BED5:
+			if(!nameBuilder_.Finish(&nameArr).ok())   return arrowFinishFail();
+			if(!scoreBuilder_.Finish(&scoreArr).ok()) return arrowFinishFail();
+			cols.push_back(nameArr);
+			cols.push_back(scoreArr);
+			break;
+		case BedFlavor::BED6:
+			if(!strandBuilder_.Finish(&strandArr).ok()) return arrowFinishFail();
+			if(!nameBuilder_.Finish(&nameArr).ok())     return arrowFinishFail();
+			if(!scoreBuilder_.Finish(&scoreArr).ok())   return arrowFinishFail();
+			cols.push_back(strandArr);
+			cols.push_back(nameArr);
+			cols.push_back(scoreArr);
+			break;
+		case BedFlavor::BED12:
+			if(!strandBuilder_.Finish(&strandArr).ok())          return arrowFinishFail();
+			if(!nameBuilder_.Finish(&nameArr).ok())              return arrowFinishFail();
+			if(!scoreBuilder_.Finish(&scoreArr).ok())            return arrowFinishFail();
+			if(!thickStartBuilder_.Finish(&thickStartArr).ok())  return arrowFinishFail();
+			if(!thickEndBuilder_.Finish(&thickEndArr).ok())      return arrowFinishFail();
+			if(!rgbBuilder_.Finish(&rgbArr).ok())                return arrowFinishFail();
+			if(!blockCountBuilder_.Finish(&blockCountArr).ok())  return arrowFinishFail();
+			if(!blockSizesBuilder_.Finish(&blockSizesArr).ok())  return arrowFinishFail();
+			if(!blockStartsBuilder_.Finish(&blockStartsArr).ok())return arrowFinishFail();
+			cols.push_back(strandArr);
+			cols.push_back(nameArr);
+			cols.push_back(scoreArr);
+			cols.push_back(thickStartArr);
+			cols.push_back(thickEndArr);
+			cols.push_back(rgbArr);
+			cols.push_back(blockCountArr);
+			cols.push_back(blockSizesArr);
+			cols.push_back(blockStartsArr);
+			break;
+		case BedFlavor::BED_PLUS:
+			if(!tailBuilder_.Finish(&tailArr).ok()) return arrowFinishFail();
+			cols.push_back(tailArr);
+			break;
+		}
 		cols.push_back(maxArr);
 		auto table = arrow::Table::Make(schema_, cols, rowsInBatch_);
 		auto wStatus = writer_->WriteTable(*table, rowsInBatch_);
@@ -4051,6 +4345,11 @@ private:
 		}
 		rowsInBatch_ = 0;
 		return 0;
+	}
+
+	int arrowFinishFail() {
+		std::cerr << "Error: arrow per-flavor builder Finish failed" << std::endl;
+		return 1;
 	}
 
 	int closeWriter() {
@@ -4273,20 +4572,47 @@ private:
 		}
 		o << "],";
 		o << "\"schema_columns\":[";
-		o << "{\"name\":\"Chromosome\",\"arrow_type\":\"string\","
-		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		o << "{\"name\":\"Start\",\"arrow_type\":\"int32\","
-		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		o << "{\"name\":\"End\",\"arrow_type\":\"int32\","
-		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
-		// Tail (BED4+ catch-all): raw bytes after the End field, tab-
-		// separated as in the source BED. Listed before MaxEndSoFar per
-		// the storage-order recommendation in FORMAT_SPEC.md §3.3
-		// (user columns precede the derived MaxEndSoFar).
-		if(hasTailCol_) {
-			o << "{\"name\":\"Tail\",\"arrow_type\":\"string\","
-			     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":false},";
+		auto col = [&](const char* name, const char* type, bool derived) {
+			o << "{\"name\":\"" << name << "\",\"arrow_type\":\"" << type
+			  << "\",\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":"
+			  << (derived ? "true" : "false") << "},";
+		};
+		col("Chromosome", "string", false);
+		col("Start",      "int32",  false);
+		col("End",        "int32",  false);
+		// Per-flavor user columns, in the same order they appear in
+		// the Arrow schema. Order matches FORMAT_SPEC §3.3.
+		switch(flavor_) {
+		case BedFlavor::BED3:
+			break;
+		case BedFlavor::BED4:
+			col("Name", "string", false);
+			break;
+		case BedFlavor::BED5:
+			col("Name",  "string", false);
+			col("Score", "string", false);
+			break;
+		case BedFlavor::BED6:
+			col("Strand", "string", false);
+			col("Name",   "string", false);
+			col("Score",  "string", false);
+			break;
+		case BedFlavor::BED12:
+			col("Strand",      "string", false);
+			col("Name",        "string", false);
+			col("Score",       "string", false);
+			col("ThickStart",  "int32",  false);
+			col("ThickEnd",    "int32",  false);
+			col("ItemRgb",     "string", false);
+			col("BlockCount",  "int32",  false);
+			col("BlockSizes",  "string", false);
+			col("BlockStarts", "string", false);
+			break;
+		case BedFlavor::BED_PLUS:
+			col("Tail", "string", false);
+			break;
 		}
+		// MaxEndSoFar last (no trailing comma after this entry).
 		o << "{\"name\":\"MaxEndSoFar\",\"arrow_type\":\"int32\","
 		     "\"compression\":[\"zstd\",3],\"encoding\":\"native\",\"derived\":true}";
 		o << "],";
@@ -4312,16 +4638,27 @@ private:
 	arrow::Int32Builder  startBuilder_;
 	arrow::Int32Builder  endBuilder_;
 	arrow::Int32Builder  maxEndBuilder_;
-	arrow::StringBuilder tailBuilder_; // only used when hasTailCol_ is set
+	// Per-flavor builders — only those active for the locked flavor are
+	// appended into. Idle builders carry no state and have zero cost.
+	arrow::StringBuilder nameBuilder_;        // BED4/5/6/12
+	arrow::StringBuilder scoreBuilder_;       // BED5/6/12
+	arrow::StringBuilder strandBuilder_;      // BED6/12 (dictionary-encoded by Parquet at write time)
+	arrow::Int32Builder  thickStartBuilder_;  // BED12
+	arrow::Int32Builder  thickEndBuilder_;    // BED12
+	arrow::StringBuilder rgbBuilder_;         // BED12
+	arrow::Int32Builder  blockCountBuilder_;  // BED12
+	arrow::StringBuilder blockSizesBuilder_;  // BED12
+	arrow::StringBuilder blockStartsBuilder_; // BED12
+	arrow::StringBuilder tailBuilder_;        // BED_PLUS (catch-all)
 
 	std::vector<ChromStat> chromStats_;
 	std::vector<ChromIndexData> indexPerChrom_;
 
-	uint64_t totalRows_;
-	int64_t  rowsInBatch_;
-	bool     buildIndex_;
-	bool     schemaLocked_;
-	bool     hasTailCol_;
+	uint64_t  totalRows_;
+	int64_t   rowsInBatch_;
+	bool      buildIndex_;
+	bool      schemaLocked_;
+	BedFlavor flavor_;
 
 	bool        haveCurChrom_;
 	std::string curChromName_;
@@ -4352,31 +4689,55 @@ private:
 // Column order matches FORMAT_SPEC.md §3.3:
 //   Chromosome, Start, End, [Tail], MaxEndSoFar.
 static std::shared_ptr<arrow::Table> buildLocissChromTable(
-    const std::string& chromName,
+    const std::string& chromName, BedFlavor flavor,
     const int32_t* begArr, const int32_t* endArr, size_t n,
     int32_t* outMinStart, int32_t* outMaxStart, int32_t* outMaxEnd,
     const std::pair<const char*, int>* tails)  // default declared in fwd decl
 {
 	if(n == 0) return nullptr;
 
+	// Base columns: Chromosome, Start, End, MaxEndSoFar.
 	arrow::StringBuilder chromB;
 	arrow::Int32Builder  startB, endB, maxEndB;
-	arrow::StringBuilder tailB;
 	(void)chromB.Reserve((int64_t)n);
 	(void)chromB.ReserveData((int64_t)(n * chromName.size()));
 	(void)startB.Reserve((int64_t)n);
 	(void)endB.Reserve((int64_t)n);
 	(void)maxEndB.Reserve((int64_t)n);
+
+	// Per-flavor builders. Inactive ones stay empty (zero overhead).
+	arrow::StringBuilder nameB, scoreB, strandB, rgbB,
+	                     blockSizesB, blockStartsB, tailB;
+	arrow::Int32Builder  thickStartB, thickEndB, blockCountB;
 	if(tails) {
-		(void)tailB.Reserve((int64_t)n);
-		// Conservative data-buffer reserve: average tail length × n.
 		size_t totalTailBytes = 0;
 		for(size_t i = 0; i < n; i++) totalTailBytes += (size_t)tails[i].second;
-		(void)tailB.ReserveData((int64_t)totalTailBytes);
+		auto reserveStr = [&](arrow::StringBuilder& b) {
+			(void)b.Reserve((int64_t)n);
+			(void)b.ReserveData((int64_t)totalTailBytes); // upper bound
+		};
+		switch(flavor) {
+		case BedFlavor::BED3: break;
+		case BedFlavor::BED4: reserveStr(nameB); break;
+		case BedFlavor::BED5: reserveStr(nameB); reserveStr(scoreB); break;
+		case BedFlavor::BED6:
+			reserveStr(strandB); reserveStr(nameB); reserveStr(scoreB);
+			break;
+		case BedFlavor::BED12:
+			reserveStr(strandB); reserveStr(nameB); reserveStr(scoreB);
+			(void)thickStartB.Reserve((int64_t)n);
+			(void)thickEndB.Reserve((int64_t)n);
+			reserveStr(rgbB);
+			(void)blockCountB.Reserve((int64_t)n);
+			reserveStr(blockSizesB); reserveStr(blockStartsB);
+			break;
+		case BedFlavor::BED_PLUS: reserveStr(tailB); break;
+		}
 	}
 
 	int32_t mn = begArr[0], mx = begArr[0], me = endArr[0];
 	int32_t running = endArr[0];
+	std::pair<const char*, int> f[9];
 	for(size_t i = 0; i < n; i++) {
 		int32_t s = begArr[i];
 		int32_t e = endArr[i];
@@ -4388,31 +4749,126 @@ static std::shared_ptr<arrow::Table> buildLocissChromTable(
 		startB.UnsafeAppend(s);
 		endB.UnsafeAppend(e);
 		maxEndB.UnsafeAppend(running);
-		if(tails) tailB.UnsafeAppend(tails[i].first, tails[i].second);
+
+		if(tails && flavor != BedFlavor::BED3) {
+			const char* tp = tails[i].first;
+			int tl = tails[i].second;
+			(void)splitTailFields(tp, tl, f, 9);
+			switch(flavor) {
+			case BedFlavor::BED4:
+				nameB.UnsafeAppend(f[0].first, f[0].second);
+				break;
+			case BedFlavor::BED5:
+				nameB.UnsafeAppend(f[0].first, f[0].second);
+				scoreB.UnsafeAppend(f[1].first, f[1].second);
+				break;
+			case BedFlavor::BED6:
+				strandB.UnsafeAppend(f[2].first, f[2].second);
+				nameB.UnsafeAppend(f[0].first, f[0].second);
+				scoreB.UnsafeAppend(f[1].first, f[1].second);
+				break;
+			case BedFlavor::BED12: {
+				int32_t ts = 0, te = 0, bc = 0;
+				if(!parseInt32Field(f[3].first, f[3].second, &ts)
+				|| !parseInt32Field(f[4].first, f[4].second, &te)
+				|| !parseInt32Field(f[6].first, f[6].second, &bc)) {
+					std::cerr << "Error: BED12 numeric field parse failed in "
+					          << chromName << " (ThickStart/ThickEnd/BlockCount)"
+					          << std::endl;
+					return nullptr;
+				}
+				strandB.UnsafeAppend(f[2].first, f[2].second);
+				nameB.UnsafeAppend(f[0].first, f[0].second);
+				scoreB.UnsafeAppend(f[1].first, f[1].second);
+				thickStartB.UnsafeAppend(ts);
+				thickEndB.UnsafeAppend(te);
+				rgbB.UnsafeAppend(f[5].first, f[5].second);
+				blockCountB.UnsafeAppend(bc);
+				blockSizesB.UnsafeAppend(f[7].first, f[7].second);
+				blockStartsB.UnsafeAppend(f[8].first, f[8].second);
+				break;
+			}
+			case BedFlavor::BED_PLUS:
+				tailB.UnsafeAppend(tp, tl);
+				break;
+			case BedFlavor::BED3: /*unreachable*/ break;
+			}
+		}
 	}
 	*outMinStart = mn;
 	*outMaxStart = mx;
 	*outMaxEnd   = me;
 
-	std::shared_ptr<arrow::Array> chrA, sA, eA, meA, tA;
+	std::shared_ptr<arrow::Array> chrA, sA, eA, meA;
 	(void)chromB.Finish(&chrA);
 	(void)startB.Finish(&sA);
 	(void)endB.Finish(&eA);
 	(void)maxEndB.Finish(&meA);
-	if(tails) (void)tailB.Finish(&tA);
+	std::shared_ptr<arrow::Array> nameA, scoreA, strandA, thickStartA,
+	    thickEndA, rgbA, blockCountA, blockSizesA, blockStartsA, tailA;
+	switch(flavor) {
+	case BedFlavor::BED3: break;
+	case BedFlavor::BED4: (void)nameB.Finish(&nameA); break;
+	case BedFlavor::BED5: (void)nameB.Finish(&nameA); (void)scoreB.Finish(&scoreA); break;
+	case BedFlavor::BED6:
+		(void)strandB.Finish(&strandA);
+		(void)nameB.Finish(&nameA);
+		(void)scoreB.Finish(&scoreA);
+		break;
+	case BedFlavor::BED12:
+		(void)strandB.Finish(&strandA);
+		(void)nameB.Finish(&nameA);
+		(void)scoreB.Finish(&scoreA);
+		(void)thickStartB.Finish(&thickStartA);
+		(void)thickEndB.Finish(&thickEndA);
+		(void)rgbB.Finish(&rgbA);
+		(void)blockCountB.Finish(&blockCountA);
+		(void)blockSizesB.Finish(&blockSizesA);
+		(void)blockStartsB.Finish(&blockStartsA);
+		break;
+	case BedFlavor::BED_PLUS: (void)tailB.Finish(&tailA); break;
+	}
 
+	// Assemble schema + column vector in lock-step (must match flushBatch).
 	std::vector<std::shared_ptr<arrow::Field>> fields = {
 		arrow::field("Chromosome",  arrow::utf8(),  false),
 		arrow::field("Start",       arrow::int32(), false),
 		arrow::field("End",         arrow::int32(), false),
 	};
 	std::vector<std::shared_ptr<arrow::Array>> cols = {chrA, sA, eA};
-	if(tails) {
-		fields.push_back(arrow::field("Tail", arrow::utf8(), false));
-		cols.push_back(tA);
+	auto push = [&](const char* name, std::shared_ptr<arrow::DataType> t,
+	                std::shared_ptr<arrow::Array> a) {
+		fields.push_back(arrow::field(name, std::move(t), false));
+		cols.push_back(std::move(a));
+	};
+	switch(flavor) {
+	case BedFlavor::BED3: break;
+	case BedFlavor::BED4: push("Name", arrow::utf8(), nameA); break;
+	case BedFlavor::BED5:
+		push("Name",  arrow::utf8(), nameA);
+		push("Score", arrow::utf8(), scoreA);
+		break;
+	case BedFlavor::BED6:
+		push("Strand", arrow::utf8(), strandA);
+		push("Name",   arrow::utf8(), nameA);
+		push("Score",  arrow::utf8(), scoreA);
+		break;
+	case BedFlavor::BED12:
+		push("Strand",      arrow::utf8(),  strandA);
+		push("Name",        arrow::utf8(),  nameA);
+		push("Score",       arrow::utf8(),  scoreA);
+		push("ThickStart",  arrow::int32(), thickStartA);
+		push("ThickEnd",    arrow::int32(), thickEndA);
+		push("ItemRgb",     arrow::utf8(),  rgbA);
+		push("BlockCount",  arrow::int32(), blockCountA);
+		push("BlockSizes",  arrow::utf8(),  blockSizesA);
+		push("BlockStarts", arrow::utf8(),  blockStartsA);
+		break;
+	case BedFlavor::BED_PLUS:
+		push("Tail", arrow::utf8(), tailA);
+		break;
 	}
-	fields.push_back(arrow::field("MaxEndSoFar", arrow::int32(), false));
-	cols.push_back(meA);
+	push("MaxEndSoFar", arrow::int32(), meA);
 
 	return arrow::Table::Make(arrow::schema(fields), cols, (int64_t)n);
 }
@@ -4429,6 +4885,9 @@ static int locissWriteRecord(LocissSink* sink, const char* chrom, int chrLen,
                              int32_t beg, int32_t end,
                              const char* tail, int tailLen) {
 	return sink->writeRecord(chrom, chrLen, beg, end, tail, tailLen);
+}
+static int locissSetFlavor(LocissSink* sink, BedFlavor flavor) {
+	return sink->setFlavor(flavor);
 }
 static int locissWriteChromBatch(LocissSink* sink,
                                  std::shared_ptr<arrow::Table> table,

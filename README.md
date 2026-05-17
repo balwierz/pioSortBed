@@ -148,43 +148,44 @@ with LociSSD output). Build with `make WITH_LOCISS=1` (requires
 `libarrow-dev` + `libparquet-dev`); the default build has zero Arrow /
 Parquet dependency.
 
-### Handling non-standard BED-like input
+### Schema by input flavor
 
-BED has no header and no schema enforcement: production pipelines
-routinely emit "BED-like" files with custom column layouts (narrowPeak,
-methylation calls with extra signal columns, fragment maps with
-strand-and-counts tails, etc.). pioSortBed handles arbitrary tail
-columns by **detecting from the first record** whether the input has
-any columns past `End`. The schema is then locked for the whole file:
+pioSortBed detects the BED variant from the first record's column
+count and locks the LociSSD schema for the whole file. Standard
+flavors (BED4 / BED5 / BED6 / BED12) get **typed columns** so
+downstream readers can push predicates onto `Strand` etc. Anything
+else — narrowPeak's 10 cols, methylation tracks with extra signal
+columns, custom 7/8-col formats — falls back to a single catch-all
+`Tail` string column that preserves the raw bytes verbatim.
 
-| First record shape | Resulting LociSSD schema |
+| Input | Schema (in file order, per FORMAT_SPEC §3.3) |
 |---|---|
-| 3 columns (pure BED3) | `Chromosome, Start, End, MaxEndSoFar` |
-| 4+ columns (anything past End) | `Chromosome, Start, End, Tail, MaxEndSoFar` |
+| BED3                  | `Chromosome, Start, End, MaxEndSoFar` |
+| BED4                  | `Chromosome, Start, End, Name, MaxEndSoFar` |
+| BED5                  | `Chromosome, Start, End, Name, Score, MaxEndSoFar` |
+| BED6                  | `Chromosome, Start, End, Strand, Name, Score, MaxEndSoFar` |
+| BED12                 | `Chromosome, Start, End, Strand, Name, Score, ThickStart, ThickEnd, ItemRgb, BlockCount, BlockSizes, BlockStarts, MaxEndSoFar` |
+| Other (7/8/9/10/11/13+) | `Chromosome, Start, End, Tail, MaxEndSoFar` (catch-all) |
 
-`Tail` is a single `string` column carrying the raw post-`End`
-tab-separated bytes verbatim (no leading tab). Three properties worth
-noting:
+Notes:
 
-1. **Column layout doesn't matter.** Whether the input is BED4, BED6,
-   BED12, narrowPeak (10 cols), or some lab's custom 7-column format,
-   the bytes round-trip into `Tail` unchanged. Downstream tools split
-   the `Tail` string locally for the columns they actually need.
-2. **Column count can vary record-to-record.** Within a BED4+ file
-   one record can have 6 user fields and another 8 — `Tail` is just
-   different strings. Useful for messy real-world inputs.
-3. **Mixing BED3 and BED4+ in the same file is rejected.** Parquet
-   doesn't support mid-write schema evolution, so once the first
-   record's tail-presence determines the schema, every later record
-   must match. The error message is explicit and suggests either
-   splitting the input or padding the BED3 records with a placeholder
-   column (e.g. `awk -F'\t' 'NF==3{$0=$0"\t."} 1'`).
-
-For genuine BED4 / BED5 / BED6 / BED12 inputs, future versions may
-split the typed columns out (Name, Score, Strand, …) so downstream
-tools can predicate-push on Strand and friends without parsing the
-`Tail` string. Today the `Tail` string preserves all data and unblocks
-the LociSSD output for every BED variant in the wild.
+- **`Strand` is pulled to position 4** for BED6 and BED12, per
+  FORMAT_SPEC §3.3 (loci-required columns, then Strand if present,
+  then the remaining user columns in BED order, then `MaxEndSoFar`).
+- **`Score` is `string`, not numeric.** BED scores can be non-numeric
+  (e.g. `.`); the spec defers integer interpretation to the reader.
+- **`ThickStart`, `ThickEnd`, `BlockCount` are `int32`.** A non-integer
+  in any of these for a BED12 input is an error at sort time.
+- **Catch-all (BED_PLUS) input** behaves as in earlier versions:
+  arbitrary tail content round-trips into the `Tail` string; column
+  counts can even vary record-to-record (one row 7 cols, another 9
+  cols — `Tail` is just different strings); only the choice between
+  BED3 and BED4+ at the first record is sticky for the whole file.
+- **Mixing BED3 and BED4+ records is rejected.** Parquet can't
+  evolve schemas mid-write, so once the first record commits to a
+  flavor, later records must match. The error message points at the
+  fix: split the input by column count, or pad short records with
+  a placeholder column (e.g. `awk -F'\t' 'NF==3{$0=$0"\t."} 1'`).
 
 ## Installation
 
