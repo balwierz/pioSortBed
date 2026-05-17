@@ -47,6 +47,17 @@ the project uses [semantic versioning](https://semver.org).
   `--bgzip --tabix`, `--lociss-output`, `--lociss-output
   --lociss-index`).
 
+- **Typed Arrow columns for standard BED4/5/6/12 inputs under
+  `--lociss-output`.** The writer used to encode every BED4+ input
+  as a single catch-all `Tail` string column. It now detects the
+  input's BED flavor (BED3/BED4/BED5/BED6/BED12 vs BED+) and emits
+  the appropriate per-column schema (Name `string`, Score `int32`,
+  Strand `string`, ItemRGB / BlockCount / BlockSizes / BlockStarts
+  for BED12, etc.) per FORMAT_SPEC §3.3 column ordering. Non-standard
+  BED widths still fall back to the catch-all `Tail` column —
+  faithful round-trip is preserved. Predicate pushdown on Strand,
+  Score, etc. now works at Parquet read time.
+
 ### Fixed
 
 - The classic-path emit loop's `terminate called without an active
@@ -80,8 +91,23 @@ the project uses [semantic versioning](https://semver.org).
 - 3 new tests under `test/test.sh`, skipped on non-`WITH_HTSLIB`
   builds: `--bgzip` round-trip vs plain sort; `--bgzip --tabix`
   region query vs awk reference; `--bgzip` without `-o` errors out.
-  Total: 28 of 28 tests passing in the htslib build, 25 of 25 in
-  the default build.
+- 2 new tests under `test/test.sh`, skipped on non-`WITH_LOCISS`
+  builds: `--lociss-output` Parquet round-trip across all four
+  sort paths; cross-path data-payload md5 match (Tail / typed
+  columns identical regardless of sort path).
+- Test totals per build: 25 of 25 in the default build, 28 of 28
+  in the `WITH_HTSLIB` build, 30 of 30 in the
+  `WITH_HTSLIB + WITH_LOCISS` build.
+
+### Infrastructure
+
+- New `.github/workflows/ci.yml`: a 3-cell matrix builds and runs
+  the test suite on every push and pull request — default
+  (BED-only), `WITH_HTSLIB=1`, and `WITH_HTSLIB=1 WITH_LOCISS=1`.
+  The LociSSD job runs in a clean `ubuntu:22.04` container and
+  builds htslib from source (Debian's `libhts-dev` and Apache
+  Arrow's `libarrow-dev` cannot coexist as APT packages — they
+  pull in incompatible libcurl SSL backends).
 
 ## [3.7.0] — 2026-05-06
 

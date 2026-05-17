@@ -1,5 +1,7 @@
 # pioSortBed
 
+[![CI](https://github.com/balwierz/pioSortBed/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/balwierz/pioSortBed/actions/workflows/ci.yml)
+
 **Ultra-fast BED file sorter for genomics**
 
 Sorts BED files by chromosome and start coordinate, equivalent to:
