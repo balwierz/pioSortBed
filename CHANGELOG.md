@@ -4,6 +4,85 @@ All notable changes to pioSortBed are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [semantic versioning](https://semver.org).
 
+## [3.8.0] — 2026-05-17
+
+### Added
+
+- **Integrated `--bgzip [--tabix]` output** (htslib-backed; opt-in at
+  build time via `make WITH_HTSLIB=1`). Writes a BGZF-compressed
+  `.bed.gz` (and optionally a tabix `.tbi` sidecar) from a single
+  pioSortBed invocation, eliminating the canonical `pio | bgzip >
+  out.bed.gz; tabix out.bed.gz` three-tool pipeline.
+
+  Implementation: a small drainer thread reads bytes off a stdout-
+  redirected pipe and feeds them to `bgzf_write`, so every sort path's
+  emit code (which writes BED text to stdout) works unchanged. After
+  the BGZF closes, an optional `tbx_index_build3` builds the tabix
+  index in place. Works on all four sort paths (classic, low-mem-ssd,
+  external-merge, multi-pass). Mutually exclusive with
+  `--lociss-output`; requires `-o FILE` (BGZF to stdout is ambiguous).
+
+  At 100M records (6.6 GB BED) on the bench desktop, the new path
+  is 2.5× faster than the canonical three-tool pipeline (33.9 s vs
+  86.1 s) and writes 6.1× less to disk (1.3 GB vs 8.0 GB, because
+  pioSortBed doesn't spill to GNU-sort temp files and the
+  compression happens once instead of via a separate bgzip stage).
+
+- New benchmark `benchmark/bench_query.sh` + Python driver
+  `bench_query_drivers.py`: region-query latency for the three
+  indexed output forms (bgzip+tabix, LociSSD, LociSSD+index) read by
+  four readers (tabix CLI, polars `scan_parquet`, DuckDB SQL, and Loci
+  — a pyranges 1 derivative with native LociSSD support). 333
+  queries per (region-size × cache-state) cell; CSV +
+  `bench_query_latency.png` rendered from the same data.
+
+  Headline: at a 10 Mbp region size on the 100M-record file,
+  polars + LociSSD answers a query in 7.8 ms — 13× faster than
+  tabix on the same data (105 ms). tabix wins at the 1 kbp and
+  100 kbp sizes thanks to its very low per-query setup cost.
+
+- New benchmark `benchmark/bench_pipeline.sh`: end-to-end wall time
+  + bytes written for four recipes that all produce a queryable
+  sorted BED from the same 100M-record input (canonical pipeline,
+  `--bgzip --tabix`, `--lociss-output`, `--lociss-output
+  --lociss-index`).
+
+### Fixed
+
+- The classic-path emit loop's `terminate called without an active
+  exception` abort under `--bgzip` when the sort dispatches return
+  early (`multipass`, `extmerge`, `low-mem-ssd` paths each have
+  their own return point). Each dispatch now wraps its `return rc`
+  in `finalizeOutputRedirect()` which closes the BGZF and joins the
+  drainer thread before main exits.
+
+- Stale references in `--help` and the README to the WITH_BAM-only
+  htslib build flag now point at `WITH_HTSLIB=1` (the more general
+  flag that also enables `--bgzip`/`--tabix`). `WITH_BAM=1` still
+  works as an alias for back-compat with downstream Makefiles.
+
+### Changed
+
+- Build flag refactor: split the previous combined `WITH_BAM` into
+  three independent opt-in flags — `WITH_HTSLIB=1` (bgzip + tabix
+  + htslib link), `WITH_BAM=1` (BAM I/O, implies HTSLIB), `WITH_RANS=1`
+  (htscodecs rANS codecs for external-merge, implies HTSLIB and needs
+  a source-tree HTSLIB for the htscodecs/ headers). The default
+  binary still has zero htslib dependency.
+
+- `CFLAGS` upgraded from `-std=c++17` to `-std=c++20`. The system
+  Apache Arrow + Parquet headers (used in `WITH_LOCISS=1` builds)
+  now require C++20; the base BED-only build doesn't need the
+  newer standard but uses it for consistency. GCC ≥ 10 needed.
+
+### Tests
+
+- 3 new tests under `test/test.sh`, skipped on non-`WITH_HTSLIB`
+  builds: `--bgzip` round-trip vs plain sort; `--bgzip --tabix`
+  region query vs awk reference; `--bgzip` without `-o` errors out.
+  Total: 28 of 28 tests passing in the htslib build, 25 of 25 in
+  the default build.
+
 ## [3.7.0] — 2026-05-06
 
 ### Added

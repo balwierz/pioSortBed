@@ -162,22 +162,31 @@ make install    # optional: installs to /usr/local/bin (override PREFIX=...)
 
 **Optional builds:**
 
-- `make WITH_BAM=1 HTSLIB=/path/to/htslib` adds an in-RAM BAM input
-  path (coord-sort only; reuses `radixSort64` and writes BAM via
-  htslib). Also enables htscodecs' SIMD-vectorised rANS codecs for
-  `--external-merge`.
+- `make WITH_HTSLIB=1` enables the `--bgzip` / `--tabix` integrated
+  output (write a queryable `.bed.gz` + `.tbi` in one invocation;
+  no need for the canonical `pio | bgzip ; tabix` three-tool
+  pipeline). Uses the system htslib install (`apt install libhts-dev`);
+  pass `HTSLIB=/path/to/source-tree` to link against an htslib source
+  tree instead.
+- `make WITH_BAM=1 HTSLIB=/path/to/htslib` (implies `WITH_HTSLIB=1`)
+  adds an in-RAM BAM input path (coord-sort only; reuses `radixSort64`
+  and writes BAM via htslib).
+- `make WITH_RANS=1 HTSLIB=/path/to/htslib` (implies `WITH_HTSLIB=1`)
+  enables htscodecs' SIMD-vectorised rANS order-0/1 codecs for
+  `--external-merge` temp files. Requires an htslib source tree
+  (the htscodecs/ headers don't ship in distro packages).
 - `make WITH_LOCISS=1` enables the `--lociss-output` Parquet writer.
   Requires `libarrow-dev libparquet-dev`. The default build has zero
   Arrow/Parquet dependency.
 
 Manual compilation (default build):
 ```bash
-g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++17 \
+g++ src/pioSortBed.cpp -Isrc -o pioSortBed -O3 -std=c++20 \
     -static-libstdc++ -static-libgcc -ltbb -llz4 -lzstd \
-    -DVERSION_STRING=\"3.7.0\"
+    -DVERSION_STRING=\"3.8.0\"
 ```
 
-> Parallelism uses C++17 `std::execution::par` algorithms backed by oneTBB,
+> Parallelism uses C++20 `std::execution::par` algorithms backed by oneTBB,
 > not OpenMP. The C++ runtime is linked statically; libtbb / lz4 / zstd
 > stay dynamic in the default `make`. The release binary
 > (`make release-binary TBB_LIB=...`) statically links all of libtbb,
@@ -210,6 +219,8 @@ pioSortBed [options] -   # read from standard input
 | `-o FILE` / `--output FILE` | Write to file instead of stdout |
 | **Other** | |
 | `--collapse` | Collapse overlapping regions, summing weights (classic / low-mem-ssd only) |
+| `--bgzip` | Write BGZF-compressed BED text (`.bed.gz`) instead of plain text. Requires `-o FILE`. Mutually exclusive with `--lociss-output`. Requires `make WITH_HTSLIB=1`. |
+| `--tabix` | After `--bgzip`, build a tabix `.tbi` index in place. Implies `--bgzip`. Replaces the canonical `pio \| bgzip ; tabix` three-tool pipeline. |
 | `--lociss-output FILE` | Write sorted Parquet (LociSSD v2 spec) instead of BED text. Works on every sort path. Requires `make WITH_LOCISS=1`. See [LociSSD Parquet output](#lociss-parquet-output). |
 | `--lociss-index` | Embed an optional row-precision interval index in the LociSSD output footer |
 | `-v` / `--verbose` | Print parsing / sorting timing and chromosome stats to stderr |
@@ -232,7 +243,11 @@ pioSortBed --natural-sort input.bed > sorted.bed       # chr2 before chr10
 pioSortBed --external-merge -t 8 --max-mem=4G huge.bed > sorted.bed
 pioSortBed --multi-pass     -t 8 --max-mem=4G huge.bed > sorted.bed   # 0 temp writes
 
-# LociSSD Parquet output (requires WITH_LOCISS=1 build)
+# Integrated bgzip + tabix in one step (requires WITH_HTSLIB=1)
+# Replaces the canonical:   pio | bgzip > out.bed.gz; tabix out.bed.gz
+pioSortBed --low-mem-ssd -t 8 --bgzip --tabix -o sorted.bed.gz input.bed
+
+# LociSSD Parquet output (requires WITH_LOCISS=1)
 pioSortBed --low-mem-ssd -t 8 --lociss-output sorted.lociss input.bed
 pioSortBed --low-mem-ssd -t 8 --lociss-output sorted.lociss --lociss-index input.bed
 ```
