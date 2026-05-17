@@ -289,7 +289,10 @@ echo "--- --bgzip / --tabix (WITH_HTSLIB build only) ---"
 # Skip these three tests on a non-htslib build. We detect by asking
 # pioSortBed itself: it prints the --bgzip option in its help only on
 # WITH_HTSLIB builds. If absent, skip cleanly.
-if "$PIO" --help 2>&1 | grep -q -- '--bgzip'; then
+# Strict match on the flag-declaration line ("          --bgzip ..." in
+# CLI11's help output), not bare-substring grep — other flags' help text
+# may mention --bgzip in passing without the binary actually supporting it.
+if "$PIO" --help 2>&1 | grep -qE '^[[:space:]]+--bgzip[[:space:]]'; then
     if ! command -v tabix &>/dev/null || ! command -v bgzip &>/dev/null; then
         echo "  SKIP: tabix or bgzip not installed (htslib CLI tools needed for tests)"
     else
@@ -337,7 +340,13 @@ fi
 echo ""
 echo "--- --lociss-output / Tail passthrough (WITH_LOCISS build only) ---"
 
-if "$PIO" --help 2>&1 | grep -q -- '--lociss-output'; then
+# Strict declaration-line match — `--bgzip`'s help text mentions
+# `--lociss-output` ("mutually exclusive with --lociss-output"), so a
+# bare substring grep would fire in WITH_HTSLIB-but-not-WITH_LOCISS
+# builds and try to run LociSSD tests against a binary that doesn't
+# support the flag. Match `--lociss-output TEXT` (the CLI11 option-type
+# marker) instead.
+if "$PIO" --help 2>&1 | grep -qE '^[[:space:]]+--lociss-output[[:space:]]+TEXT'; then
     TMP_BED=$(mktemp /tmp/pio_lociss_XXXX.bed)
     TMP_LOCISS_BASE=$(mktemp -u /tmp/pio_lociss_XXXX.lociss)
     cat > "$TMP_BED" <<EOF
