@@ -24,10 +24,15 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <thread>
 #include "CLI11.hpp"
+#ifdef WITH_HTSLIB
+#include <htslib/bgzf.h>
+#include <htslib/tbx.h>
+#include <htslib/hts.h>
+#endif
 #ifdef WITH_BAM
 #include <htslib/sam.h>
-#include <htslib/hts.h>
 #endif
 #ifdef WITH_RANS
 #include <htscodecs/rANS_static4x16.h>
@@ -44,6 +49,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
 
 // Forward declarations so the sort paths (multiPassSort, extMergeSort,
 // lowMemSortMmap) can drive a LocissSink via opaque-pointer helpers
@@ -67,6 +73,144 @@ static std::shared_ptr<arrow::Table> buildLocissChromTable(
 #endif
 #include <lz4.h>
 #include <zstd.h>
+
+// =============================================================================
+// --bgzip / --tabix output integration (htslib-backed; opt-in at build time).
+// =============================================================================
+//
+// BgzipRedirect spawns a drainer thread that reads bytes off a pipe and feeds
+// them to bgzf_write. We dup2 the pipe's write end onto stdout, so every
+// existing emit path (fwrite_unlocked / fputs_unlocked → stdout) works
+// unchanged. After finish() returns, the output file is a valid BGZF.
+//
+// The drainer-thread + pipe pattern (rather than refactoring every emit site
+// to use a synthetic FILE* over bgzf_write) keeps the integration to one
+// helper struct and zero churn in the sort paths.
+#ifdef WITH_HTSLIB
+struct BgzipRedirect {
+    BGZF* bgzfFp        = nullptr;
+    int   pipe_read_fd  = -1;
+    int   saved_stdout  = -1;
+    std::thread writer;
+    std::atomic<int> writerRc{0}; // 0 on success, non-zero on bgzf_write failure
+
+    int start(const std::string& outPath, int numThreads) {
+        bgzfFp = bgzf_open(outPath.c_str(), "w");
+        if(!bgzfFp) {
+            std::cerr << "Error: bgzf_open failed for " << outPath << std::endl;
+            return 1;
+        }
+        if(numThreads > 1) bgzf_mt(bgzfFp, numThreads, 256);
+
+        int fds[2];
+        if(pipe(fds) != 0) {
+            std::cerr << "Error: pipe() failed for --bgzip redirect" << std::endl;
+            bgzf_close(bgzfFp); bgzfFp = nullptr;
+            return 1;
+        }
+        pipe_read_fd = fds[0];
+        int pipe_write_fd = fds[1];
+
+        fflush(stdout);
+        saved_stdout = dup(STDOUT_FILENO);
+        if(saved_stdout < 0 || dup2(pipe_write_fd, STDOUT_FILENO) < 0) {
+            std::cerr << "Error: dup/dup2 failed for --bgzip redirect" << std::endl;
+            close(pipe_read_fd); close(pipe_write_fd); bgzf_close(bgzfFp); bgzfFp = nullptr;
+            return 1;
+        }
+        close(pipe_write_fd);
+
+        writer = std::thread([this]() {
+            char buf[262144];
+            ssize_t n;
+            while((n = read(pipe_read_fd, buf, sizeof(buf))) > 0) {
+                if(bgzf_write(bgzfFp, buf, (size_t)n) < 0) {
+                    writerRc.store(1);
+                    // Drain to unblock writer side; we'll report in finish().
+                }
+            }
+            close(pipe_read_fd);
+            pipe_read_fd = -1;
+        });
+        return 0;
+    }
+
+    int finish() {
+        fflush(stdout);
+        if(saved_stdout >= 0) {
+            dup2(saved_stdout, STDOUT_FILENO);
+            close(saved_stdout);
+            saved_stdout = -1;
+        }
+        if(writer.joinable()) writer.join();
+        int rc = writerRc.load();
+        if(bgzfFp) {
+            if(bgzf_close(bgzfFp) < 0) {
+                std::cerr << "Error: bgzf_close failed" << std::endl;
+                rc = 1;
+            }
+            bgzfFp = nullptr;
+        }
+        return rc;
+    }
+};
+
+static int setupOutputRedirect(BgzipRedirect& bgz, bool doBgzip,
+                               const std::string& outputFile, int numThreads)
+{
+    if(outputFile.empty()) return 0;
+    if(doBgzip) return bgz.start(outputFile, numThreads);
+    if(!freopen(outputFile.c_str(), "w", stdout)) {
+        std::cerr << "Error: cannot open " << outputFile << " for writing" << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
+// finalize closes the BGZF and, on success + doTabix, builds the .tbi.
+// Returns rc unchanged if no finalisation work needed; rc | 1 if it failed.
+static int finalizeOutputRedirect(BgzipRedirect& bgz, bool doBgzip, bool doTabix,
+                                  const std::string& outputFile,
+                                  int numThreads, int rc)
+{
+    if(!doBgzip || outputFile.empty()) return rc;
+    int finishRc = bgz.finish();
+    if(finishRc != 0 && rc == 0) rc = finishRc;
+    if(rc == 0 && doTabix) {
+        if(tbx_index_build3(outputFile.c_str(), NULL, 0, numThreads,
+                            &tbx_conf_bed) < 0) {
+            std::cerr << "Error: tabix index build failed for "
+                      << outputFile << std::endl;
+            rc = 1;
+        }
+    }
+    return rc;
+}
+#else
+// Non-htslib build: stubs so the rest of the file compiles uniformly.
+struct BgzipRedirect {};
+static inline int setupOutputRedirect(BgzipRedirect&, bool doBgzip,
+                                      const std::string& outputFile,
+                                      int /*numThreads*/)
+{
+    if(doBgzip) {
+        std::cerr << "Error: --bgzip requires a WITH_HTSLIB=1 build "
+                     "(this binary was built without htslib support)" << std::endl;
+        return 1;
+    }
+    if(outputFile.empty()) return 0;
+    if(!freopen(outputFile.c_str(), "w", stdout)) {
+        std::cerr << "Error: cannot open " << outputFile << " for writing" << std::endl;
+        return 1;
+    }
+    return 0;
+}
+static inline int finalizeOutputRedirect(BgzipRedirect&, bool /*doBgzip*/,
+                                         bool /*doTabix*/,
+                                         const std::string& /*outputFile*/,
+                                         int /*numThreads*/, int rc)
+{ return rc; }
+#endif
 
 // Fallback for manual compilation without -DVERSION_STRING; the Makefile
 // always injects the real version, so this only matters for one-off builds.
@@ -4189,6 +4333,8 @@ int main(int argc, char *argv[])
 	std::string maxMemStr;
 	std::string outputFile;
 	bool verbose = false;
+	bool doBgzip = false;
+	bool doTabix = false;
 
 	app.add_option("input-file", inputFile,
 		"input file; \"-\" reads from stdin; .gz files are decompressed automatically")
@@ -4232,6 +4378,13 @@ int main(int argc, char *argv[])
 		"(uncapped by default)");
 	app.add_option("-o,--output", outputFile,
 		"write sorted output to this file (default: stdout)");
+#ifdef WITH_HTSLIB
+	app.add_flag("--bgzip", doBgzip,
+		"emit BGZF-compressed BED text (.bed.gz) instead of plain text. "
+		"Requires -o FILE; mutually exclusive with --lociss-output");
+	app.add_flag("--tabix", doTabix,
+		"after --bgzip, build a tabix (.tbi) index in place. Implies --bgzip");
+#endif
 	app.add_flag("-v,--verbose", verbose,
 		"report parsing / sorting timings and per-chromosome stats on stderr");
 #ifdef WITH_LOCISS
@@ -4247,6 +4400,32 @@ int main(int argc, char *argv[])
 
 	CLI11_PARSE(app, argc, argv);
 	const size_t maxMemBytes = parseMemSize(maxMemStr);
+
+	// --tabix implies --bgzip (the .tbi index requires a BGZF file).
+	if(doTabix) doBgzip = true;
+
+	// --bgzip writes binary; require -o FILE so a pipeline doesn't dump
+	// it into the terminal. Mutually exclusive with --lociss-output
+	// (which writes its own file directly through the Parquet writer).
+	if(doBgzip) {
+		if(outputFile.empty()) {
+			std::cerr << "Error: --bgzip requires -o/--output FILE "
+			             "(BGZF to stdout is ambiguous in a pipeline)" << std::endl;
+			return 1;
+		}
+#ifdef WITH_LOCISS
+		if(!locissOutput.empty()) {
+			std::cerr << "Error: --bgzip and --lociss-output are mutually "
+			             "exclusive (pick a text or a Parquet output)" << std::endl;
+			return 1;
+		}
+#endif
+#ifndef WITH_HTSLIB
+		std::cerr << "Error: --bgzip / --tabix require a WITH_HTSLIB=1 build "
+		             "(this binary was built without htslib support)" << std::endl;
+		return 1;
+#endif
+	}
 
 	if(numThreads <= 0)
 	{
@@ -4319,19 +4498,19 @@ int main(int argc, char *argv[])
 			        "(stdin can only be read once)." << endl;
 			return 1;
 		}
-		if(!outputFile.empty()) {
-			if(!freopen(outputFile.c_str(), "w", stdout)) {
-				cerr << "Error: cannot open " << outputFile << " for writing" << endl;
-				return 1;
-			}
-		}
+		BgzipRedirect bgz_mp;
+		if(setupOutputRedirect(bgz_mp, doBgzip, outputFile, numThreads) != 0)
+			return 1;
+		int rc;
 #ifdef WITH_LOCISS
-		return multiPassSort(inputFile, maxMemBytes, naturalSort,
-		                     numThreads, verbose, locissOutput, locissIndex);
+		rc = multiPassSort(inputFile, maxMemBytes, naturalSort,
+		                   numThreads, verbose, locissOutput, locissIndex);
 #else
-		return multiPassSort(inputFile, maxMemBytes, naturalSort,
-		                     numThreads, verbose, std::string(), false);
+		rc = multiPassSort(inputFile, maxMemBytes, naturalSort,
+		                   numThreads, verbose, std::string(), false);
 #endif
+		return finalizeOutputRedirect(bgz_mp, doBgzip, doTabix,
+		                              outputFile, numThreads, rc);
 	}
 
 	// External merge sort dispatch. Fires before mmap/slurp and bypasses the
@@ -4358,35 +4537,33 @@ int main(int argc, char *argv[])
 			     << "' (valid: raw|lz4|zstd|rans0|rans1)" << endl;
 			return 1;
 		}
-		if(!outputFile.empty()) {
-			if(!freopen(outputFile.c_str(), "w", stdout)) {
-				cerr << "Error: cannot open " << outputFile << " for writing" << endl;
-				return 1;
-			}
-		}
+		BgzipRedirect bgz_em;
+		if(setupOutputRedirect(bgz_em, doBgzip, outputFile, numThreads) != 0)
+			return 1;
+		int rc;
 #ifdef WITH_LOCISS
-		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, numThreads, verbose,
-		                    locissOutput, locissIndex);
+		rc = extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
+		                  naturalSort, numThreads, verbose,
+		                  locissOutput, locissIndex);
 #else
-		return extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
-		                    naturalSort, numThreads, verbose,
-		                    std::string(), false);
+		rc = extMergeSort(inputFile, maxMemBytes, codec, extTmpDir,
+		                  naturalSort, numThreads, verbose,
+		                  std::string(), false);
 #endif
+		return finalizeOutputRedirect(bgz_em, doBgzip, doTabix,
+		                              outputFile, numThreads, rc);
 	}
 
 	// -o/--output redirects stdout to the named file. All downstream data
 	// emit (fputs_unlocked, fwrite_unlocked, printf in collapse mode) goes
 	// through stdout, so freopen-ing it here is a single-line redirect with
 	// no other code changes needed. Diagnostics stay on stderr.
-	if(!outputFile.empty())
-	{
-		if(!freopen(outputFile.c_str(), "w", stdout))
-		{
-			cerr << "Error: cannot open " << outputFile << " for writing" << endl;
-			return 1;
-		}
-	}
+	// --bgzip variant: spawn a drainer thread reading stdout via a pipe
+	// and feeding BGZF; finalize at end of main with tabix-index build if
+	// --tabix was set. Either way the sort paths see unchanged stdout.
+	BgzipRedirect bgz_main;
+	if(setupOutputRedirect(bgz_main, doBgzip, outputFile, numThreads) != 0)
+		return 1;
 
 	size_t readCount = 1;	// count == 0 is used as an end of a list.
 	size_t currMaxReads = 1024;
@@ -4539,15 +4716,18 @@ int main(int argc, char *argv[])
 	{
 		// All input paths land here with useMmap=true (file: native mmap;
 		// stdin/gzip: slurped into a buffer and presented as if mmap'd).
+		int rc;
 #ifdef WITH_LOCISS
-		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
-		                      numThreads, naturalSort, maxMemBytes, verbose,
-		                      locissOutput, locissIndex);
+		rc = lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
+		                    numThreads, naturalSort, maxMemBytes, verbose,
+		                    locissOutput, locissIndex);
 #else
-		return lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
-		                      numThreads, naturalSort, maxMemBytes, verbose,
-		                      std::string(), false);
+		rc = lowMemSortMmap(mmapBase, mmapSize, fCollapse, sortMode,
+		                    numThreads, naturalSort, maxMemBytes, verbose,
+		                    std::string(), false);
 #endif
+		return finalizeOutputRedirect(bgz_main, doBgzip, doTabix,
+		                              outputFile, numThreads, rc);
 	}
 
 	time_t tstart, tend;
@@ -4749,5 +4929,6 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Sorting has taken %d seconds\n",
 		        (int)(difftime(tend, tstart)+0.5));
 	}
-	return 0;
+	return finalizeOutputRedirect(bgz_main, doBgzip, doTabix,
+	                              outputFile, numThreads, 0);
 }

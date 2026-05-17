@@ -1,8 +1,8 @@
-VERSION  = 3.7.0
+VERSION  = 3.8.0
 PREFIX  ?= /usr/local
 
 CC      = g++
-CFLAGS  = -Isrc -O3 -std=c++17 -DVERSION_STRING=\"$(VERSION)\"
+CFLAGS  = -Isrc -O3 -std=c++20 -DVERSION_STRING=\"$(VERSION)\"
 # Parallel std::sort on libstdc++ is implemented over TBB.
 # C++/GCC runtimes statically linked so stdio doesn't go through a PLT;
 # libtbb stays dynamic (no libtbb.a in Debian).
@@ -13,23 +13,52 @@ CFLAGS  = -Isrc -O3 -std=c++17 -DVERSION_STRING=\"$(VERSION)\"
 LDFLAGS = -static-libstdc++ -static-libgcc -ltbb -llz4 -lzstd
 DEPS    =
 
-# Optional BAM input via htslib. Build with:
-#   make WITH_BAM=1 HTSLIB=/path/to/htslib
-# HTSLIB should point to a built htslib tree (i.e. one that contains
-# libhts.{a,so} and the htslib/ header dir). Without WITH_BAM the binary
-# is BED-only and has zero htslib dependency.
-WITH_BAM ?=
-HTSLIB   ?=
+# Optional htslib-backed features. Three independent opt-in flags,
+# each enables a feature that links against htslib:
+#   WITH_HTSLIB=1 — integrated bgzip + tabix output (--bgzip / --tabix),
+#                   producing a queryable .bed.gz + .tbi in one step.
+#                   Works with a system htslib install (`apt install
+#                   libhts-dev`); HTSLIB= optional.
+#   WITH_BAM=1    — BAM input (`*.bam` → coord-sorted BAM via htslib's
+#                   BGZF worker pool). Implies WITH_HTSLIB.
+#   WITH_RANS=1   — htscodecs SIMD rANS codecs for --external-merge temp
+#                   files (--merge-codec=rans0|rans1). Requires HTSLIB
+#                   to point at an htslib *source tree* (the htscodecs/
+#                   headers ship there, not in the system install).
+#                   Implies WITH_HTSLIB.
+#
+# Default (no flags): binary is BED-only with zero htslib dependency.
+WITH_HTSLIB ?=
+WITH_BAM    ?=
+WITH_RANS   ?=
+HTSLIB      ?=
 ifneq ($(WITH_BAM),)
-  ifeq ($(HTSLIB),)
-    $(error WITH_BAM=1 requires HTSLIB=/path/to/htslib)
+  WITH_HTSLIB := 1
+endif
+ifneq ($(WITH_RANS),)
+  WITH_HTSLIB := 1
+endif
+ifneq ($(WITH_HTSLIB),)
+  CFLAGS += -DWITH_HTSLIB
+  ifneq ($(HTSLIB),)
+    # Source-tree htslib: use its headers + statically link libhts.a so the
+    # htscodecs rANS internals are pulled in (they're in libhts.a but not
+    # exported by libhts.so).
+    CFLAGS  += -I$(HTSLIB)
+    LDFLAGS += $(HTSLIB)/libhts.a -lz -lpthread -ldeflate
+  else
+    # System htslib install: -lhts is enough for bgzip + tabix + BAM.
+    LDFLAGS += -lhts -lz -lpthread -ldeflate
   endif
-  # Link libhts.a (static) so the htscodecs rANS internals (rans_compress_*,
-  # rans_uncompress_*) are pulled in — they're in libhts.a but not exported
-  # by libhts.so, so dynamic linking would only work for the public API and
-  # would not give us rANS for --merge-codec rans0/rans1.
-  CFLAGS  += -DWITH_BAM -DWITH_RANS -I$(HTSLIB) -I$(HTSLIB)/htscodecs
-  LDFLAGS += $(HTSLIB)/libhts.a -lz -lpthread -ldeflate
+  ifneq ($(WITH_BAM),)
+    CFLAGS += -DWITH_BAM
+  endif
+  ifneq ($(WITH_RANS),)
+    ifeq ($(HTSLIB),)
+      $(error WITH_RANS=1 needs HTSLIB=/path/to/htslib-source-tree (for the htscodecs/ headers))
+    endif
+    CFLAGS += -DWITH_RANS -I$(HTSLIB)/htscodecs
+  endif
 endif
 
 # Optional LociSSD output (Parquet writer per FORMAT_SPEC.md). Build with:

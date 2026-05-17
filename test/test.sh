@@ -284,6 +284,57 @@ mono_par5=$(echo "$got_par5" | awk 'BEGIN{ok=1}{pos=($6=="-")?$3:$2; if($1==last
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "--- --bgzip / --tabix (WITH_HTSLIB build only) ---"
+
+# Skip these three tests on a non-htslib build. We detect by asking
+# pioSortBed itself: it prints the --bgzip option in its help only on
+# WITH_HTSLIB builds. If absent, skip cleanly.
+if "$PIO" --help 2>&1 | grep -q -- '--bgzip'; then
+    if ! command -v tabix &>/dev/null || ! command -v bgzip &>/dev/null; then
+        echo "  SKIP: tabix or bgzip not installed (htslib CLI tools needed for tests)"
+    else
+        TMPBGZ=$(mktemp /tmp/pio_bgzip_XXXX.bed.gz)
+        rm -f "$TMPBGZ" "$TMPBGZ.tbi"
+
+        # 1. --bgzip round-trip: bgzipped output decompresses to the
+        #    canonical sorted reference.
+        wantbgz=$(ref_sort < "$PAR" | canon)
+        "$PIO" -t 4 --bgzip -o "$TMPBGZ" "$PAR" 2>/dev/null
+        gotbgz=$(bgzip -d -c "$TMPBGZ" 2>/dev/null | canon)
+        check_eq "--bgzip round-trip vs plain sort" "$gotbgz" "$wantbgz"
+        rm -f "$TMPBGZ"
+
+        # 2. --bgzip --tabix index correctness: a region query returns
+        #    the same rows as the awk-extracted reference region.
+        "$PIO" -t 4 --bgzip --tabix -o "$TMPBGZ" "$PAR" 2>/dev/null
+        if [[ -f "$TMPBGZ.tbi" ]]; then
+            # Pick the first chromosome that exists in the test fixture
+            # and a wide region that should overlap at least one record.
+            firstchr=$(ref_sort < "$PAR" | head -1 | awk '{print $1}')
+            wanttbx=$(ref_sort < "$PAR" | awk -F'\t' -v c="$firstchr" \
+                '$1==c && $2<2000000000 && $3>0 {print $1"\t"$2"\t"$3}' | canon)
+            gottbx=$(tabix "$TMPBGZ" "$firstchr:0-2000000000" 2>/dev/null \
+                | awk -F'\t' '{print $1"\t"$2"\t"$3}' | canon)
+            check_eq "--bgzip --tabix region query matches awk reference" \
+                     "$gottbx" "$wanttbx"
+        else
+            fail "--bgzip --tabix did not produce a .tbi sidecar"
+        fi
+        rm -f "$TMPBGZ" "$TMPBGZ.tbi"
+
+        # 3. --bgzip without -o must fail with exit code 1.
+        if "$PIO" --bgzip "$PAR" > /dev/null 2>&1; then
+            fail "--bgzip without -o should fail but succeeded"
+        else
+            ok "--bgzip without -o errors out (as documented)"
+        fi
+    fi
+else
+    echo "  SKIP: pioSortBed built without WITH_HTSLIB; --bgzip not available"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "--- Version flag ---"
 
 ver=$("$PIO" --version 2>&1)
