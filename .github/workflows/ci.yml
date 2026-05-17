@@ -45,7 +45,12 @@ jobs:
             #       HTSLIB=/path/to/htslib for exactly this case) and
             #       install libarrow-dev / libparquet-dev as packages.
             container: "ubuntu:22.04"
-            flags: "WITH_HTSLIB=1 WITH_LOCISS=1 HTSLIB=${{ github.workspace }}/htslib"
+            # HTSLIB= is filled in by the build step below (we'd like to
+            # write ${{ github.workspace }}/htslib here, but matrix-level
+            # expression evaluation doesn't have github.workspace bound
+            # to the in-container path — it resolved to empty, leaving
+            # HTSLIB=/htslib at runtime).
+            flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
             # libarrow-dev / libparquet-dev come from the Apache Arrow APT
             # source. python3-pyarrow isn't a Debian package; install via pip
             # (test/test.sh uses pyarrow for the cross-path data-payload
@@ -125,7 +130,15 @@ jobs:
           make -j"$(nproc)"
 
       - name: Build (${{ matrix.config.flags || 'default' }})
-        run: make ${{ matrix.config.flags }} pioSortBed
+        # HTSLIB="$PWD/htslib" only takes effect when build_htslib was
+        # true; otherwise the Makefile's HTSLIB= default (empty) wins
+        # and we link against the system libhts.
+        run: |
+          if [ -d htslib ]; then
+            make ${{ matrix.config.flags }} HTSLIB="$PWD/htslib" pioSortBed
+          else
+            make ${{ matrix.config.flags }} pioSortBed
+          fi
 
       - name: Sanity-check binary
         run: |
@@ -133,4 +146,9 @@ jobs:
           ./pioSortBed --help | head -20
 
       - name: Run test suite
-        run: make ${{ matrix.config.flags }} test
+        run: |
+          if [ -d htslib ]; then
+            make ${{ matrix.config.flags }} HTSLIB="$PWD/htslib" test
+          else
+            make ${{ matrix.config.flags }} test
+          fi
