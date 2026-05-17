@@ -25,7 +25,11 @@ jobs:
             needs_arrow: false
           - name: "WITH_HTSLIB + WITH_LOCISS (+ --lociss-output)"
             flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
-            apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pyarrow"
+            # libarrow-dev / libparquet-dev come from the Apache Arrow APT
+            # source. python3-pyarrow isn't a Debian package; install via pip
+            # (one of the test/test.sh checks uses pyarrow to verify
+            # cross-path data-payload md5 matches).
+            apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pip"
             needs_arrow: true
 
     steps:
@@ -51,6 +55,16 @@ jobs:
             g++ make \
             libtbb-dev liblz4-dev libzstd-dev \
             ${{ matrix.config.apt_extra }}
+
+      - name: Install pyarrow for the LociSSD test guard
+        if: ${{ matrix.config.needs_arrow }}
+        # test/test.sh's cross-path data-payload md5 check uses pyarrow
+        # to skip the manifest's created_utc timestamp when comparing
+        # files. Install via pip with --break-system-packages because
+        # Ubuntu noble's system Python is externally-managed (PEP 668).
+        run: |
+          python3 -m pip install --break-system-packages 'pyarrow~=21.0' || \
+          python3 -m pip install --break-system-packages pyarrow
 
       - name: Build (${{ matrix.config.flags || 'default' }})
         run: make ${{ matrix.config.flags }} pioSortBed
