@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "default (BED-only)"
+            flags: ""
+            apt_extra: ""
+          - name: "WITH_HTSLIB (+ --bgzip / --tabix)"
+            flags: "WITH_HTSLIB=1"
+            apt_extra: "libhts-dev tabix"
+          - name: "WITH_HTSLIB + WITH_LOCISS (+ --lociss-output)"
+            flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
+            apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pyarrow"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ make \
+            libtbb-dev liblz4-dev libzstd-dev \
+            ${{ matrix.config.apt_extra }}
+
+      - name: Build (${{ matrix.config.flags || 'default' }})
+        run: make ${{ matrix.config.flags }} pioSortBed
+
+      - name: Sanity-check binary
+        run: |
+          ./pioSortBed --version
+          ./pioSortBed --help | head -20
+
+      - name: Run test suite
+        run: make ${{ matrix.config.flags }} test
