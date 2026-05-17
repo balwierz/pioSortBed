@@ -9,3 +9,9 @@ pioSortBed-linux-x86_64
 pioSortBed-linux-x86_64-2.*
 benchmark/benchmark_plot.png
 .~lock.*#
+
+# Stray LociSSD output files (the .lociss extension is convention; any
+# fixture or smoke-test output isn't worth tracking).
+*.lociss
+*.bed.gz
+*.bed.gz.tbi
