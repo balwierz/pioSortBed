@@ -3800,12 +3800,20 @@ public:
 		if(!schemaLocked_) {
 			if(lockSchema(/*hasTail=*/tailLen > 0) != 0) return 1;
 		} else if((tailLen > 0) != hasTailCol_) {
-			std::cerr << "Error: LociSSD record tail-presence varies "
-			             "(first record was "
-			          << (hasTailCol_ ? "BED4+" : "BED3")
-			          << ", later record is "
-			          << (tailLen > 0 ? "BED4+" : "BED3")
-			          << "). All records must share the same column count."
+			// Tail-presence (BED3 vs BED4+) must be uniform across the
+			// file because Parquet doesn't support mid-write schema
+			// changes. Within BED4+ records, varying tail-column counts
+			// are fine — the Tail column is an opaque tab-separated
+			// string so a record can have 4, 6, 8, ... user columns.
+			std::cerr << "Error: LociSSD input has mixed BED3 and BED4+ "
+			             "records (first record had "
+			          << (hasTailCol_ ? "user columns past End"
+			                          : "no columns past End")
+			          << ", a later record has the opposite). The Tail "
+			             "column can hold arbitrary tab-separated content "
+			             "with variable column counts, but tail-presence "
+			             "must be uniform — split the input or pad the "
+			             "BED3 records to BED4+ with a placeholder column."
 			          << std::endl;
 			return 1;
 		}
