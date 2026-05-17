@@ -18,20 +18,36 @@ jobs:
           - name: "default (BED-only)"
             flags: ""
             apt_extra: ""
+            needs_arrow: false
           - name: "WITH_HTSLIB (+ --bgzip / --tabix)"
             flags: "WITH_HTSLIB=1"
             apt_extra: "libhts-dev tabix"
+            needs_arrow: false
           - name: "WITH_HTSLIB + WITH_LOCISS (+ --lociss-output)"
             flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
             apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pyarrow"
+            needs_arrow: true
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Add Apache Arrow APT repo
+        if: ${{ matrix.config.needs_arrow }}
+        # Ubuntu noble doesn't ship libarrow-dev/libparquet-dev/python3-pyarrow
+        # in its default repos; the Apache Arrow project distributes them via
+        # their own APT source. https://arrow.apache.org/install/
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -V ca-certificates lsb-release wget
+          codename=$(lsb_release --codename --short)
+          wget -q https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-${codename}.deb
+          sudo apt-get install -y -V ./apache-arrow-apt-source-latest-${codename}.deb
+          rm apache-arrow-apt-source-latest-${codename}.deb
+
       - name: Install build + test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y -V \
             g++ make \
             libtbb-dev liblz4-dev libzstd-dev \
             ${{ matrix.config.apt_extra }}
