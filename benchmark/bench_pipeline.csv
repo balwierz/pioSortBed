@@ -1,0 +1,5 @@
+recipe,wall_s,peak_rss_kb,fs_writes_blocks_512,fs_writes_bytes
+canonical-sort-bgzip-tabix,86.13,16778468,16413128,8403521536
+pio-bgzip-tabix,33.88,11395004,2625408,1344208896
+pio-lociss,22.85,9894296,2908688,1489248256
+pio-lociss-with-index,43.94,24020344,3830216,1961070592
