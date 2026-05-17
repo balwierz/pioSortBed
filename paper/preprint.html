@@ -569,12 +569,69 @@ applicable) work uniformly across all four paths.</p>
 Parquet file <span class="citation" data-cites="parquet">(Apache
 Software Foundation 2025b)</span> conforming to the LociSSD v2 spec
 <span class="citation" data-cites="formatspec">(Balwierz 2026)</span>
-instead of (or alongside) a BED text stream. The file contains four
-required columns — <code>Chromosome</code>, <code>Start</code>,
-<code>End</code>, and a derived <code>MaxEndSoFar</code> (per-chromosome
-running maximum of <code>End</code>) — plus a JSON manifest in the
-Parquet footer key-value metadata recording per-chromosome row offsets,
-value bounds, schema, and writer version.</p>
+instead of (or alongside) a BED text stream. Every file contains the
+three required loci columns (<code>Chromosome</code>,
+<code>Start</code>, <code>End</code>) and the derived
+<code>MaxEndSoFar</code> (per-chromosome running maximum of
+<code>End</code>); standard BED4/5/6/12 inputs additionally emit the
+typed user columns. The schema is detected from the first record’s
+column count and locked for the whole file:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Input</th>
+<th>Additional typed columns (in file order)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BED3</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td>BED4</td>
+<td><code>Name</code></td>
+</tr>
+<tr>
+<td>BED5</td>
+<td><code>Name</code>, <code>Score</code></td>
+</tr>
+<tr>
+<td>BED6</td>
+<td><code>Strand</code>, <code>Name</code>, <code>Score</code></td>
+</tr>
+<tr>
+<td>BED12</td>
+<td><code>Strand</code>, <code>Name</code>, <code>Score</code>,
+<code>ThickStart</code>, <code>ThickEnd</code>, <code>ItemRgb</code>,
+<code>BlockCount</code>, <code>BlockSizes</code>,
+<code>BlockStarts</code></td>
+</tr>
+<tr>
+<td>other (7/8/9/10/11/13+)</td>
+<td><code>Tail</code> (catch-all <code>string</code> carrying the raw
+post-<code>End</code> bytes verbatim)</td>
+</tr>
+</tbody>
+</table>
+<p>Column ordering follows FORMAT_SPEC §3.3: required loci columns
+first, then <code>Strand</code> if present (pulled to position 4), then
+the remaining user columns in BED order, then <code>MaxEndSoFar</code>
+last. <code>Score</code> is encoded as <code>string</code> rather than
+<code>int32</code> because BED scores can be non-numeric
+(e.g. <code>.</code>); <code>ThickStart</code>, <code>ThickEnd</code>,
+<code>BlockCount</code> are <code>int32</code> per the BED12
+specification. The catch-all <code>Tail</code> flavor preserves
+arbitrary record layouts (narrowPeak’s 10 columns, custom
+signal-tracking formats with extra fields) and tolerates
+record-to-record column count variability — useful for messy real-world
+inputs that the typed flavors would reject. The Parquet footer KV
+metadata embeds a JSON manifest recording per-chromosome row offsets,
+value bounds, schema, writer version, and the resolved flavor.</p>
 <p><code>MaxEndSoFar</code> makes the file self-indexing for region
 queries. A reader issuing
 <code>(query_chromosome, query_start, query_end)</code> pushes down the

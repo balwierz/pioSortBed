@@ -235,11 +235,33 @@ and `--collapse` (where applicable) work uniformly across all four paths.
 
 `--lociss-output FILE` makes pioSortBed write an Apache Parquet file
 [@parquet] conforming to the LociSSD v2 spec [@formatspec] instead of (or
-alongside) a BED text stream. The file contains four required columns —
-`Chromosome`, `Start`, `End`, and a derived `MaxEndSoFar` (per-chromosome
-running maximum of `End`) — plus a JSON manifest in the Parquet footer
-key-value metadata recording per-chromosome row offsets, value bounds,
-schema, and writer version.
+alongside) a BED text stream. Every file contains the three required loci
+columns (`Chromosome`, `Start`, `End`) and the derived `MaxEndSoFar`
+(per-chromosome running maximum of `End`); standard BED4/5/6/12 inputs
+additionally emit the typed user columns. The schema is detected from the
+first record's column count and locked for the whole file:
+
+| Input | Additional typed columns (in file order) |
+|---|---|
+| BED3              | (none) |
+| BED4              | `Name` |
+| BED5              | `Name`, `Score` |
+| BED6              | `Strand`, `Name`, `Score` |
+| BED12             | `Strand`, `Name`, `Score`, `ThickStart`, `ThickEnd`, `ItemRgb`, `BlockCount`, `BlockSizes`, `BlockStarts` |
+| other (7/8/9/10/11/13+) | `Tail` (catch-all `string` carrying the raw post-`End` bytes verbatim) |
+
+Column ordering follows FORMAT_SPEC §3.3: required loci columns first,
+then `Strand` if present (pulled to position 4), then the remaining user
+columns in BED order, then `MaxEndSoFar` last. `Score` is encoded as
+`string` rather than `int32` because BED scores can be non-numeric
+(e.g. `.`); `ThickStart`, `ThickEnd`, `BlockCount` are `int32` per the
+BED12 specification. The catch-all `Tail` flavor preserves arbitrary
+record layouts (narrowPeak's 10 columns, custom signal-tracking
+formats with extra fields) and tolerates record-to-record column
+count variability — useful for messy real-world inputs that the
+typed flavors would reject. The Parquet footer KV metadata embeds a
+JSON manifest recording per-chromosome row offsets, value bounds,
+schema, writer version, and the resolved flavor.
 
 `MaxEndSoFar` makes the file self-indexing for region queries. A reader
 issuing `(query_chromosome, query_start, query_end)` pushes down the
