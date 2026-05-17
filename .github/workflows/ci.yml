@@ -21,29 +21,43 @@ jobs:
             flags: ""
             apt_extra: ""
             needs_arrow: false
+            build_htslib: false
           - name: "WITH_HTSLIB (+ --bgzip / --tabix)"
             container: ""
             flags: "WITH_HTSLIB=1"
             apt_extra: "libhts-dev tabix"
             needs_arrow: false
+            build_htslib: false
           - name: "WITH_HTSLIB + WITH_LOCISS (+ --lociss-output)"
             # Run in a clean ubuntu:22.04 container, not on the
-            # ubuntu-latest runner, because Apache Arrow's APT package
-            # libarrow-dev declares an unsatisfiable libcurl4-openssl-dev
-            # dependency on the noble runner (the 64-bit-time_t transition
-            # replaced it with libcurl4t64-openssl-dev) AND on the
-            # ubuntu-22.04 runner image (pre-installed packages on the
-            # runner conflict with the jammy libcurl4-openssl-dev). A
-            # pristine jammy container has neither problem.
+            # ubuntu-latest runner, to keep apt's view of the world
+            # reproducible. Two complications drove this layout:
+            #   (1) Apache Arrow's libarrow-dev depends on
+            #       libcurl4-openssl-dev; the noble runner replaced
+            #       that with libcurl4t64-openssl-dev (64-bit-time_t
+            #       transition) and the ubuntu-22.04 runner image has
+            #       pre-installed packages that block it too.
+            #   (2) Debian's libhts-dev depends on libcurl4-gnutls-dev,
+            #       which mutually excludes libcurl4-openssl-dev — so
+            #       libarrow-dev and libhts-dev cannot coexist as APT
+            #       packages on the same machine. We build htslib from
+            #       source instead (the Makefile already supports
+            #       HTSLIB=/path/to/htslib for exactly this case) and
+            #       install libarrow-dev / libparquet-dev as packages.
             container: "ubuntu:22.04"
-            flags: "WITH_HTSLIB=1 WITH_LOCISS=1"
+            flags: "WITH_HTSLIB=1 WITH_LOCISS=1 HTSLIB=${{ github.workspace }}/htslib"
             # libarrow-dev / libparquet-dev come from the Apache Arrow APT
             # source. python3-pyarrow isn't a Debian package; install via pip
             # (test/test.sh uses pyarrow for the cross-path data-payload
-            # md5 check). sudo isn't present in the bare container — Steps
-            # run as root.
-            apt_extra: "libhts-dev tabix libarrow-dev libparquet-dev python3-pip"
+            # md5 check). tabix is the only deb that still pulls in libhts —
+            # it brings libhts3 (runtime, not -dev) and libcurl4-gnutls is
+            # a transitive runtime dep with no conflict against
+            # libcurl4-openssl-dev. sudo isn't present in the bare
+            # container — steps run as root.
+            apt_extra: "tabix libarrow-dev libparquet-dev python3-pip
+              libdeflate-dev"
             needs_arrow: true
+            build_htslib: true
 
     steps:
       - name: Install git + ca-certificates (container only)
@@ -82,11 +96,33 @@ jobs:
         if: ${{ matrix.config.needs_arrow }}
         # test/test.sh's cross-path data-payload md5 check uses pyarrow
         # to skip the manifest's created_utc timestamp when comparing
-        # files. Install via pip with --break-system-packages because
-        # Ubuntu's system Python is externally-managed (PEP 668).
+        # files. Jammy's system pip (22.0.2) doesn't have PEP 668
+        # enforcement, so plain pip install works. Jammy also predates
+        # --break-system-packages (added in pip 23.0.1), so we cannot
+        # use it here.
         run: |
-          python3 -m pip install --break-system-packages 'pyarrow~=21.0' || \
-          python3 -m pip install --break-system-packages pyarrow
+          python3 -m pip install pyarrow
+
+      - name: Build htslib from source (LociSSD job only)
+        if: ${{ matrix.config.build_htslib }}
+        # The Debian libhts-dev pulls in libcurl4-gnutls-dev, which
+        # mutually excludes libarrow-dev's libcurl4-openssl-dev. Build
+        # htslib ourselves to dodge the conflict; the Makefile picks it
+        # up via HTSLIB=… (see the matrix flags entry). autoconf et al
+        # are needed because the release tarball's ./configure is
+        # already-generated but the git tag isn't — we ship the source
+        # tree via git so we get htscodecs/ as a submodule.
+        run: |
+          apt-get install -y -V autoconf automake libtool git
+          git clone --depth=1 --branch=1.21 https://github.com/samtools/htslib.git
+          cd htslib
+          git submodule update --init --depth=1
+          autoreconf -i
+          # --disable-bz2 / --disable-lzma match the Makefile's HTSLIB=…
+          # link line, which only adds -ldeflate (not -lbz2 / -llzma).
+          ./configure --disable-libcurl --disable-s3 --disable-gcs \
+                      --disable-plugins --disable-bz2 --disable-lzma
+          make -j"$(nproc)"
 
       - name: Build (${{ matrix.config.flags || 'default' }})
         run: make ${{ matrix.config.flags }} pioSortBed
