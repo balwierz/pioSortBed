@@ -21,12 +21,19 @@ abstract: |
   4.4× faster than `bedops sort-bed`, and 9.7× faster than `bedtools sort`.
   At 500 million synthetic records, `--multi-pass` writes 0 GiB of temp
   data versus 6.5 GiB for `--external-merge` and 20.2 GiB for either
-  GNU sort or bedops. As a separate output mode, `--lociss-output` emits
-  sorted Parquet conforming to the published LociSSD v2 spec, directly
-  consumable by polars, DuckDB, pyranges 1, and any Parquet-aware reader,
-  with statistics-based predicate pushdown for fast region queries. The
-  source is a single C++17 file (~3700 lines) released under the MIT
-  license, with a self-contained static Linux x86_64 binary.
+  GNU sort or bedops. An integrated `--bgzip --tabix` output mode
+  (htslib-backed) produces a queryable `.bed.gz + .tbi` in a single
+  invocation: on the 100M-record input, pioSortBed finishes in 34 s
+  vs 86 s for the canonical `sort | bgzip ; tabix` three-tool pipeline,
+  and writes 1.3 GB to disk vs 8.0 GB. `--lociss-output` instead
+  emits sorted Parquet conforming to the published LociSSD v2 spec,
+  directly consumable by polars, DuckDB, pyranges 1 / Loci, and any
+  Parquet-aware reader, with statistics-based predicate pushdown for
+  fast region queries. At a 10 Mbp region size on the 100M-record
+  BED, polars + LociSSD answers a region query in 7.8 ms — 13× faster
+  than tabix. The source is a single C++20 file (~3900 lines) released
+  under the MIT license, with a self-contained static Linux x86_64
+  binary.
 ---
 
 **Keywords:** BED, sorting, genomic intervals, radix sort, parallel,
@@ -278,9 +285,10 @@ duckdb.sql("SELECT * FROM 'regions.lociss' "
            "WHERE Chromosome = 'chr1' AND Start < 100000")
 ```
 ```python
-# pyranges 1
-import pyranges as pr
-gr = pr.read_table("regions.lociss")
+# Loci (a pyranges 1 derivative with native LociSSD support)
+import loci
+ds = loci.open_lociss("regions.lociss")
+df = ds.region("chr1", 100_000, 200_000)
 ```
 
 `--lociss-output` works on every sort path; the corresponding sort-mode
@@ -288,6 +296,21 @@ restrictions still apply (`--sort=b|5` and `--collapse` are not yet
 supported with LociSSD output). Cross-path consistency was verified
 on a 500k-record / 22-chromosome fixture: all four sort paths produce
 byte-identical Parquet (md5sum matches across runs).
+
+## Integrated bgzip + tabix output
+
+`--bgzip` (and the dependent `--tabix`) writes the sorted output as a
+BGZF-compressed `.bed.gz` (and an adjacent `.tbi` index) in a single
+pioSortBed invocation, eliminating the canonical three-tool pipeline
+`sort | bgzip > out.bed.gz; tabix out.bed.gz` that every production BED
+workflow ends with. The implementation reuses htslib's BGZF writer
+[@danecek2021twelve] driven by a small drainer thread that consumes
+bytes off a `stdout`-redirected pipe and feeds them to `bgzf_write`,
+so every sort path's emit code (which writes BED text to `stdout`)
+works unchanged. `--tabix` then calls `tbx_index_build3` on the
+finished `.bed.gz` to write the tabix index in place. The feature is
+gated on `WITH_HTSLIB=1` at build time and is mutually exclusive with
+`--lociss-output` (text vs Parquet output).
 
 ## Output emission
 
@@ -469,11 +492,87 @@ speedup: at 500M records, `--multi-pass` improved from 121.9 s to 80.4 s
 (dotted) for `--external-merge` and `--multi-pass`; `bedops sort-bed`
 and `GNU sort --parallel=8` for context.](figures/fig5_streamingscale.png){#fig:streaming width=100%}
 
+## Query performance and pipeline wall time
+
+The previous subsections measure the *sort* step in isolation. The
+downstream story is what the sorted BED is actually used for: region
+queries from analysis pipelines. We compare tabix-indexed bgzipped BED
+against LociSSD Parquet read by three Parquet-native consumers
+— polars [@polars], DuckDB [@duckdb], and Loci [@stovner2025pyranges]
+(a pyranges 1 derivative with native LociSSD support, used here for
+`--lociss-index`-aware queries).
+
+**Region-query latency.** Figure 6 reports median latency for 333
+random queries per region size on the NA12878 100M-record sorted BED,
+warm cache. tabix wins at small region sizes (median 129 µs at 1 kbp,
+1.2 ms at 100 kbp) thanks to its purpose-built C BED reader and very
+low per-query setup cost. At the 10 Mbp region size, however, tabix has
+to scan and parse every BED row in the range and degrades sharply to
+105 ms; the Parquet readers' per-query setup cost (~7–10 ms) becomes
+amortised across the region, and **polars + LociSSD answers the same
+query in 7.8 ms — 13× faster than tabix**. Loci on LociSSD is also
+faster than tabix at this size (10.7 ms, 9.8×). DuckDB is the slowest
+of the three Parquet readers at 1 kbp and 100 kbp due to per-query SQL
+parsing overhead and at 10 Mbp returns ~the same time as tabix.
+
+**Table 4.** Region-query latency (median, microseconds), 100M-record
+sorted BED, warm cache, 333 queries per cell.
+
+| Region size | tabix bgzip+tabix | polars LociSSD | DuckDB LociSSD | Loci LociSSD |
+|---:|---:|---:|---:|---:|
+| 1 kbp   |    **129** |  7,181 | 12,372 |  8,459 |
+| 100 kbp |  **1,198** |  7,079 | 12,693 |  8,652 |
+| 10 Mbp  | 104,847    |  **7,830** | 112,994 | 10,673 |
+
+The optional `--lociss-index` (row-precision interval index in the
+Parquet footer) does not help at our test scales: the predicate-pushdown
+path is already faster than walking the index from Python. At 10M-record
+files where the index fits comfortably in the footer KV, Loci's
+index-on path is ~10× *slower* than its index-off path
+(25 ms vs 2.5 ms, all sizes). At our 100M-record file the index is
+multi-GB and exceeds pyarrow's default thrift footer limit; this is
+a documented LociSSD-format scaling concern (FORMAT_SPEC.md §6.5.1)
+that suggests omitting the index at TB scale and relying on
+predicate pushdown.
+
+**Pipeline wall time and bytes written.** Table 5 reports the total
+wall time and total bytes written for four end-to-end recipes that
+all produce a sorted, queryable BED from the same 100M-record
+6.6 GB input. The canonical three-tool pipeline takes 86 s and writes
+8 GB to disk. pioSortBed's integrated `--bgzip --tabix` produces the
+same `.bed.gz + .tbi` in **34 s** while writing only **1.3 GB**
+(GNU sort spills to temp files, bgzip rewrites everything, tabix
+walks the bgzipped output). LociSSD goes a step further:
+`--lociss-output` finishes in **23 s** and writes 1.4 GB — by far the
+fastest path to a queryable, statistically-indexed file.
+
+**Table 5.** End-to-end pipeline to produce a sorted, queryable BED
+from the NA12878 100M-record input. `pioSortBed` runs at `-t 8`.
+
+| Recipe | Wall time | Bytes written | Speedup vs canonical |
+|---|---:|---:|---:|
+| `LC_ALL=C sort \| bgzip ; tabix` (canonical) | 86.1 s | 8.0 GB | 1.0× |
+| `pio --bgzip --tabix` (this work) | **33.9 s** | **1.3 GB** | **2.5×** |
+| `pio --lociss-output` (this work) | **22.9 s** | **1.4 GB** | **3.8×** |
+| `pio --lociss-output --lociss-index` (this work) | 43.9 s | 1.9 GB | 2.0× |
+
+The pipeline-time win combines the sort speedup with eliminating two
+sequential rewrites (sort → bgzip → tabix); the bytes-written win
+combines avoiding GNU sort's temp-file spills with writing a single
+compressed output.
+
+![Region-query latency on the NA12878 100M-record sorted BED, warm
+cache, median of 333 queries per cell. tabix queries the bgzip+tabix
+BED; polars / DuckDB / Loci query the LociSSD Parquet. tabix wins
+at small region sizes (low per-query setup cost) but degrades to
+105 ms at 10 Mbp; polars + LociSSD answers the same 10 Mbp query in
+7.8 ms.](figures/fig6_querylatency.png){#fig:querylatency width=100%}
+
 ## Correctness
 
 pioSortBed's BED text output is byte-identical to
 `LC_ALL=C sort -k1,1 -k2,2n` for default-mode (`--sort=s`) inputs,
-validated in CI on every commit by a 25-test suite covering BED3, BED6,
+validated in CI on every commit by a 28-test suite covering BED3, BED6,
 gzip input, stdin input, the four sort paths, `--collapse`,
 `--natural-sort`, the `--sort=b` and `--sort=5` orders, and edge cases
 (empty file, single line, missing trailing newline, header-only file).
@@ -517,12 +616,18 @@ every time; emitting LociSSD once at sort time replaces those reparses
 with a Parquet open + statistics-aware predicate evaluation. With
 typical row-group sizes (65 536 rows) and the `MaxEndSoFar` column,
 overlap queries prune to the relevant row group(s) without a dedicated
-index scan. The optional row-precision interval index exists for the
-common case where ~24 B/record transient RAM is available during the
-sort and a downstream consumer wants row-precision pruning. The format
-itself is a Parquet file conforming to a published, versioned spec
-[@formatspec]; the manifest in the footer KV records writer version and
-per-chromosome bounds for fast file-level introspection.
+index scan. The §Query-performance results back this up: at a 10 Mbp
+region size on a 100M-record file, polars + LociSSD answers a query
+in 7.8 ms vs 105 ms for tabix, a 13× win, because tabix must scan
+every row in the region while Parquet's row-group statistics let
+polars skip whole groups. The optional `--lociss-index`
+(row-precision interval index) does *not* help at our test scales —
+predicate pushdown is already fast enough — but the format keeps it
+opt-in for the workloads where row-precision pruning is worth its
+RAM cost. The format itself is a Parquet file conforming to a
+published, versioned spec [@formatspec]; the manifest in the footer
+KV records writer version and per-chromosome bounds for fast
+file-level introspection.
 
 ## Limitations
 
@@ -554,14 +659,17 @@ for BAM workloads and pioSortBed for BED.
 # Availability
 
 pioSortBed is open source under the MIT license. The repository is at
-`<TODO: https://github.com/<user>/pioSortBed>`. The current release is
-v3.7.0. Prebuilt static `pioSortBed-linux-x86_64` binaries are published
-as GitHub release artefacts; building from source requires GCC ≥ 9,
-oneTBB, lz4, and zstd (`apt install libtbb-dev liblz4-dev libzstd-dev`).
-The `--lociss-output` mode requires Apache Arrow + Parquet C++ and is
-opt-in at build time (`make WITH_LOCISS=1`), so the default build has
-zero Arrow/Parquet dependency. The LociSSD format specification is in
-`FORMAT_SPEC.md` in the same repository.
+`https://github.com/balwierz/pioSortBed`. The current release is
+v3.8.0. Prebuilt static `pioSortBed-linux-x86_64` binaries are
+published as GitHub release artefacts; building from source requires
+GCC ≥ 10 (C++20), oneTBB, lz4, and zstd (`apt install libtbb-dev
+liblz4-dev libzstd-dev`). Three optional features are opt-in at build
+time so the default binary has no htslib / Arrow / Parquet dependency:
+`make WITH_HTSLIB=1` enables `--bgzip` / `--tabix` integrated output
+(and BAM input under `make WITH_BAM=1 HTSLIB=…`); `make WITH_LOCISS=1`
+enables `--lociss-output` (requires Apache Arrow + Parquet C++). The
+LociSSD format specification is in `FORMAT_SPEC.md` in the same
+repository.
 
 The benchmark scripts, fixtures, gnuplot drivers, and the CSVs underlying
 every figure and table in this paper are in `benchmark/` in the
