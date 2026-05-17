@@ -145,10 +145,12 @@ the cost of ~24 B/record transient RAM during sort.
 
 `--lociss-output` works on **every sort path** (classic, `--low-mem-ssd`,
 `--multi-pass`, `--external-merge`); only the corresponding sort-mode
-restrictions apply (`--sort=b|5` and `--collapse` are not yet supported
-with LociSSD output). Build with `make WITH_LOCISS=1` (requires
-`libarrow-dev` + `libparquet-dev`); the default build has zero Arrow /
-Parquet dependency.
+restrictions apply (`--sort=b|5` not yet supported with LociSSD
+output). `--collapse` pairs with `--lociss-output` on the classic sort
+path and writes a five-column `{Chr, Start, End, Score double,
+MaxEndSoFar}` schema per FORMAT_SPEC §10. Build with
+`make WITH_LOCISS=1` (requires `libarrow-dev` + `libparquet-dev`); the
+default build has zero Arrow / Parquet dependency.
 
 ### Schema by input flavor
 

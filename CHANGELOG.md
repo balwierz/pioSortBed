@@ -58,6 +58,16 @@ the project uses [semantic versioning](https://semver.org).
   faithful round-trip is preserved. Predicate pushdown on Strand,
   Score, etc. now works at Parquet read time.
 
+- **`--collapse` + `--lociss-output` support** (classic path only,
+  matching the existing `--collapse` restriction). Writes a
+  five-column `{Chromosome, Start, End, Score double, MaxEndSoFar}`
+  schema matching FORMAT_SPEC §10's minimal example. The Score
+  column uses an `arrow::DoubleBuilder` so downstream readers
+  can predicate-push on numeric Score without parsing strings.
+  The double accumulator over float input weights protects
+  precision across long collapse runs (e.g. CAGE TSS clusters
+  with ≥10⁴ reads folded onto a single base).
+
 ### Fixed
 
 - The classic-path emit loop's `terminate called without an active
@@ -91,12 +101,14 @@ the project uses [semantic versioning](https://semver.org).
 - 3 new tests under `test/test.sh`, skipped on non-`WITH_HTSLIB`
   builds: `--bgzip` round-trip vs plain sort; `--bgzip --tabix`
   region query vs awk reference; `--bgzip` without `-o` errors out.
-- 2 new tests under `test/test.sh`, skipped on non-`WITH_LOCISS`
+- 4 new tests under `test/test.sh`, skipped on non-`WITH_LOCISS`
   builds: `--lociss-output` Parquet round-trip across all four
   sort paths; cross-path data-payload md5 match (Tail / typed
-  columns identical regardless of sort path).
+  columns identical regardless of sort path); `--collapse +
+  --lociss-output` text/Parquet row match with typed-double Score;
+  mutex rejection of `--collapse + --low-mem-ssd + --lociss-output`.
 - Test totals per build: 25 of 25 in the default build, 28 of 28
-  in the `WITH_HTSLIB` build, 30 of 30 in the
+  in the `WITH_HTSLIB` build, 32 of 32 in the
   `WITH_HTSLIB + WITH_LOCISS` build.
 
 ### Infrastructure

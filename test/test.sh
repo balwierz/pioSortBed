@@ -417,6 +417,59 @@ print(hashlib.md5(t.to_string().encode()).hexdigest())
     fi
 
     rm -f "$TMP_BED" "${outs[@]}" 2>/dev/null
+
+    # --- --collapse + --lociss-output -------------------------------------
+    # Classic-path-only (the collapse pass is classic-path-only at large).
+    # Schema: Chr, Start, End, Score (double), MaxEndSoFar — per
+    # FORMAT_SPEC §10. Verify both summed weights match the text-mode
+    # collapse output AND the typed-double Score column survives the
+    # round-trip.
+    TMP_BED2=$(mktemp /tmp/pio_collapse_XXXX.bed)
+    TMP_LOCISS2=$(mktemp -u /tmp/pio_collapse_XXXX.lociss)
+    cat > "$TMP_BED2" <<EOF
+chr1	100	200	r1	2	+
+chr1	100	500	r2	3	-
+chr1	150	160	r3	1	+
+chr2	50	60	r4	7	+
+chr2	50	61	r5	4	-
+EOF
+    text_out=$($PIO --collapse "$TMP_BED2" 2>/dev/null \
+               | awk -F'\t' '{print $1"\t"$2"\t"$3"\t"$5}')
+    rm -f "$TMP_LOCISS2"
+    if ! $PIO --collapse --lociss-output "$TMP_LOCISS2" "$TMP_BED2" >/dev/null 2>&1; then
+        fail "--collapse + --lociss-output: pioSortBed failed to write"
+    elif command -v python3 &>/dev/null && python3 -c "import pyarrow.parquet" 2>/dev/null; then
+        lociss_out=$(python3 -c "
+import pyarrow.parquet as pq
+t = pq.read_table('$TMP_LOCISS2')
+score_t = t.schema.field('Score').type
+assert str(score_t) == 'double', f'Score column type is {score_t!r}, want double'
+for c, s, e, sc in zip(t['Chromosome'].to_pylist(),
+                       t['Start'].to_pylist(),
+                       t['End'].to_pylist(),
+                       t['Score'].to_pylist()):
+    print(f'{c}\t{s}\t{e}\t{sc:g}')
+" 2>/dev/null)
+        if [[ "$text_out" == "$lociss_out" ]]; then
+            ok "--collapse + --lociss-output matches text collapse (typed double Score)"
+        else
+            fail "--collapse + --lociss-output row mismatch vs text collapse"
+            echo "    text:   $(echo "$text_out" | tr '\n' '|')"
+            echo "    lociss: $(echo "$lociss_out" | tr '\n' '|')"
+        fi
+    else
+        echo "  SKIP: pyarrow unavailable; cannot cross-check --collapse + --lociss-output"
+    fi
+
+    # Mutex: --collapse + --lociss-output only on the classic path
+    if $PIO --collapse --low-mem-ssd --lociss-output /tmp/_must_not_exist.lociss \
+              "$TMP_BED2" 2>&1 | grep -q "only supported on the classic"; then
+        ok "--collapse + --lociss-output rejects --low-mem-ssd"
+    else
+        fail "--collapse + --lociss-output should reject --low-mem-ssd combo"
+    fi
+
+    rm -f "$TMP_BED2" "$TMP_LOCISS2" /tmp/_must_not_exist.lociss 2>/dev/null
 else
     echo "  SKIP: pioSortBed built without WITH_LOCISS; --lociss-output not available"
 fi

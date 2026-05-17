@@ -70,7 +70,11 @@ enum class BedFlavor {
     BED6     = 6,   // + Name, Score, Strand                                        -> 7-col (Strand reordered to pos 4 per spec §3.3)
     BED12    = 12,  // + Name, Score, Strand, ThickStart, ThickEnd, ItemRgb,
                     //   BlockCount, BlockSizes, BlockStarts                        -> 13-col
-    BED_PLUS = -1   // Any other column count -> catch-all Tail string column.
+    BED_PLUS = -1,  // Any other column count -> catch-all Tail string column.
+    COLLAPSED = -2  // --collapse + --lociss-output: Chr, Start, End, Score (double)
+                    // -> 5-col schema. Score holds the summed weight from the
+                    // (chr, start) collapse; FORMAT_SPEC §10 minimal example
+                    // matches this shape (Chr, Start, End, Score, MaxEndSoFar).
 };
 
 // Map BED total-column-count → BedFlavor. Counts not matching a known
@@ -3928,6 +3932,13 @@ private:
 		case BedFlavor::BED_PLUS:
 			fields.push_back(arrow::field("Tail", arrow::utf8(), false));
 			break;
+		case BedFlavor::COLLAPSED:
+			// Numeric Score per FORMAT_SPEC §10. Holds the summed weight
+			// from the --collapse pass — float64 because the input weights
+			// are floats and the sum's accumulator is double-precision to
+			// keep precision over long collapse runs.
+			fields.push_back(arrow::field("Score", arrow::float64(), false));
+			break;
 		}
 		fields.push_back(arrow::field("MaxEndSoFar", arrow::int32(), false));
 		schema_ = arrow::schema(fields);
@@ -4088,6 +4099,13 @@ public:
 		case BedFlavor::BED_PLUS:
 			if(!tailBuilder_.Append(tail ? tail : "", tailLen).ok()) return arrowFail();
 			break;
+		case BedFlavor::COLLAPSED:
+			// COLLAPSED takes its Score from a numeric argument, not from
+			// the BED tail — callers must use writeCollapsedRecord(). If we
+			// reach this branch the writer's been wired up wrong.
+			std::cerr << "Error: writeRecord() called on a COLLAPSED-flavor "
+			             "sink; use writeCollapsedRecord() instead." << std::endl;
+			return 1;
 		}
 
 		if(buildIndex_) {
@@ -4109,6 +4127,66 @@ private:
 		return 1;
 	}
 public:
+
+	// Append a single COLLAPSED record. Same ordering contract as
+	// writeRecord(): records arrive in (chrom, beg) ascending order.
+	// `score` is the accumulator from --collapse's sum-by-(chr,start)
+	// pass (input weights are floats, the accumulator is double — see
+	// FORMAT_SPEC §10 minimal example for the resulting schema). `end`
+	// is typically `beg + 1` because --collapse truncates to a single
+	// base, but the argument is taken explicitly to keep the API
+	// uniform with writeRecord(). The sink's flavor MUST already be
+	// COLLAPSED — call setFlavor(BedFlavor::COLLAPSED) before the
+	// first record (or rely on the first call's auto-lock).
+	int writeCollapsedRecord(const char* chrom, int chrLen,
+	                         int32_t beg, int32_t end, double score)
+	{
+		if(!schemaLocked_) {
+			if(lockSchema(BedFlavor::COLLAPSED) != 0) return 1;
+		} else if(flavor_ != BedFlavor::COLLAPSED) {
+			std::cerr << "Error: writeCollapsedRecord() called on a "
+			             "non-COLLAPSED sink (flavor was locked to a "
+			             "different BED variant by an earlier writeRecord)."
+			          << std::endl;
+			return 1;
+		}
+
+		std::string chrName(chrom, chrLen);
+		if(!haveCurChrom_ || chrName != curChromName_) {
+			finalizeChrom();
+			curChromName_   = chrName;
+			haveCurChrom_   = true;
+			curRunRowsBegin_= totalRows_;
+			curRunMinStart_ = beg;
+			curRunMaxStart_ = beg;
+			curRunMaxEnd_   = end;
+			if(buildIndex_) indexPerChrom_.emplace_back();
+		} else {
+			if(beg < curRunMinStart_) curRunMinStart_ = beg;
+			if(beg > curRunMaxStart_) curRunMaxStart_ = beg;
+			if(end > curRunMaxEnd_)   curRunMaxEnd_ = end;
+		}
+
+		auto s1 = chromBuilder_.Append(chrom, chrLen);
+		auto s2 = startBuilder_.Append(beg);
+		auto s3 = endBuilder_.Append(end);
+		auto s4 = maxEndBuilder_.Append(curRunMaxEnd_);
+		auto s5 = collapsedScoreBuilder_.Append(score);
+		if(!s1.ok() || !s2.ok() || !s3.ok() || !s4.ok() || !s5.ok()) {
+			return arrowFail();
+		}
+
+		if(buildIndex_) {
+			ChromIndexData& idx = indexPerChrom_.back();
+			idx.starts.push_back((int64_t)beg);
+			idx.ends.push_back((int64_t)end);
+			idx.maxEndRunning.push_back((int64_t)curRunMaxEnd_);
+		}
+		totalRows_++;
+		rowsInBatch_++;
+		if(rowsInBatch_ >= kRowGroupSize) return flushBatch();
+		return 0;
+	}
 
 	// Append a single-chromosome run as a pre-built Arrow Table. Used by the
 	// parallel paths: each worker thread builds the Arrow arrays for its own
@@ -4334,6 +4412,13 @@ private:
 			if(!tailBuilder_.Finish(&tailArr).ok()) return arrowFinishFail();
 			cols.push_back(tailArr);
 			break;
+		case BedFlavor::COLLAPSED: {
+			std::shared_ptr<arrow::Array> collapsedScoreArr;
+			if(!collapsedScoreBuilder_.Finish(&collapsedScoreArr).ok())
+				return arrowFinishFail();
+			cols.push_back(collapsedScoreArr);
+			break;
+		}
 		}
 		cols.push_back(maxArr);
 		auto table = arrow::Table::Make(schema_, cols, rowsInBatch_);
@@ -4650,6 +4735,7 @@ private:
 	arrow::StringBuilder blockSizesBuilder_;  // BED12
 	arrow::StringBuilder blockStartsBuilder_; // BED12
 	arrow::StringBuilder tailBuilder_;        // BED_PLUS (catch-all)
+	arrow::DoubleBuilder collapsedScoreBuilder_; // COLLAPSED (numeric Score, summed weight)
 
 	std::vector<ChromStat> chromStats_;
 	std::vector<ChromIndexData> indexPerChrom_;
@@ -5085,14 +5171,23 @@ int main(int argc, char *argv[])
 	// sam_open instead of going through stdout.
 #ifdef WITH_LOCISS
 	// --lociss-output is supported on the classic sort path,
-	// --multi-pass, --external-merge, and --low-mem-ssd. The combinations
-	// below are still rejected because they require schema features
-	// (Score column for --collapse, end-aware/strand-aware ordering for
-	// --sort=b|5) that the LociSSD writer doesn't emit yet — see TODO.md.
+	// --multi-pass, --external-merge, and --low-mem-ssd. --collapse
+	// is supported only on the classic path (the collapse pass itself
+	// is classic-path-only — same restriction as text output). --sort
+	// b|5 is still rejected because the LociSSD writer's chromosome-run
+	// invariant assumes Start-only ordering.
 	if(!locissOutput.empty()) {
-		if(fCollapse || sortMode != 's') {
-			cerr << "Error: --lociss-output does not yet support --collapse "
-			        "or --sort=b|5 (see TODO.md). Drop them to use it." << endl;
+		if(sortMode != 's') {
+			cerr << "Error: --lociss-output does not yet support "
+			        "--sort=b|5 (see TODO.md). Drop it to use --lociss-output."
+			     << endl;
+			return 1;
+		}
+		if(fCollapse && (lowMemSSD || extMerge || multiPass)) {
+			cerr << "Error: --collapse is only supported on the classic "
+			        "sort path; combining it with --lociss-output requires "
+			        "dropping --low-mem-ssd / --external-merge / --multi-pass."
+			     << endl;
 			return 1;
 		}
 		if(!outputFile.empty()) {
@@ -5485,22 +5580,56 @@ int main(int argc, char *argv[])
 
 	if(fCollapse)
 	{
+#ifdef WITH_LOCISS
+		// --collapse + --lociss-output: write a 5-column COLLAPSED-flavor
+		// Parquet (Chr, Start, End, Score double, MaxEndSoFar) via
+		// LocissSink::writeCollapsedRecord. Schema per FORMAT_SPEC §10.
+		LocissSink collapsedSink(locissOutput,
+		                         /*buildIndex=*/locissIndex != 0);
+		const bool emitLociss = !locissOutput.empty();
+		if(emitLociss) {
+			if(collapsedSink.open() != 0)        { free(order); return 1; }
+			if(collapsedSink.setFlavor(BedFlavor::COLLAPSED) != 0) {
+				free(order); return 1;
+			}
+		}
+#endif
 		size_t i = 0;
 		while(i < totalReads)
 		{
 			uint32_t ri = order[i];
 			uint32_t ci = reads[ri].chrIdx;
 			int pos = reads[ri].beg;
-			float sum = 0.0f;
+			// double accumulator over float weights — collapse runs can be
+			// long (CAGE TSS clusters routinely fold ≥10⁴ reads onto one
+			// base), and float would lose ~7 decimal digits over that span.
+			double sum = 0.0;
 			while(i < totalReads)
 			{
 				uint32_t rj = order[i];
 				if(reads[rj].chrIdx != ci || reads[rj].beg != pos) break;
-				sum += parseWeight(reads, rj);
+				sum += (double)parseWeight(reads, rj);
 				i++;
 			}
+#ifdef WITH_LOCISS
+			if(emitLociss) {
+				const std::string& chr = chroms[ci];
+				if(collapsedSink.writeCollapsedRecord(
+				       chr.c_str(), (int)chr.size(),
+				       pos, pos + 1, sum) != 0) {
+					free(order); return 1;
+				}
+				continue;
+			}
+#endif
 			printf("%s\t%d\t%d\t.\t%g\t+\n", chroms[ci].c_str(), pos, pos+1, sum);
 		}
+#ifdef WITH_LOCISS
+		if(emitLociss) {
+			std::string wv = std::string("pioSortBed ") + VERSION_STRING;
+			if(collapsedSink.finish(wv) != 0) { free(order); return 1; }
+		}
+#endif
 	}
 #ifdef WITH_LOCISS
 	else if(!locissOutput.empty())

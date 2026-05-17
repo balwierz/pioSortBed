@@ -663,9 +663,12 @@ relevant fields throughout the code path.
 default coordinate sort (`--sort=s`); `--sort=b` (start+end) and
 `--sort=5` (strand-aware 5'-end) require the in-RAM paths.
 `--collapse` (which sums weights for records sharing
-`(chromosome, start)`) is currently classic-path-only. Stdin and gzip
-input are accepted only by the in-RAM paths because the streaming
-paths require a seekable mmap'd input.
+`(chromosome, start)`) is currently classic-path-only — both for BED
+text output and for `--lociss-output`, where it writes a five-column
+`{Chromosome, Start, End, Score (double), MaxEndSoFar}` schema
+matching FORMAT_SPEC §10. Stdin and gzip input are accepted only by
+the in-RAM paths because the streaming paths require a seekable
+mmap'd input.
 
 ## BAM input
 

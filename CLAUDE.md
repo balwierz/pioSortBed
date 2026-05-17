@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make            # produces ./pioSortBed (links libtbb.so dynamically)
 make test       # runs the test suite under test/test.sh
                 # (25 in the default build, 28 with WITH_HTSLIB=1,
-                #  30 with WITH_HTSLIB=1 WITH_LOCISS=1)
+                #  32 with WITH_HTSLIB=1 WITH_LOCISS=1)
 make install    # installs to $PREFIX/bin (default /usr/local)
 ```
 
@@ -76,7 +76,7 @@ Options:
 - `--tmpdir=PATH` — temp-file location for `--external-merge` (default: `$TMPDIR` or `/tmp`)
 - `--bgzip` (WITH_HTSLIB build only) — write BGZF-compressed BED text instead of plain text; requires `-o FILE`; mutually exclusive with `--lociss-output`
 - `--tabix` (WITH_HTSLIB build only) — after `--bgzip`, build a `.tbi` index in place; implies `--bgzip`
-- `--lociss-output FILE` (WITH_LOCISS build only) — write a sorted Apache Parquet file per FORMAT_SPEC v2 instead of BED text. Currently rejects `--collapse` and `--sort=b|5`
+- `--lociss-output FILE` (WITH_LOCISS build only) — write a sorted Apache Parquet file per FORMAT_SPEC v2 instead of BED text. Pairs with `--collapse` on the classic sort path (writes a five-column `{Chr, Start, End, Score double, MaxEndSoFar}` schema per FORMAT_SPEC §10); still rejects `--sort=b|5`
 - `-t N` / `--threads N` — worker pool size (`0` = all cores, default; `1` = serial)
 - `--max-mem=N[GMK]` — concurrent per-chromosome emit-buffer cap on the `--low-mem-ssd` parallel pass 2, OR per-run memory budget on `--external-merge` (default 1 GiB on the latter)
 - `-o FILE` / `--output FILE` — write to file (default: stdout)
@@ -148,7 +148,7 @@ The 3.0.x cleanup pass removed every previously hard-coded compile-time limit. C
 ### Repository layout
 
 - `src/pioSortBed.cpp`, `src/CLI11.hpp` — source
-- `test/test.sh` — correctness suite (25 / 28 / 30 across build configurations)
+- `test/test.sh` — correctness suite (25 / 28 / 32 across build configurations)
 - `.github/workflows/ci.yml` — 3-config matrix CI on every push and PR
 - `benchmark/benchmark.sh` — cross-tool timing benchmark on synthetic BED6 fixtures (11 tools: `pio` at 1/4/8 threads, `pio-lm` at 1/4/8 threads, `sort` at 1/4/8 threads, `bedtools`, `bedops`)
 - `benchmark/benchmark_na12878.sh` — real-data NA12878 BAM-derived benchmark
