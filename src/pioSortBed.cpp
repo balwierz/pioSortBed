@@ -3677,6 +3677,17 @@ public:
 		}
 		outStream_ = *fileResult;
 
+		// Per FORMAT_SPEC.md §4.3, conforming writers SHOULD emit Parquet
+		// SortingColumn hints for the loci tuple (Chromosome, Start, End)
+		// — all ascending, nulls last. Advisory; readers may use it to
+		// short-circuit sort-order checks or pick predicate-pushdown
+		// strategies. Schema column indices match the arrow::schema below:
+		//   0 = Chromosome, 1 = Start, 2 = End, 3 = MaxEndSoFar (not in hint).
+		std::vector<parquet::SortingColumn> sortingCols = {
+			{/*column_idx=*/0, /*descending=*/false, /*nulls_first=*/false},
+			{/*column_idx=*/1, /*descending=*/false, /*nulls_first=*/false},
+			{/*column_idx=*/2, /*descending=*/false, /*nulls_first=*/false},
+		};
 		auto props = parquet::WriterProperties::Builder()
 			.version(parquet::ParquetVersion::PARQUET_2_6)
 			->data_page_version(parquet::ParquetDataPageVersion::V2)
@@ -3686,6 +3697,7 @@ public:
 			->enable_write_page_index()
 			->enable_dictionary("Chromosome")
 			->max_row_group_length(kRowGroupSize)
+			->set_sorting_columns(sortingCols)
 			->build();
 		auto arrowProps = parquet::ArrowWriterProperties::Builder()
 			.store_schema()

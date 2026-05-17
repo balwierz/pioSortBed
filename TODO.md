@@ -26,9 +26,6 @@ None of these block existing functionality.
   lily, onion). Add a `--lociss-int64` flag when a real >2 Gbp dataset
   comes up.
 
-- **Parquet `SortingColumn` hint** — spec §4.3 calls it advisory.
-  Currently not emitted. ~5 lines to add.
-
 ## General
 
 - **External-merge: parallelise zstd compression in the writer** —
